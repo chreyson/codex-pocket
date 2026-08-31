@@ -1,0 +1,15 @@
+{
+  "name": "codex-pocket",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "A minimal mobile remote for local Codex conversations.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "test:desktop": "python -m unittest discover -s test -p \"test_*.py\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

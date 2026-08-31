@@ -1,0 +1,6 @@
+.data/
+.tools/
+__pycache__/
+*.log
+node_modules/
+schemas/
