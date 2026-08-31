@@ -30,7 +30,6 @@ let threads = [];
 let selectedThreadId = "";
 let currentThread = null;
 let eventSource = null;
-let lastMessageSignature = "";
 let selectionEpoch = 0;
 let pendingMessage = null;
 const sendingThreads = new Set();
@@ -43,6 +42,7 @@ const queuedMessageDeltas = new Map();
 let deltaFrameId = null;
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const MAX_LIVE_MESSAGE_LENGTH = 80_000;
 
 function createSidebarIcon(name) {
   const svg = document.createElementNS(SVG_NAMESPACE, "svg");
@@ -92,15 +92,18 @@ function postJson(url, value) {
   });
 }
 
-function resetLiveRendering() {
-  liveMessages.clear();
-  messageNodes.clear();
-  queuedMessageDeltas.clear();
+function cancelQueuedMessageDeltas() {
   if (deltaFrameId !== null && typeof cancelAnimationFrame === "function") {
     cancelAnimationFrame(deltaFrameId);
   }
   deltaFrameId = null;
-  lastMessageSignature = "";
+  queuedMessageDeltas.clear();
+}
+
+function resetLiveRendering() {
+  cancelQueuedMessageDeltas();
+  liveMessages.clear();
+  messageNodes.clear();
 }
 
 function showAuth(message = "") {
@@ -465,75 +468,367 @@ function renderApprovals(requests = []) {
   }
 }
 
-function renderThread(thread) {
-  if (thread.id !== selectedThreadId) return;
-  const nearBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 120;
-  currentThread = thread;
-  const persistedPendingMessage = pendingMessage && [...thread.messages].reverse().some(
-    (message) => message.role === "user"
-      && message.text === pendingMessage.text
-      && !pendingMessage.knownMessageIds.has(message.id),
+function isFollowingOutput() {
+  if (!messageList.dataset.rendered) return true;
+  return messageList.scrollHeight
+    - messageList.scrollTop
+    - messageList.clientHeight < 120;
+}
+
+function clipLiveText(value) {
+  return String(value ?? "").slice(0, MAX_LIVE_MESSAGE_LENGTH);
+}
+
+function createMessageNode(message) {
+  const article = document.createElement("article");
+  article.className = "message";
+
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const author = document.createElement("span");
+  author.className = "message-author";
+  const time = document.createElement("time");
+  meta.append(author, time);
+
+  const body = document.createElement("div");
+  body.className = "message-body";
+  article.append(meta, body);
+
+  const record = { article, author, time, body, kind: "message" };
+  updateMessageNode(record, message);
+  return record;
+}
+
+function updateMessageNode(record, message) {
+  record.article.dataset.role = message.role;
+  record.article.dataset.kind = message.kind;
+
+  if (message.pending) record.article.dataset.pending = "true";
+  else delete record.article.dataset.pending;
+
+  const live = liveMessages.get(message.id);
+  if (live && !live.completed) record.article.dataset.streaming = "true";
+  else delete record.article.dataset.streaming;
+
+  const author = messageLabel(message);
+  const time = formatTime(message.timestamp);
+  if (record.author.textContent !== author) record.author.textContent = author;
+  if (record.time.textContent !== time) record.time.textContent = time;
+  if (record.body.textContent !== message.text) record.body.textContent = message.text;
+}
+
+function reconcileMessageNodes(messages) {
+  const ordered = [];
+  const visibleIds = new Set();
+
+  for (const message of groupActivityMessages(messages)) {
+    visibleIds.add(message.id);
+    let record = messageNodes.get(message.id);
+
+    if (message.kind === "activityGroup") {
+      record = {
+        article: renderActivityGroup(message),
+        kind: "activityGroup",
+      };
+      messageNodes.set(message.id, record);
+    } else if (!record || record.kind !== "message") {
+      record = createMessageNode(message);
+      messageNodes.set(message.id, record);
+    } else {
+      updateMessageNode(record, message);
+    }
+    ordered.push(record.article);
+  }
+
+  for (const id of messageNodes.keys()) {
+    if (!visibleIds.has(id)) messageNodes.delete(id);
+  }
+  messageList.replaceChildren(...ordered);
+}
+
+function mergeCumulativeText(currentText, incomingText) {
+  const current = clipLiveText(currentText);
+  const incoming = clipLiveText(incomingText);
+  if (!current) return incoming;
+  if (!incoming) return current;
+  if (incoming.startsWith(current)) return incoming;
+  if (current.startsWith(incoming)) return current;
+  return incoming;
+}
+
+function snapshotCaughtUp(snapshotText, liveText) {
+  return snapshotText === liveText
+    || (
+      liveText.length === MAX_LIVE_MESSAGE_LENGTH
+      && snapshotText.startsWith(liveText)
+    );
+}
+
+function mergeThreadWithLiveMessages(thread, authoritativeSnapshot) {
+  const messages = [...(thread.messages || [])];
+  const indexes = new Map(messages.map((message, index) => [message.id, index]));
+
+  for (const [itemId, live] of liveMessages) {
+    const index = indexes.get(itemId);
+    if (index === undefined) {
+      indexes.set(itemId, messages.length);
+      messages.push(live.message);
+      continue;
+    }
+
+    const snapshotMessage = messages[index];
+    if (live.completed) {
+      if (
+        authoritativeSnapshot
+        && snapshotCaughtUp(snapshotMessage.text, live.message.text)
+      ) {
+        liveMessages.delete(itemId);
+      } else {
+        messages[index] = { ...snapshotMessage, ...live.message };
+      }
+      continue;
+    }
+
+    let text = live.message.text;
+    if (snapshotMessage.text.startsWith(text)) {
+      text = clipLiveText(snapshotMessage.text);
+      live.message = { ...snapshotMessage, ...live.message, text };
+    }
+    messages[index] = { ...snapshotMessage, ...live.message, text };
+  }
+
+  const hasActiveStream = [...liveMessages.values()]
+    .some((live) => !live.completed);
+  return {
+    ...thread,
+    messages,
+    control: {
+      ...(thread.control || {}),
+      busy: Boolean(thread.control?.busy || hasActiveStream),
+      requests: thread.control?.requests || [],
+    },
+  };
+}
+
+function ensureCurrentThreadForLive(threadId) {
+  if (threadId !== selectedThreadId) return false;
+  if (currentThread?.id === threadId) return true;
+
+  const summary = threads.find((thread) => thread.id === threadId) || {};
+  currentThread = {
+    ...summary,
+    id: threadId,
+    title: summary.title || "Codex",
+    project: summary.project || "当前项目",
+    status: summary.status || "active",
+    messages: [],
+    control: { busy: true, requests: [] },
+  };
+  return true;
+}
+
+function upsertCurrentMessage(message, { markBusy = true } = {}) {
+  const messages = [...(currentThread?.messages || [])];
+  const index = messages.findIndex((item) => item.id === message.id);
+  if (index === -1) messages.push(message);
+  else messages[index] = message;
+
+  currentThread = {
+    ...currentThread,
+    messages,
+    control: {
+      ...(currentThread?.control || {}),
+      ...(markBusy ? { busy: true } : {}),
+      requests: currentThread?.control?.requests || [],
+    },
+  };
+}
+
+function liveMessage(value, text = value.text) {
+  return {
+    id: value.itemId,
+    role: "assistant",
+    kind: value.kind === "commentary" ? "commentary" : "message",
+    text: clipLiveText(text),
+    timestamp: value.timestamp ?? Math.floor(Date.now() / 1000),
+  };
+}
+
+function handleMessageStart(value) {
+  if (!ensureCurrentThreadForLive(value.threadId)) return;
+
+  const previous = liveMessages.get(value.itemId);
+  if (previous?.completed) return;
+
+  const persisted = currentThread.messages
+    .find((message) => message.id === value.itemId);
+  const previousText = previous?.message.text ?? persisted?.text ?? "";
+  const message = liveMessage(
+    value,
+    mergeCumulativeText(previousText, value.text),
   );
+
+  liveMessages.set(value.itemId, { message, completed: false });
+  upsertCurrentMessage(message);
+  renderThread(currentThread, { authoritativeSnapshot: false });
+}
+
+function flushMessageDeltas(epoch, threadId) {
+  deltaFrameId = null;
+  if (selectionEpoch !== epoch || selectedThreadId !== threadId) {
+    queuedMessageDeltas.clear();
+    return;
+  }
+
+  const batches = [...queuedMessageDeltas.entries()];
+  queuedMessageDeltas.clear();
+  const followOutput = isFollowingOutput();
+  let needsReconcile = false;
+
+  for (const [itemId, chunks] of batches) {
+    const live = liveMessages.get(itemId);
+    if (live?.completed) continue;
+
+    const persisted = currentThread?.messages
+      ?.find((message) => message.id === itemId);
+    const base = live?.message || persisted || {
+      id: itemId,
+      role: "assistant",
+      kind: "message",
+      text: "",
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+    const message = {
+      ...base,
+      text: clipLiveText(`${base.text}${chunks.join("")}`),
+    };
+
+    liveMessages.set(itemId, { message, completed: false });
+    upsertCurrentMessage(message);
+
+    const record = messageNodes.get(itemId);
+    if (record?.kind === "message") {
+      if (record.body.textContent !== message.text) {
+        record.body.textContent = message.text;
+      }
+    } else {
+      needsReconcile = true;
+    }
+  }
+
+  if (!currentThread) return;
+  if (needsReconcile) {
+    renderThread(currentThread, {
+      authoritativeSnapshot: false,
+      autoScroll: false,
+    });
+  } else {
+    if (currentThread.messages.length || pendingMessage) {
+      setConversationPlaceholder("", "", false);
+      messageList.hidden = false;
+    }
+    const state = currentThread.control?.busy
+      ? "运行中"
+      : statusLabel(currentThread.status);
+    conversationMeta.textContent =
+      `${currentThread.project} · ${state} · ${currentThread.messages.length} 条记录`;
+    updateComposer();
+  }
+
+  if (followOutput && currentThread.messages.length) {
+    messageList.scrollTop = messageList.scrollHeight;
+    messageList.dataset.rendered = "true";
+  }
+}
+
+function queueMessageDelta(value) {
+  if (!ensureCurrentThreadForLive(value.threadId)) return;
+  if (liveMessages.get(value.itemId)?.completed) return;
+
+  const chunks = queuedMessageDeltas.get(value.itemId) || [];
+  chunks.push(value.delta);
+  queuedMessageDeltas.set(value.itemId, chunks);
+
+  if (deltaFrameId !== null) return;
+  const epoch = selectionEpoch;
+  const threadId = selectedThreadId;
+  deltaFrameId = requestAnimationFrame(
+    () => flushMessageDeltas(epoch, threadId),
+  );
+}
+
+function handleMessageDone(value) {
+  if (!ensureCurrentThreadForLive(value.threadId)) return;
+
+  queuedMessageDeltas.delete(value.itemId);
+  if (!queuedMessageDeltas.size && deltaFrameId !== null) {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(deltaFrameId);
+    }
+    deltaFrameId = null;
+  }
+
+  const message = liveMessage(value);
+  liveMessages.set(value.itemId, { message, completed: true });
+  upsertCurrentMessage(message, { markBusy: false });
+  renderThread(currentThread, { authoritativeSnapshot: false });
+}
+
+function insertPendingMessage(messages) {
+  if (!pendingMessage) return messages;
+  const firstNewMessage = messages.findIndex(
+    (message) => !pendingMessage.knownMessageIds.has(message.id),
+  );
+  const insertionIndex = firstNewMessage === -1
+    ? messages.length
+    : firstNewMessage;
+  return [
+    ...messages.slice(0, insertionIndex),
+    pendingMessage,
+    ...messages.slice(insertionIndex),
+  ];
+}
+
+function renderThread(
+  thread,
+  { authoritativeSnapshot = true, autoScroll = true } = {},
+) {
+  if (thread.id !== selectedThreadId) return;
+
+  const followOutput = isFollowingOutput();
+  currentThread = mergeThreadWithLiveMessages(thread, authoritativeSnapshot);
+  const persistedPendingMessage = pendingMessage
+    && [...currentThread.messages].reverse().some(
+      (message) => message.role === "user"
+        && message.text === pendingMessage.text
+        && !pendingMessage.knownMessageIds.has(message.id),
+    );
   if (persistedPendingMessage) pendingMessage = null;
 
-  const displayMessages = pendingMessage ? [...thread.messages, pendingMessage] : thread.messages;
+  const displayMessages = insertPendingMessage(currentThread.messages);
   const hasMessages = displayMessages.length > 0;
-  const state = thread.control?.busy ? "运行中" : statusLabel(thread.status);
-  conversationTitle.textContent = thread.title;
-  conversationMeta.textContent = `${thread.project} · ${state} · ${thread.messages.length} 条记录`;
+  const state = currentThread.control?.busy
+    ? "运行中"
+    : statusLabel(currentThread.status);
+  conversationTitle.textContent = currentThread.title;
+  conversationMeta.textContent =
+    `${currentThread.project} · ${state} · ${currentThread.messages.length} 条记录`;
+
   if (hasMessages) {
     setConversationPlaceholder("", "", false);
     messageList.hidden = false;
   } else {
     setConversationPlaceholder("还没有消息");
   }
-  renderApprovals(thread.control?.requests || []);
+  renderApprovals(currentThread.control?.requests || []);
   updateComposer();
+  reconcileMessageNodes(displayMessages);
 
-  const signature = JSON.stringify(displayMessages.map((message) => [
-    message.id,
-    message.role,
-    message.kind,
-    message.label,
-    message.activityType,
-    message.activityStatus,
-    message.text,
-    message.timestamp,
-    Boolean(message.pending),
-  ]));
-  if (signature === lastMessageSignature) return;
-  lastMessageSignature = signature;
-
-  messageList.replaceChildren();
-  for (const message of groupActivityMessages(displayMessages)) {
-    if (message.kind === "activityGroup") {
-      messageList.append(renderActivityGroup(message));
-      continue;
-    }
-    const article = document.createElement("article");
-    article.className = "message";
-    article.dataset.role = message.role;
-    article.dataset.kind = message.kind;
-    if (message.pending) article.dataset.pending = "true";
-
-    const meta = document.createElement("div");
-    meta.className = "message-meta";
-    const author = document.createElement("span");
-    author.className = "message-author";
-    author.textContent = messageLabel(message);
-    const time = document.createElement("time");
-    time.textContent = formatTime(message.timestamp);
-    meta.append(author, time);
-
-    const body = document.createElement("div");
-    body.className = "message-body";
-    body.textContent = message.text;
-    article.append(meta, body);
-    messageList.append(article);
-  }
-
-  if (hasMessages && (nearBottom || !messageList.dataset.rendered)) {
+  if (autoScroll && hasMessages && followOutput) {
+    const epoch = selectionEpoch;
+    const threadId = currentThread.id;
     requestAnimationFrame(() => {
+      if (selectionEpoch !== epoch || selectedThreadId !== threadId) return;
       messageList.scrollTop = messageList.scrollHeight;
       messageList.dataset.rendered = "true";
     });
@@ -545,41 +840,93 @@ function closeEvents() {
   eventSource = null;
 }
 
-function connectEvents() {
+function eventValue(event) {
+  try {
+    return JSON.parse(event.data);
+  } catch {
+    return null;
+  }
+}
+
+function validLiveEvent(value, subscriptionThreadId) {
+  return value
+    && value.threadId === subscriptionThreadId
+    && typeof value.itemId === "string"
+    && value.itemId;
+}
+
+function connectEvents(subscriptionEpoch = selectionEpoch) {
+  cancelQueuedMessageDeltas();
   closeEvents();
   const subscriptionThreadId = selectedThreadId;
-  const query = selectedThreadId ? `?threadId=${encodeURIComponent(selectedThreadId)}` : "";
+  const query = subscriptionThreadId
+    ? `?threadId=${encodeURIComponent(subscriptionThreadId)}`
+    : "";
   const source = new EventSource(`/api/events${query}`);
   eventSource = source;
   setConnection({ state: "connecting" });
 
+  const isCurrentSubscription = () =>
+    eventSource === source
+    && selectedThreadId === subscriptionThreadId
+    && selectionEpoch === subscriptionEpoch;
+
   source.addEventListener("threads", (event) => {
-    if (eventSource !== source) return;
-    threads = JSON.parse(event.data);
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!Array.isArray(value)) return;
+    threads = value;
     renderThreads();
   });
   source.addEventListener("thread", (event) => {
-    if (eventSource === source) renderThread(JSON.parse(event.data));
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!value || value.id !== subscriptionThreadId) return;
+    renderThread(value);
+  });
+  source.addEventListener("messageStart", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!validLiveEvent(value, subscriptionThreadId)) return;
+    handleMessageStart(value);
+  });
+  source.addEventListener("messageDelta", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (
+      !validLiveEvent(value, subscriptionThreadId)
+      || typeof value.delta !== "string"
+      || !value.delta
+    ) return;
+    queueMessageDelta(value);
+  });
+  source.addEventListener("messageDone", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!validLiveEvent(value, subscriptionThreadId)) return;
+    handleMessageDone(value);
   });
   source.addEventListener("status", (event) => {
-    if (eventSource === source) setConnection(JSON.parse(event.data));
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (value) setConnection(value);
   });
   source.addEventListener("threadError", (event) => {
-    if (eventSource !== source || selectedThreadId !== subscriptionThreadId) return;
-    const value = JSON.parse(event.data);
-    conversationMeta.textContent = value.message || "读取会话失败";
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    conversationMeta.textContent = value?.message || "读取会话失败";
   });
   let probingSession = false;
   source.onerror = async () => {
-    if (eventSource !== source) return;
+    if (!isCurrentSubscription()) return;
     setConnection({ state: "disconnected" });
     if (probingSession) return;
     probingSession = true;
     try {
       const data = await requestJson("/api/bootstrap");
-      if (eventSource === source) setConnection(data.status);
+      if (isCurrentSubscription()) setConnection(data.status);
     } catch (error) {
-      if (eventSource === source && error.message === "UNAUTHORIZED") {
+      if (isCurrentSubscription() && error.message === "UNAUTHORIZED") {
         showAuth("会话已过期，请重新输入访问密钥。");
       }
     } finally {
@@ -589,7 +936,7 @@ function connectEvents() {
 }
 
 async function selectThread(threadId) {
-  selectionEpoch += 1;
+  const epoch = ++selectionEpoch;
   resetLiveRendering();
   selectedThreadId = threadId;
   currentThread = null;
@@ -609,12 +956,16 @@ async function selectThread(threadId) {
   conversationMeta.textContent = thread ? `${thread.project} · 正在同步` : "正在同步";
   setConversationPlaceholder("正在同步会话");
   updateComposer();
-  connectEvents();
+  connectEvents(epoch);
   try {
-    renderThread(await requestJson(`/api/threads/${encodeURIComponent(threadId)}`));
+    const loaded = await requestJson(
+      `/api/threads/${encodeURIComponent(threadId)}`,
+    );
+    if (selectionEpoch !== epoch || selectedThreadId !== threadId) return;
+    renderThread(loaded);
   } catch (error) {
     if (error.message === "UNAUTHORIZED") return showAuth("会话已过期，请重新输入访问密钥。");
-    if (selectedThreadId !== threadId) return;
+    if (selectionEpoch !== epoch || selectedThreadId !== threadId) return;
     conversationMeta.textContent = error.message;
     setConversationPlaceholder("无法加载会话", error.message);
   }
@@ -627,8 +978,23 @@ async function sendMessage(event) {
   if (!text || !threadId || sendingThreads.has(threadId) || currentThread?.control?.busy) return;
 
   const knownMessageIds = new Set((currentThread?.messages || []).map((message) => message.id));
+  const optimisticMessage = {
+    id: `pending-${Date.now()}`,
+    role: "user",
+    kind: "message",
+    text,
+    timestamp: Math.floor(Date.now() / 1000),
+    pending: true,
+    knownMessageIds,
+  };
   sendingThreads.add(threadId);
+  pendingMessage = optimisticMessage;
   composerError = "";
+  messageInput.value = "";
+  resizeComposer();
+  if (currentThread) {
+    renderThread(currentThread, { authoritativeSnapshot: false });
+  }
   updateComposer();
   try {
     const result = await postJson(
@@ -636,17 +1002,6 @@ async function sendMessage(event) {
       { text },
     );
     if (selectedThreadId !== threadId || currentThread?.id !== threadId) return;
-    pendingMessage = {
-      id: `pending-${Date.now()}`,
-      role: "user",
-      kind: "message",
-      text,
-      timestamp: Math.floor(Date.now() / 1000),
-      pending: true,
-      knownMessageIds,
-    };
-    messageInput.value = "";
-    resizeComposer();
     if (currentThread) {
       currentThread = {
         ...currentThread,
@@ -656,11 +1011,23 @@ async function sendMessage(event) {
           busy: true,
         },
       };
-      renderThread(currentThread);
+      renderThread(currentThread, { authoritativeSnapshot: false });
     }
   } catch (error) {
     if (error.message === "UNAUTHORIZED") return showAuth("会话已过期，请重新输入访问密钥。");
-    if (selectedThreadId === threadId) composerError = error.message;
+    if (selectedThreadId === threadId) {
+      if (pendingMessage?.id === optimisticMessage.id) {
+        pendingMessage = null;
+        if (!messageInput.value) {
+          messageInput.value = text;
+          resizeComposer();
+        }
+        if (currentThread) {
+          renderThread(currentThread, { authoritativeSnapshot: false });
+        }
+      }
+      composerError = error.message;
+    }
   } finally {
     sendingThreads.delete(threadId);
     updateComposer();

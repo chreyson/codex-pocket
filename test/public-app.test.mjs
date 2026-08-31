@@ -69,6 +69,8 @@ class FakeElement {
     this.scrollTop = 0;
     this.clientHeight = 100;
     this._textContent = "";
+    this.textContentWrites = 0;
+    this.replaceChildrenCalls = 0;
   }
 
   get textContent() {
@@ -76,6 +78,7 @@ class FakeElement {
   }
 
   set textContent(value) {
+    this.textContentWrites += 1;
     this._textContent = String(value ?? "");
     this.children = [];
   }
@@ -85,6 +88,7 @@ class FakeElement {
   }
 
   replaceChildren(...children) {
+    this.replaceChildrenCalls += 1;
     this.children = [...children];
     this._textContent = "";
   }
@@ -188,6 +192,22 @@ async function eventually(predicate) {
 
 async function createHarness(fetchImpl) {
   FakeEventSource.instances = [];
+  const animationFrames = new Map();
+  let nextAnimationFrameId = 1;
+  const requestAnimationFrame = (callback) => {
+    const id = nextAnimationFrameId++;
+    animationFrames.set(id, callback);
+    return id;
+  };
+  const cancelAnimationFrame = (id) => {
+    animationFrames.delete(id);
+  };
+  const flushAnimationFrames = () => {
+    const callbacks = [...animationFrames.values()];
+    animationFrames.clear();
+    for (const callback of callbacks) callback();
+    return callbacks.length;
+  };
   const elements = Object.fromEntries(ELEMENT_IDS.map((id) => [id, new FakeElement()]));
   elements["auth-screen"].hidden = true;
   elements.app.hidden = true;
@@ -214,9 +234,8 @@ async function createHarness(fetchImpl) {
     history: { replaceState() {} },
     location: { hash: "", pathname: "/", search: "" },
     URLSearchParams,
-    requestAnimationFrame(callback) {
-      callback();
-    },
+    requestAnimationFrame,
+    cancelAnimationFrame,
     setImmediate,
   });
   const source = await fs.readFile(APP_SOURCE_URL, "utf8");
@@ -231,11 +250,36 @@ async function createHarness(fetchImpl) {
       pendingMessage,
       sendingThreads: [...sendingThreads],
       eventSource,
+      selectionEpoch,
+      liveMessages: [...liveMessages.values()].map((live) => ({
+        id: live.message.id,
+        text: live.message.text,
+        completed: live.completed,
+      })),
+      queuedDeltaCount: queuedMessageDeltas.size,
     }),
   };`;
-  vm.runInContext(source + hooks, context, { filename: "public/app.js" });
+  vm.runInContext(`"use strict";\n${source}${hooks}`, context, { filename: "public/app.js" });
   await eventually(() => !elements.app.hidden);
-  return { elements, eventSources: FakeEventSource.instances, hooks: context.__appTest };
+  return {
+    elements,
+    eventSources: FakeEventSource.instances,
+    hooks: context.__appTest,
+    flushAnimationFrames,
+    pendingAnimationFrames: () => animationFrames.size,
+  };
+}
+
+function emitSse(source, event, value) {
+  source.listeners.get(event)({ data: JSON.stringify(value) });
+}
+
+function emptyThreadDetail(id) {
+  return {
+    ...threadSummary(id),
+    messages: [],
+    control: { busy: true, requests: [] },
+  };
 }
 
 test("thread navigation groups conversations by project and search opens matching groups", async () => {
@@ -363,6 +407,65 @@ test("an SSE message arriving before the send response does not leave a duplicat
   assert.equal(harness.elements["message-list"].textContent.match(/sent once/g)?.length, 1);
 });
 
+test("an optimistic user message stays before live replies that beat the send response", async () => {
+  const sendResult = deferred();
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [threadSummary("A")],
+      });
+    }
+    if (url === "/api/threads/A") {
+      return jsonResponse(200, threadDetail("A", "earlier message"));
+    }
+    if (url === "/api/threads/A/messages") return sendResult.promise;
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.flushAnimationFrames();
+  harness.elements["message-input"].value = "test";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
+
+  let rendered = harness.elements["message-list"].children;
+  assert.deepEqual(
+    rendered.map((article) => article.dataset.role),
+    ["assistant", "user"],
+  );
+  assert.equal(rendered[1].children[1].textContent, "test");
+
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "messageStart", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "reply-1",
+    kind: "message",
+    text: "我在，继续即可。",
+    timestamp: 2,
+  });
+  harness.flushAnimationFrames();
+
+  rendered = harness.elements["message-list"].children;
+  assert.deepEqual(
+    rendered.map((article) => article.dataset.role),
+    ["assistant", "user", "assistant"],
+  );
+  assert.deepEqual(
+    rendered.map((article) => article.children[1].textContent),
+    ["earlier message", "test", "我在，继续即可。"],
+  );
+
+  sendResult.resolve(jsonResponse(202, { control: { busy: true } }));
+  await sending;
+  rendered = harness.elements["message-list"].children;
+  assert.deepEqual(
+    rendered.map((article) => article.children[1].textContent),
+    ["earlier message", "test", "我在，继续即可。"],
+  );
+});
+
 test("a stale thread load failure cannot replace the newer conversation", async () => {
   const staleLoad = deferred();
   const harness = await createHarness(async (url) => {
@@ -407,4 +510,271 @@ test("an SSE error that probes as unauthorized returns to sign-in", async () => 
   assert.equal(harness.elements["auth-error"].textContent, "会话已过期，请重新输入访问密钥。");
   assert.equal(harness.hooks.getState().selectedThreadId, "");
   assert.equal(source.closed, true);
+});
+
+test("agent deltas batch into one frame and update one existing message node", async () => {
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [threadSummary("A")],
+      });
+    }
+    if (url === "/api/threads/A") {
+      return jsonResponse(200, emptyThreadDetail("A"));
+    }
+    throw new Error("Unexpected fetch: " + url);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.flushAnimationFrames();
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "messageStart", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    kind: "message",
+    text: "",
+    timestamp: 1,
+  });
+  harness.flushAnimationFrames();
+
+  const article = harness.elements["message-list"].children[0];
+  const body = article.children[1];
+  const textWrites = body.textContentWrites;
+  const listReconciles = harness.elements["message-list"].replaceChildrenCalls;
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "实",
+  });
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "时",
+  });
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "输出",
+  });
+
+  assert.equal(harness.pendingAnimationFrames(), 1);
+  assert.equal(body.textContent, "");
+  harness.flushAnimationFrames();
+  assert.equal(body.textContent, "实时输出");
+  assert.equal(body.textContentWrites, textWrites + 1);
+  assert.equal(harness.elements["message-list"].children[0], article);
+  assert.equal(
+    harness.elements["message-list"].replaceChildrenCalls,
+    listReconciles,
+  );
+  assert.equal(harness.elements["message-list"].children.length, 1);
+});
+
+test("lagging snapshots and queued deltas cannot regress a completed message", async () => {
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [threadSummary("A")],
+      });
+    }
+    if (url === "/api/threads/A") {
+      return jsonResponse(200, emptyThreadDetail("A"));
+    }
+    throw new Error("Unexpected fetch: " + url);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.flushAnimationFrames();
+  const source = harness.eventSources.at(-1);
+  const snapshot = (text) => ({
+    ...threadSummary("A"),
+    messages: [{
+      id: "live-1",
+      role: "assistant",
+      kind: "message",
+      text,
+      timestamp: 1,
+    }],
+    control: { busy: true, requests: [] },
+  });
+
+  emitSse(source, "messageStart", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    kind: "message",
+    text: "实时",
+    timestamp: 1,
+  });
+  harness.flushAnimationFrames();
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "输出",
+  });
+  harness.flushAnimationFrames();
+  emitSse(source, "thread", snapshot("实"));
+  assert.match(harness.elements["message-list"].textContent, /实时输出/);
+  harness.flushAnimationFrames();
+
+  emitSse(source, "thread", snapshot("实时输出完成"));
+  assert.match(harness.elements["message-list"].textContent, /实时输出完成/);
+  harness.flushAnimationFrames();
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "不应出现",
+  });
+  assert.equal(harness.pendingAnimationFrames(), 1);
+  emitSse(source, "messageDone", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    kind: "message",
+    text: "最终文本",
+    timestamp: 1,
+  });
+  assert.equal(harness.hooks.getState().queuedDeltaCount, 0);
+  harness.flushAnimationFrames();
+  assert.match(harness.elements["message-list"].textContent, /最终文本/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /不应出现/);
+
+  emitSse(source, "thread", snapshot("最终"));
+  assert.match(harness.elements["message-list"].textContent, /最终文本/);
+  emitSse(source, "thread", snapshot("最终文本"));
+  assert.equal(harness.hooks.getState().liveMessages.length, 0);
+  assert.equal(harness.elements["message-list"].children.length, 1);
+});
+
+test("queued output and stale A to B to A loads cannot pollute the current view", async () => {
+  const firstALoad = deferred();
+  let aLoads = 0;
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [threadSummary("A"), threadSummary("B")],
+      });
+    }
+    if (url === "/api/threads/A") {
+      aLoads += 1;
+      if (aLoads === 1) return firstALoad.promise;
+      return jsonResponse(200, threadDetail("A", "new A"));
+    }
+    if (url === "/api/threads/B") {
+      return jsonResponse(200, threadDetail("B", "message B"));
+    }
+    throw new Error("Unexpected fetch: " + url);
+  });
+
+  const firstSelection = harness.hooks.selectThread("A");
+  const oldSource = harness.eventSources.at(-1);
+  emitSse(oldSource, "messageStart", {
+    threadId: "A",
+    turnId: "turn-old",
+    itemId: "old-live",
+    kind: "message",
+    text: "old",
+    timestamp: 1,
+  });
+  harness.flushAnimationFrames();
+  emitSse(oldSource, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-old",
+    itemId: "old-live",
+    delta: " queued",
+  });
+  assert.equal(harness.pendingAnimationFrames(), 1);
+
+  await harness.hooks.selectThread("B");
+  await harness.hooks.selectThread("A");
+  harness.flushAnimationFrames();
+  firstALoad.resolve(jsonResponse(200, threadDetail("A", "old A")));
+  await firstSelection;
+
+  emitSse(oldSource, "messageStart", {
+    threadId: "A",
+    turnId: "turn-old",
+    itemId: "late-old",
+    kind: "message",
+    text: "late old source",
+    timestamp: 1,
+  });
+  emitSse(oldSource, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-old",
+    itemId: "late-old",
+    delta: " ignored",
+  });
+  harness.flushAnimationFrames();
+
+  assert.equal(harness.hooks.getState().selectedThreadId, "A");
+  assert.equal(harness.hooks.getState().currentThread.messages[0].text, "new A");
+  assert.match(harness.elements["message-list"].textContent, /new A/);
+  assert.doesNotMatch(
+    harness.elements["message-list"].textContent,
+    /old A|old queued|late old source|ignored/,
+  );
+  assert.equal(harness.hooks.getState().queuedDeltaCount, 0);
+});
+
+test("live output follows the bottom without taking over after the user scrolls up", async () => {
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [threadSummary("A")],
+      });
+    }
+    if (url === "/api/threads/A") {
+      return jsonResponse(200, emptyThreadDetail("A"));
+    }
+    throw new Error("Unexpected fetch: " + url);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.flushAnimationFrames();
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "messageStart", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    kind: "message",
+    text: "a",
+    timestamp: 1,
+  });
+  harness.flushAnimationFrames();
+
+  const list = harness.elements["message-list"];
+  list.dataset.rendered = "true";
+  list.scrollHeight = 1000;
+  list.clientHeight = 300;
+  list.scrollTop = 100;
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "b",
+  });
+  harness.flushAnimationFrames();
+  assert.equal(list.scrollTop, 100);
+
+  list.scrollTop = 650;
+  emitSse(source, "messageDelta", {
+    threadId: "A",
+    turnId: "turn-1",
+    itemId: "live-1",
+    delta: "c",
+  });
+  harness.flushAnimationFrames();
+  assert.equal(list.scrollTop, 1000);
+  assert.match(list.textContent, /abc/);
 });

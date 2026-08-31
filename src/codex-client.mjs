@@ -2,6 +2,12 @@ import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
 
+const MAX_LIVE_MESSAGE_LENGTH = 80_000;
+
+function clipLiveMessageText(value) {
+  return String(value ?? "").slice(0, MAX_LIVE_MESSAGE_LENGTH);
+}
+
 export class CodexAppServer extends EventEmitter {
   constructor({ command = process.env.CODEX_BIN || "codex", requestTimeoutMs = 20_000 } = {}) {
     super();
@@ -180,7 +186,7 @@ export class CodexAppServer extends EventEmitter {
       turnId,
       itemId: item.id,
       kind: item.phase === "commentary" ? "commentary" : "message",
-      text: String(item.text ?? ""),
+      text: clipLiveMessageText(item.text),
       timestamp: this._messageTimestamp(message, params),
       done: false,
     };
@@ -210,8 +216,12 @@ export class CodexAppServer extends EventEmitter {
     }
     if (record.done) return record;
 
-    record.text += params.delta;
-    this.emit("messageDelta", { threadId, turnId, itemId, delta: params.delta });
+    const remaining = MAX_LIVE_MESSAGE_LENGTH - record.text.length;
+    const delta = remaining > 0 ? params.delta.slice(0, remaining) : "";
+    if (delta) {
+      record.text += delta;
+      this.emit("messageDelta", { threadId, turnId, itemId, delta });
+    }
     return record;
   }
 
@@ -236,7 +246,7 @@ export class CodexAppServer extends EventEmitter {
     }
 
     record.kind = item.phase === "commentary" ? "commentary" : "message";
-    record.text = String(item.text ?? "");
+    record.text = clipLiveMessageText(item.text);
     record.done = true;
     this.emit("messageDone", this._publicLiveAgentMessage(record));
     return record;
@@ -396,7 +406,7 @@ export class CodexAppServer extends EventEmitter {
     const snapshotById = new Map(
       messages
         .filter((message) => message?.role === "assistant" && message.id)
-        .map((message) => [message.id, String(message.text ?? "")]),
+        .map((message) => [message.id, clipLiveMessageText(message.text)]),
     );
     let removed = 0;
     for (const [key, record] of this.liveAgentMessages) {

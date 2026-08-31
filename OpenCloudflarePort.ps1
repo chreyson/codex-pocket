@@ -12,12 +12,19 @@ New-Item -ItemType Directory -Force -Path $dataDirectory | Out-Null
 
 try {
     if (-not (Test-Path -LiteralPath $program -PathType Leaf)) {
-        throw "cloudflared.exe was not found at $program"
+        $installed = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
+        if ($installed) {
+            $program = $installed.Source
+        } else {
+            throw "cloudflared.exe was not found at $program or on PATH"
+        }
     }
+    $program = (Resolve-Path -LiteralPath $program).Path
 
     $specs = @(
-        @{ Name = 'Codex Pocket - Cloudflare Tunnel TCP 7844'; Protocol = 'TCP' },
-        @{ Name = 'Codex Pocket - Cloudflare Tunnel UDP 7844'; Protocol = 'UDP' }
+        @{ Name = 'Codex Pocket - Cloudflare Tunnel UDP 7844'; Protocol = 'UDP'; RemotePort = 7844 },
+        @{ Name = 'Codex Pocket - Cloudflare Tunnel TCP 7844'; Protocol = 'TCP'; RemotePort = 7844 },
+        @{ Name = 'Codex Pocket - Cloudflare HTTPS TCP 443'; Protocol = 'TCP'; RemotePort = 443 }
     )
 
     foreach ($spec in $specs) {
@@ -25,7 +32,7 @@ try {
         if ($rule) {
             $rule | Set-NetFirewallRule -Enabled True -Direction Outbound -Action Allow -Profile Any
             $rule | Get-NetFirewallApplicationFilter | Set-NetFirewallApplicationFilter -Program $program
-            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol $spec.Protocol -LocalPort Any -RemotePort 7844
+            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol $spec.Protocol -LocalPort Any -RemotePort $spec.RemotePort
         } else {
             New-NetFirewallRule `
                 -DisplayName $spec.Name `
@@ -34,7 +41,7 @@ try {
                 -Action Allow `
                 -Program $program `
                 -Protocol $spec.Protocol `
-                -RemotePort 7844 `
+                -RemotePort $spec.RemotePort `
                 -Profile Any | Out-Null
         }
     }

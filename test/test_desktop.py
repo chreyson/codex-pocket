@@ -1,12 +1,15 @@
 import io
 import os
 import subprocess
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from codex_pocket import (
     ServiceManager,
+    SingleInstanceLock,
     cloudflared_download_spec,
     constrain_tooltip_position,
     dpi_scale,
@@ -19,6 +22,18 @@ from codex_pocket import (
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_single_instance_lock_rejects_a_second_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "desktop.lock"
+            first = SingleInstanceLock(path)
+            second = SingleInstanceLock(path)
+
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+            first.release()
+            self.assertTrue(second.acquire())
+            second.release()
+
     def test_parses_quick_tunnel_url(self):
         line = "INF Your quick Tunnel has been created! https://plain-field-9.trycloudflare.com"
         self.assertEqual(

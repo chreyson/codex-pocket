@@ -16,13 +16,14 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import font as tkfont, messagebox
 
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / ".data"
 TOOLS_DIR = APP_DIR / ".tools"
 LOG_PATH = DATA_DIR / "desktop.log"
+INSTANCE_LOCK_PATH = DATA_DIR / "desktop.lock"
 TUNNEL_URL_PATTERN = re.compile(
     r"https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com",
     re.IGNORECASE,
@@ -292,6 +293,54 @@ def terminate_process_tree(process: subprocess.Popen | None) -> None:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+
+        self.handle = handle
+        return True
+
+    def release(self) -> None:
+        handle = self.handle
+        self.handle = None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 class ServiceManager:
@@ -1632,26 +1681,41 @@ class PocketWindow:
 
 
 def main() -> None:
-    if "--headless" in sys.argv:
-        manager = ServiceManager(
-            on_status=lambda value: print(f"STATUS {value}", flush=True),
-            on_ready=lambda url, key: print(f"READY {url} {key}", flush=True),
-            on_failure=lambda message: print(f"ERROR {message}", flush=True),
-        )
-        try:
-            manager.start()
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            manager.stop()
+    instance_lock = SingleInstanceLock(INSTANCE_LOCK_PATH)
+    if not instance_lock.acquire():
+        if "--headless" in sys.argv:
+            print("ERROR Codex Pocket 已经在运行", flush=True)
+        else:
+            enable_windows_dpi_awareness()
+            notice = tk.Tk()
+            notice.withdraw()
+            messagebox.showinfo("Codex Pocket", "Codex Pocket 已经在运行。")
+            notice.destroy()
         return
 
-    enable_windows_dpi_awareness()
-    root = tk.Tk()
-    PocketWindow(root)
-    root.mainloop()
+    try:
+        if "--headless" in sys.argv:
+            manager = ServiceManager(
+                on_status=lambda value: print(f"STATUS {value}", flush=True),
+                on_ready=lambda url, key: print(f"READY {url} {key}", flush=True),
+                on_failure=lambda message: print(f"ERROR {message}", flush=True),
+            )
+            try:
+                manager.start()
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                manager.stop()
+            return
+
+        enable_windows_dpi_awareness()
+        root = tk.Tk()
+        PocketWindow(root)
+        root.mainloop()
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

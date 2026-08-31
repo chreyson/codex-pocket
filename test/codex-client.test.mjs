@@ -236,3 +236,62 @@ test("reasoning and tool notifications never enter the live message cache", () =
   assert.deepEqual(events, []);
   assert.deepEqual(client.liveAgentMessagesForThread("thread-1"), []);
 });
+
+test("live message buffering is capped and still clears against a long snapshot", () => {
+  const client = new CodexAppServer();
+  const deltas = [];
+  client.on("messageDelta", (value) => deltas.push(value.delta));
+
+  client._handleLine(JSON.stringify({
+    method: "item/started",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { id: "long-item", type: "agentMessage", text: "" },
+    },
+  }));
+  client._handleLine(JSON.stringify({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "long-item",
+      delta: "x".repeat(80_010),
+    },
+  }));
+  client._handleLine(JSON.stringify({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "long-item",
+      delta: "ignored",
+    },
+  }));
+
+  assert.equal(deltas.length, 1);
+  assert.equal(deltas[0].length, 80_000);
+  assert.equal(
+    client.liveAgentMessagesForThread("thread-1")[0].value.text.length,
+    80_000,
+  );
+
+  const finalText = `${"x".repeat(80_010)}final`;
+  client._handleLine(JSON.stringify({
+    method: "item/completed",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { id: "long-item", type: "agentMessage", text: finalText },
+    },
+  }));
+  assert.equal(
+    client.liveAgentMessagesForThread("thread-1")[0].value.text.length,
+    80_000,
+  );
+  assert.equal(client.confirmLiveAgentMessageSnapshot("thread-1", [{
+    id: "long-item",
+    role: "assistant",
+    text: finalText,
+  }]), 1);
+});

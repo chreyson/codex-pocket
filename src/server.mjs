@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServer } from "./codex-client.mjs";
+import { CodexDesktopBridge } from "./codex-desktop-bridge.mjs";
 import {
   parseApprovalPayload,
   parseMessagePayload,
@@ -44,6 +45,7 @@ if (!accessToken) {
 }
 
 const codex = new CodexAppServer();
+const desktopBridge = new CodexDesktopBridge();
 let codexState = "starting";
 let codexError = "";
 codex.on("ready", () => {
@@ -316,12 +318,26 @@ const server = createServer(async (request, response) => {
       if (current.status === "active" && !current.control.busy) {
         return sendJson(response, 409, { error: "这个会话正在电脑端执行，请完成后再发送" });
       }
-      const result = await codex.startTurn(threadRoute.threadId, text);
+      let result;
+      let delivery;
+      try {
+        result = await desktopBridge.sendMessage(threadRoute.threadId, text);
+        delivery = result.delivery;
+      } catch (error) {
+        if (error.code !== "DESKTOP_BRIDGE_UNAVAILABLE") throw error;
+        result = await codex.startTurn(threadRoute.threadId, text);
+        delivery = "app-server";
+      }
       schedulePoll(10);
       return sendJson(response, 202, {
         ok: true,
+        delivery,
         turnId: result.turn?.id || null,
-        control: codex.threadControlState(threadRoute.threadId),
+        control: {
+          ...codex.threadControlState(threadRoute.threadId),
+          busy: true,
+          phase: "starting",
+        },
       });
     }
 
@@ -378,6 +394,12 @@ const server = createServer(async (request, response) => {
     if (error.code === "TURN_ACTIVE") {
       status = 409;
       message = "Codex 正在处理这个会话，请完成后再发送";
+    } else if (error.code === "DESKTOP_SEND_FAILED") {
+      status = 409;
+      message = error.message || "Codex App 未接受这条消息";
+    } else if (/already has an active writer/i.test(message)) {
+      status = 409;
+      message = "会话仍由 Codex App 持有，但 Pocket 未连接到桌面桥接。请保持 Codex App 打开并重新开启 Pocket 服务";
     } else if (error.code === "REQUEST_NOT_FOUND") {
       status = 404;
       message = "这个审批请求已经失效";

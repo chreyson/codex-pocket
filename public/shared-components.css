@@ -1,0 +1,64 @@
+.status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--status-dot-color, var(--subtle));
+}
+
+.icon-button {
+  width: var(--icon-button-size, 40px);
+  height: var(--icon-button-size, 40px);
+  flex: 0 0 var(--icon-button-size, 40px);
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--icon-button-radius, var(--radius-control));
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.icon-button:hover:not(:disabled),
+.icon-button:focus-visible:not(:disabled) {
+  border-color: var(--icon-button-hover-border, var(--line));
+  background: var(--icon-button-hover-bg, var(--surface-soft));
+  color: var(--ink);
+}
+
+.icon-button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.icon-button svg {
+  width: var(--icon-button-icon-size, 20px);
+  height: var(--icon-button-icon-size, 20px);
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.command-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: var(--primary);
+  color: var(--canvas);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.command-button:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.command-button:disabled {
+  cursor: default;
+}

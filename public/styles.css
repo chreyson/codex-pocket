@@ -1,26 +1,12 @@
+@import url("./design-tokens.css");
+@import url("./shared-components.css");
+
 :root {
-  color-scheme: light;
-  font-family: ui-sans-serif, "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  font-family: var(--font-sans);
   font-synthesis: none;
   letter-spacing: 0;
-  background: #ffffff;
-  color: #202123;
-  --canvas: #ffffff;
-  --sidebar: #edf3f5;
-  --sidebar-selected: #dfe8eb;
-  --surface-soft: #f7f7f8;
-  --surface-hover: #eeeeef;
-  --ink: #202123;
-  --muted: #626469;
-  --subtle: #6b6d72;
-  --line: #e3e3e6;
-  --line-strong: #d1d1d5;
-  --primary: #202123;
-  --primary-hover: #343438;
-  --success: #0b9963;
-  --warning: #c77a17;
-  --danger: #cf4b3f;
-  --focus: #73787c;
+  background: var(--canvas);
+  color: var(--ink);
 }
 
 * {
@@ -287,21 +273,17 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
-.status-dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 7px;
-  border-radius: 50%;
-  background: var(--warning);
+.connection-state {
+  --status-dot-color: var(--warning);
 }
 
-.connection-state[data-state="ready"] .status-dot {
-  background: var(--success);
+.connection-state[data-state="ready"] {
+  --status-dot-color: var(--success);
 }
 
-.connection-state[data-state="error"] .status-dot,
-.connection-state[data-state="disconnected"] .status-dot {
-  background: var(--danger);
+.connection-state[data-state="error"],
+.connection-state[data-state="disconnected"] {
+  --status-dot-color: var(--danger);
 }
 
 .search-row {
@@ -543,33 +525,11 @@ textarea:focus-visible {
 }
 
 .icon-button {
-  width: 40px;
-  height: 40px;
-  flex: 0 0 40px;
-  display: grid;
-  place-items: center;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-}
-
-.icon-button:hover,
-.icon-button:focus-visible {
-  border-color: var(--line);
-  background: var(--surface-soft);
-  color: var(--ink);
-  outline: none;
-}
-
-.icon-button svg {
-  width: 20px;
-  height: 20px;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.8;
+  --icon-button-size: 40px;
+  --icon-button-icon-size: 20px;
+  --icon-button-radius: 8px;
+  --icon-button-hover-bg: var(--surface-soft);
+  --icon-button-hover-border: var(--line);
 }
 
 .back-button {
@@ -647,10 +607,15 @@ textarea:focus-visible {
 
 .message-body {
   color: var(--ink);
-  font-size: 14px;
-  line-height: 1.7;
+  font-size: 15px;
+  line-height: 1.72;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.message[data-role="user"] .message-meta,
+.message[data-role="assistant"] .message-meta {
+  display: none;
 }
 
 .message[data-role="user"] {
@@ -682,7 +647,7 @@ textarea:focus-visible {
   padding: 0;
   background: transparent;
   color: var(--ink);
-  font-size: 14px;
+  font-size: 15px;
 }
 
 .message[data-role="system"] {
@@ -716,7 +681,7 @@ textarea:focus-visible {
   align-items: center;
   gap: 8px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.45;
 }
 
@@ -1142,7 +1107,7 @@ textarea:focus-visible {
 
   .message[data-kind="commentary"] .message-body,
   .message[data-kind="plan"] .message-body {
-    font-size: 14px;
+    font-size: 15px;
   }
 
   .approval-tray {
@@ -1224,23 +1189,8 @@ textarea:focus-visible {
 
 @media (prefers-color-scheme: dark) {
   :root {
-    color-scheme: dark;
-    --canvas: #1f2022;
-    --sidebar: #252a2c;
-    --sidebar-selected: #353c3f;
-    --surface-soft: #292a2d;
-    --surface-hover: #333438;
-    --ink: #f2f2f3;
-    --muted: #b6b7bb;
-    --subtle: #898b90;
-    --line: #3a3b3f;
-    --line-strong: #4a4b50;
-    --primary: #f1f1f2;
-    --primary-hover: #ffffff;
-    --danger: #e46f64;
-    --focus: #a8aaaf;
-    background: #1f2022;
-    color: #f2f2f3;
+    background: var(--canvas);
+    color: var(--ink);
   }
 
   .thread-pane {
