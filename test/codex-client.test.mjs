@@ -228,6 +228,33 @@ test("starting a turn resumes the thread and sends text input", async () => {
   assert.equal(client.threadControlState("thread-1").busy, false);
 });
 
+test("starting a turn sends local images and a stable client message id", async () => {
+  const client = new CodexAppServer();
+  const calls = [];
+  client.start = async () => {};
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === "thread/resume") return { thread: { id: "thread-1", turns: [] } };
+    return { turn: { id: "turn-image", status: "inProgress" } };
+  };
+
+  await client.startTurn("thread-1", "检查截图", {
+    clientMessageId: "web-image-message",
+    images: [{ path: "C:\\data\\images\\screen.png", detail: "high" }],
+  });
+
+  const params = calls.find((call) => call.method === "turn/start").params;
+  assert.equal(params.clientUserMessageId, "web-image-message");
+  assert.deepEqual(params.input, [
+    {
+      type: "localImage",
+      path: "C:\\data\\images\\screen.png",
+      detail: "high",
+    },
+    { type: "text", text: "检查截图", text_elements: [] },
+  ]);
+});
+
 test("starting an advanced turn sends model effort mode and structured skills", async () => {
   const client = new CodexAppServer();
   const calls = [];
@@ -266,6 +293,82 @@ test("starting an advanced turn sends model effort mode and structured skills", 
     { type: "skill", name: "docs", path: "C:\\skills\\docs\\SKILL.md" },
     { type: "text", text: "制定方案", text_elements: [] },
   ]);
+});
+
+test("starting a persistent thread uses the selected project cwd", async () => {
+  const client = new CodexAppServer();
+  const calls = [];
+  client.start = async () => {};
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    return {
+      thread: { id: "thread-new", turns: [] },
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+    };
+  };
+
+  await client.startThread({ cwd: "C:\\work\\sample" });
+
+  assert.deepEqual(calls, [{
+    method: "thread/start",
+    params: { ephemeral: false, cwd: "C:\\work\\sample" },
+  }]);
+  assert.equal(client.loadedThreads.has("thread-new"), true);
+  assert.equal(client.threadSettings.get("thread-new").model, "gpt-5.6-sol");
+});
+
+test("invalid thread lifecycle responses never pollute loaded session state", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  client.request = async (method) => method === "thread/resume"
+    ? { thread: { id: "thread-unexpected", turns: [] } }
+    : { thread: null };
+
+  await assert.rejects(
+    () => client.resumeThread("thread-expected"),
+    (error) => error.code === "INVALID_THREAD_RESPONSE",
+  );
+  assert.equal(client.loadedThreads.size, 0);
+  assert.equal(client.threadSettings.size, 0);
+
+  await assert.rejects(
+    () => client.startThread({ cwd: "C:\\work\\sample" }),
+    (error) => error.code === "INVALID_THREAD_RESPONSE",
+  );
+  assert.equal(client.loadedThreads.size, 0);
+});
+
+test("Steer targets the expected active turn with structured input", async () => {
+  const client = new CodexAppServer();
+  const calls = [];
+  client.start = async () => {};
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    return {};
+  };
+  client.activeTurns.set("thread-1", "turn-active");
+
+  await client.steerTurn("thread-1", "检查失败日志", {
+    turnId: "turn-active",
+    clientMessageId: "web-steer-1",
+    skills: [{ name: "review", path: "C:\\skills\\review\\SKILL.md" }],
+    images: [{ path: "C:\\data\\error.png" }],
+  });
+
+  assert.deepEqual(calls, [{
+    method: "turn/steer",
+    params: {
+      threadId: "thread-1",
+      expectedTurnId: "turn-active",
+      clientUserMessageId: "web-steer-1",
+      input: [
+        { type: "skill", name: "review", path: "C:\\skills\\review\\SKILL.md" },
+        { type: "localImage", path: "C:\\data\\error.png", detail: "auto" },
+        { type: "text", text: "检查失败日志", text_elements: [] },
+      ],
+    },
+  }]);
 });
 
 test("interrupting an active turn uses the official turn id and stays busy until completion", async () => {

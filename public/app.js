@@ -9,6 +9,7 @@ const threadList = document.querySelector("#thread-list");
 const threadEmpty = document.querySelector("#thread-empty");
 const threadEmptyTitle = document.querySelector("#thread-empty-title");
 const threadEmptyDetail = document.querySelector("#thread-empty-detail");
+const threadActionStatus = document.querySelector("#thread-action-status");
 const threadSearch = document.querySelector("#thread-search");
 const connectionState = document.querySelector("#connection-state");
 const connectionLabel = document.querySelector("#connection-label");
@@ -30,15 +31,26 @@ const goalBanner = document.querySelector("#goal-banner");
 const goalObjective = document.querySelector("#goal-objective");
 const goalComplete = document.querySelector("#goal-complete");
 const goalClear = document.querySelector("#goal-clear");
+const composerImages = document.querySelector("#composer-images");
+const imageInput = document.querySelector("#image-input");
+const imageUploadButton = document.querySelector("#image-upload-button");
 const messageInput = document.querySelector("#message-input");
 const modelControl = document.querySelector("#model-control");
 const modelLabel = document.querySelector("#model-label");
 const effortControl = document.querySelector("#effort-control");
 const effortLabelNode = document.querySelector("#effort-label");
 const composerStatus = document.querySelector("#composer-status");
+const deliveryControl = document.querySelector("#delivery-control");
+const interruptButton = document.querySelector("#interrupt-button");
 const sendButton = document.querySelector("#send-button");
 const backButton = document.querySelector("#back-button");
 const refreshButton = document.querySelector("#refresh-button");
+const imageViewer = document.querySelector("#image-viewer");
+const imageViewerImage = document.querySelector("#image-viewer-image");
+const imageViewerCaption = document.querySelector("#image-viewer-caption");
+const imageViewerClose = document.querySelector("#image-viewer-close");
+const imageViewerPrev = document.querySelector("#image-viewer-prev");
+const imageViewerNext = document.querySelector("#image-viewer-next");
 
 let threads = [];
 let selectedThreadId = "";
@@ -52,6 +64,8 @@ const interruptRequestThreads = new Set();
 const deliveredMessageIds = new Set();
 let composerError = "";
 const collapsedProjects = new Set();
+const creatingProjects = new Set();
+const expandedTurns = new Set();
 const resolvingRequests = new Set();
 const liveMessages = new Map();
 const messageNodes = new Map();
@@ -61,10 +75,24 @@ let desktopThreadSnapshot = null;
 let composerCatalog = null;
 let composerMenuKind = "";
 let goalUpdating = false;
+let pendingImages = [];
+let nextPendingImageId = 1;
+let viewerImages = [];
+let viewerImageIndex = 0;
+let runningMessageAction = "queue";
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const MAX_LIVE_MESSAGE_LENGTH = 80_000;
 const REQUEST_TIMEOUT_MS = 35_000;
+const UPLOAD_TIMEOUT_MS = 120_000;
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE = 4;
+const SUPPORTED_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]);
 const COMPOSER_STORAGE_KEY = "codex-pocket-composer-v1";
 const EFFORT_LABELS = {
   none: "无",
@@ -109,20 +137,23 @@ let composerSelection = {
   ...storedComposerSelection(),
 };
 
-function createSidebarIcon(name) {
+function createIcon(paths) {
   const svg = document.createElementNS(SVG_NAMESPACE, "svg");
   svg.setAttribute("aria-hidden", "true");
   svg.setAttribute("viewBox", "0 0 24 24");
-
-  const paths = name === "folder"
-    ? ["M3 6.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z", "M3 10h18"]
-    : [];
   for (const value of paths) {
-    const path = document.createElementNS(SVG_NAMESPACE, "path");
-    path.setAttribute("d", value);
-    svg.append(path);
+    const element = document.createElementNS(SVG_NAMESPACE, "path");
+    element.setAttribute("d", value);
+    svg.append(element);
   }
   return svg;
+}
+
+function createSidebarIcon(name) {
+  const paths = name === "folder"
+    ? ["M3 6.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z", "M3 10h18"]
+    : name === "plus" ? ["M12 5v14", "M5 12h14"] : [];
+  return createIcon(paths);
 }
 
 function fragmentToken() {
@@ -170,10 +201,11 @@ async function createSession(token) {
   }
 }
 
-async function requestJson(url, options = {}) {
+async function requestJson(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
   const { response, body } = await fetchJsonWithTimeout(
     url,
     { cache: "no-store", ...options },
+    timeoutMs,
   );
   if (response.status === 401) throw new Error("UNAUTHORIZED");
   if (!response.ok) throw new Error(body.error || `请求失败：${response.status}`);
@@ -208,6 +240,7 @@ function resetTransientOperations() {
   sendingThreads.clear();
   interruptingThreads.clear();
   interruptRequestThreads.clear();
+  creatingProjects.clear();
   resolvingRequests.clear();
   goalUpdating = false;
   composerError = "";
@@ -216,6 +249,8 @@ function resetTransientOperations() {
 function showAuth(message = "") {
   closeEvents();
   closeComposerMenu();
+  closeImageViewer();
+  discardPendingImages();
   selectionEpoch += 1;
   resetLiveRendering();
   selectedThreadId = "";
@@ -223,6 +258,8 @@ function showAuth(message = "") {
   pendingMessage = null;
   resetTransientOperations();
   composerCatalog = null;
+  threadActionStatus.hidden = true;
+  threadActionStatus.textContent = "";
   app.classList.remove("conversation-open");
   messageList.replaceChildren();
   approvalTray.replaceChildren();
@@ -292,6 +329,33 @@ function statusLabel(status) {
   return labels[status] || status || "未知";
 }
 
+function setThreadActionStatus(message = "", state = "") {
+  threadActionStatus.textContent = message;
+  threadActionStatus.hidden = !message;
+  threadActionStatus.dataset.state = state;
+}
+
+async function createProjectThread(projectName, projectThreadId) {
+  if (!projectThreadId || creatingProjects.has(projectThreadId)) return;
+  creatingProjects.add(projectThreadId);
+  setThreadActionStatus(`正在为 ${projectName} 新建会话`, "loading");
+  renderThreads();
+  try {
+    const result = await postJson("/api/threads", { projectThreadId });
+    if (!result.thread?.id) throw new Error("新会话响应无效");
+    threads = [result.thread, ...threads.filter((thread) => thread.id !== result.thread.id)];
+    setThreadActionStatus();
+    renderThreads();
+    await selectThread(result.thread.id);
+  } catch (error) {
+    if (handleUnauthorized(error)) return;
+    setThreadActionStatus(error.message, "error");
+  } finally {
+    creatingProjects.delete(projectThreadId);
+    renderThreads();
+  }
+}
+
 function renderThreads() {
   const query = threadSearch.value.trim().toLocaleLowerCase();
   const visible = threads.filter((thread) => {
@@ -319,29 +383,45 @@ function renderThreads() {
     group.className = "project-group";
     group.setAttribute("aria-label", projectName);
 
-    const header = document.createElement("button");
-    header.type = "button";
+    const header = document.createElement("div");
     header.className = "project-header";
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "project-toggle";
 
     const folder = createSidebarIcon("folder");
     folder.classList.add("project-folder-icon");
     const name = document.createElement("span");
     name.className = "project-name";
     name.textContent = projectName;
-    header.append(folder, name);
+    toggle.append(folder, name);
+
+    const createButton = document.createElement("button");
+    createButton.type = "button";
+    createButton.className = "project-create";
+    createButton.append(createSidebarIcon("plus"));
+    createButton.setAttribute("aria-label", `在 ${projectName} 中新建会话`);
+    createButton.title = `在 ${projectName} 中新建会话`;
+    createButton.disabled = creatingProjects.has(projectThreads[0]?.id);
+    createButton.setAttribute("aria-busy", String(createButton.disabled));
+    createButton.addEventListener("click", () => {
+      void createProjectThread(projectName, projectThreads[0]?.id);
+    });
+    header.append(toggle, createButton);
 
     const items = document.createElement("div");
     items.className = "project-threads";
     const collapsed = !query && collapsedProjects.has(projectName);
-    header.setAttribute("aria-expanded", String(!collapsed));
-    header.title = collapsed ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.title = collapsed ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
     items.hidden = collapsed;
 
-    header.addEventListener("click", () => {
+    toggle.addEventListener("click", () => {
       if (query) return;
-      const expanded = header.getAttribute("aria-expanded") === "true";
-      header.setAttribute("aria-expanded", String(!expanded));
-      header.title = expanded ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      toggle.title = expanded ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
       items.hidden = expanded;
       if (expanded) collapsedProjects.add(projectName);
       else collapsedProjects.delete(projectName);
@@ -395,12 +475,16 @@ function groupActivityMessages(messages) {
       continue;
     }
     const current = grouped.at(-1);
-    if (current?.kind === "activityGroup") {
+    if (
+      current?.kind === "activityGroup"
+      && current.turnId === (message.turnId || "")
+    ) {
       current.activities.push(message);
       current.timestamp = message.timestamp || current.timestamp;
     } else {
       grouped.push({
         id: `activity-group-${message.id}`,
+        turnId: message.turnId || "",
         role: "system",
         kind: "activityGroup",
         timestamp: message.timestamp,
@@ -429,9 +513,6 @@ function mergeRepeatedActivities(activities) {
 }
 
 function createActivityIcon(type) {
-  const svg = document.createElementNS(SVG_NAMESPACE, "svg");
-  svg.setAttribute("aria-hidden", "true");
-  svg.setAttribute("viewBox", "0 0 24 24");
   const paths = {
     command: ["M4 17.5v-11A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2h-11A2.5 2.5 0 0 1 4 17.5Z", "m7.5 9 2.5 2.5L7.5 14", "M12.5 14h4"],
     file: ["M4 19.5A2.5 2.5 0 0 1 6.5 17H20", "M6.5 3H20v18H6.5A2.5 2.5 0 0 1 4 18.5v-13A2.5 2.5 0 0 1 6.5 3Z"],
@@ -440,12 +521,7 @@ function createActivityIcon(type) {
     collab: ["M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2", "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z", "M22 21v-2a4 4 0 0 0-3-3.87", "M16 3.13a4 4 0 0 1 0 7.75"],
     context: ["M4 7h16", "M7 3 3 4-3 4", "M20 17H4", "m17 21-3-4 3-4"],
   }[type] || ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"];
-  for (const value of paths) {
-    const path = document.createElementNS(SVG_NAMESPACE, "path");
-    path.setAttribute("d", value);
-    svg.append(path);
-  }
-  return svg;
+  return createIcon(paths);
 }
 
 function activityStatusLabel(status) {
@@ -524,6 +600,172 @@ function selectedModel() {
   return composerCatalog?.models?.find((model) => model.id === composerSelection.model) || null;
 }
 
+function selectedModelSupportsImages() {
+  return selectedModel()?.supportsImages !== false;
+}
+
+function localPreviewUrl(file) {
+  try {
+    return typeof globalThis.URL?.createObjectURL === "function"
+      ? globalThis.URL.createObjectURL(file)
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function releasePreviewUrl(value) {
+  if (!String(value || "").startsWith("blob:")) return;
+  try {
+    globalThis.URL?.revokeObjectURL?.(value);
+  } catch {
+    // Object URLs are a progressive enhancement for local previews.
+  }
+}
+
+async function deleteUploadedImage(id) {
+  if (!id) return;
+  try {
+    await requestJson(`/api/uploads/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (error) {
+    if (error.message === "UNAUTHORIZED") handleUnauthorized(error);
+  }
+}
+
+function discardPendingImages() {
+  const discarded = pendingImages;
+  pendingImages = [];
+  for (const image of discarded) {
+    releasePreviewUrl(image.previewUrl);
+    if (image.id) void deleteUploadedImage(image.id);
+  }
+  renderPendingImages();
+  updateComposer();
+}
+
+async function removePendingImage(localId) {
+  const index = pendingImages.findIndex((image) => image.localId === localId);
+  if (index === -1) return;
+  const [removed] = pendingImages.splice(index, 1);
+  releasePreviewUrl(removed.previewUrl);
+  renderPendingImages();
+  updateComposer();
+  if (removed.id) await deleteUploadedImage(removed.id);
+}
+
+function renderPendingImages() {
+  composerImages.replaceChildren();
+  composerImages.hidden = pendingImages.length === 0;
+  for (const image of pendingImages) {
+    const item = document.createElement("div");
+    item.className = "composer-image";
+    item.dataset.status = image.status;
+
+    if (image.previewUrl || image.src) {
+      const preview = document.createElement("img");
+      preview.src = image.previewUrl || image.src;
+      preview.alt = image.name || "待发送图片";
+      item.append(preview);
+    }
+
+    if (image.status !== "ready") {
+      const status = document.createElement("span");
+      status.className = "composer-image-status";
+      status.textContent = image.status === "error" ? "失败" : "上传中";
+      item.append(status);
+    }
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "composer-image-remove";
+    remove.title = `移除图片：${image.name || "图片"}`;
+    remove.setAttribute("aria-label", remove.title);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removePendingImage(image.localId));
+    item.append(remove);
+    composerImages.append(item);
+  }
+}
+
+async function uploadPendingImage(item) {
+  try {
+    const result = await requestJson("/api/uploads", {
+      method: "POST",
+      headers: {
+        "Content-Type": item.file.type || "application/octet-stream",
+        "X-File-Name": encodeURIComponent(item.name),
+      },
+      body: item.file,
+    }, UPLOAD_TIMEOUT_MS);
+    const current = pendingImages.find((image) => image.localId === item.localId);
+    if (!current) {
+      if (result.image?.id) void deleteUploadedImage(result.image.id);
+      return;
+    }
+    releasePreviewUrl(current.previewUrl);
+    current.previewUrl = "";
+    current.id = result.image?.id || "";
+    current.src = result.image?.src || "";
+    current.mimeType = result.image?.mimeType || current.file.type || "";
+    current.status = current.id && current.src ? "ready" : "error";
+    if (current.status === "error") throw new Error("图片上传响应无效");
+  } catch (error) {
+    const current = pendingImages.find((image) => image.localId === item.localId);
+    if (current) {
+      current.status = "error";
+      current.error = error.message;
+      composerError = error.message;
+    }
+    if (handleUnauthorized(error)) return;
+  } finally {
+    renderPendingImages();
+    updateComposer();
+  }
+}
+
+async function addPendingImages(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+  if (!selectedModelSupportsImages()) {
+    composerError = "所选模型不支持图片输入";
+    updateComposer();
+    return;
+  }
+  const slots = Math.max(0, MAX_IMAGES_PER_MESSAGE - pendingImages.length);
+  if (files.length > slots) composerError = `一条消息最多上传 ${MAX_IMAGES_PER_MESSAGE} 张图片`;
+
+  const additions = [];
+  for (const file of files.slice(0, slots)) {
+    if (file.type && !SUPPORTED_IMAGE_TYPES.has(file.type)) {
+      composerError = "仅支持 PNG、JPEG、WebP 或 GIF 图片";
+      continue;
+    }
+    if (!Number.isFinite(file.size) || file.size <= 0) {
+      composerError = "图片文件为空";
+      continue;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      composerError = "单张图片不能超过 12 MB";
+      continue;
+    }
+    const image = {
+      localId: `local-image-${Date.now()}-${nextPendingImageId++}`,
+      file,
+      name: String(file.name || "图片").slice(0, 160),
+      previewUrl: localPreviewUrl(file),
+      src: "",
+      id: "",
+      status: "uploading",
+      error: "",
+    };
+    pendingImages.push(image);
+    additions.push(image);
+  }
+  renderPendingImages();
+  updateComposer();
+  await Promise.all(additions.map(uploadPendingImage));
+}
+
 function effortLabel(value) {
   return EFFORT_LABELS[value] || value || "强度";
 }
@@ -567,21 +809,30 @@ function applyComposerCatalog(value) {
 function controlIsBusy() {
   return goalUpdating
     || sendingThreads.has(selectedThreadId)
-    || interruptingThreads.has(selectedThreadId)
-    || Boolean(currentThread?.control?.busy);
+    || interruptingThreads.has(selectedThreadId);
 }
 
 function updateComposerControlAvailability() {
   const busy = controlIsBusy();
+  const running = Boolean(currentThread?.control?.busy);
   const hasModels = Boolean(composerCatalog?.models?.length);
-  modelControl.disabled = busy || !hasModels;
-  effortControl.disabled = busy || !selectedModel()?.efforts?.length;
+  const ready = currentThread?.id === selectedThreadId;
+  modelControl.disabled = busy || running || !hasModels;
+  effortControl.disabled = busy || running || !selectedModel()?.efforts?.length;
   skillControl.disabled = busy || !composerCatalog?.features?.skills;
+  imageUploadButton.disabled = busy
+    || !ready
+    || !selectedModelSupportsImages()
+    || pendingImages.length >= MAX_IMAGES_PER_MESSAGE;
+  imageInput.disabled = imageUploadButton.disabled;
+  imageUploadButton.title = selectedModelSupportsImages()
+    ? "添加图片"
+    : "所选模型不支持图片输入";
   for (const button of modeControl.children) {
-    button.disabled = busy || !modeAvailable(button.dataset.mode);
+    button.disabled = busy || running || !modeAvailable(button.dataset.mode);
   }
-  goalComplete.disabled = busy || !activeGoal();
-  goalClear.disabled = busy || !activeGoal();
+  goalComplete.disabled = busy || running || !activeGoal();
+  goalClear.disabled = busy || running || !activeGoal();
 }
 
 function renderSelectedSkills() {
@@ -629,6 +880,7 @@ function renderComposerControls() {
   skillCount.hidden = skillTotal === 0;
   skillCount.textContent = skillTotal ? String(skillTotal) : "";
   renderSelectedSkills();
+  renderPendingImages();
 
   messageInput.placeholder = composerSelection.mode === "plan"
     ? "描述要规划的任务"
@@ -706,9 +958,15 @@ function renderModelMenu() {
       if (!model.efforts.some((effort) => effort.id === composerSelection.effort)) {
         composerSelection.effort = model.defaultEffort || model.efforts[0]?.id || "";
       }
+      if (pendingImages.length && model.supportsImages === false) {
+        composerError = "所选模型不支持图片输入";
+      } else if (composerError === "所选模型不支持图片输入") {
+        composerError = "";
+      }
       persistComposerSelection();
       closeComposerMenu();
       renderComposerControls();
+      updateComposer();
     });
     list.append(row);
   }
@@ -801,18 +1059,16 @@ function toggleSkill(name) {
   renderComposerControls();
 }
 
-async function clearActiveGoal({ nextMode = "default" } = {}) {
+async function mutateActiveGoal(mutation, { nextMode = "default", clear = false } = {}) {
   if (!selectedThreadId || !activeGoal() || goalUpdating) return;
   const threadId = selectedThreadId;
   const previousMode = composerSelection.mode;
   goalUpdating = true;
   updateComposer();
   try {
-    await requestJson(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
-      method: "DELETE",
-    });
+    const result = await mutation(threadId);
     if (selectedThreadId !== threadId) return;
-    composerCatalog.goal = null;
+    composerCatalog.goal = clear ? null : result.goal || null;
     composerSelection.mode = nextMode;
     persistComposerSelection();
   } catch (error) {
@@ -830,30 +1086,22 @@ async function clearActiveGoal({ nextMode = "default" } = {}) {
   }
 }
 
-async function completeActiveGoal() {
-  if (!selectedThreadId || !activeGoal() || goalUpdating) return;
-  const threadId = selectedThreadId;
-  goalUpdating = true;
-  updateComposer();
-  try {
-    const result = await postJson(
+function clearActiveGoal({ nextMode = "default" } = {}) {
+  return mutateActiveGoal(
+    (threadId) => requestJson(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
+      method: "DELETE",
+    }),
+    { nextMode, clear: true },
+  );
+}
+
+function completeActiveGoal() {
+  return mutateActiveGoal(
+    (threadId) => postJson(
       `/api/threads/${encodeURIComponent(threadId)}/goal`,
       { status: "complete" },
-    );
-    if (selectedThreadId !== threadId) return;
-    composerCatalog.goal = result.goal || null;
-    composerSelection.mode = "default";
-    persistComposerSelection();
-  } catch (error) {
-    if (handleUnauthorized(error)) return;
-    if (selectedThreadId === threadId) composerError = error.message;
-  } finally {
-    goalUpdating = false;
-    if (selectedThreadId === threadId) {
-      renderComposerControls();
-      updateComposer();
-    }
-  }
+    ),
+  );
 }
 
 async function chooseComposerMode(mode) {
@@ -874,6 +1122,13 @@ function resizeComposer() {
   messageInput.style.height = `${Math.min(messageInput.scrollHeight, 160)}px`;
 }
 
+function chooseRunningMessageAction(action) {
+  if (!["queue", "steer"].includes(action)) return;
+  runningMessageAction = action;
+  updateComposer();
+  messageInput.focus();
+}
+
 function updateComposer() {
   const control = currentThread?.control || {};
   const requests = control.requests || [];
@@ -881,21 +1136,49 @@ function updateComposer() {
   const sending = sendingThreads.has(selectedThreadId);
   const interrupting = interruptingThreads.has(selectedThreadId);
   const running = Boolean(control.busy);
-  const busy = sending || interrupting || running;
-  composer.hidden = !selectedThreadId;
-  messageInput.disabled = !selectedThreadId || !ready || busy;
-  sendButton.dataset.action = running || interrupting ? "interrupt" : "send";
-  sendButton.setAttribute(
-    "aria-label",
-    running || interrupting ? "中断任务" : "发送消息",
+  const queued = Boolean(
+    control.queued
+    || pendingMessage?.deliveryState === "queued"
   );
-  sendButton.title = running || interrupting ? "中断任务" : "发送消息";
+  const uploadingImages = pendingImages.some((image) => image.status === "uploading");
+  const failedImages = pendingImages.some((image) => image.status === "error");
+  const readyImages = pendingImages.filter((image) => image.status === "ready");
+  const hasMessageContent = Boolean(messageInput.value.trim() || readyImages.length);
+  const goalNeedsText = !running
+    && composerSelection.mode === "goal"
+    && !messageInput.value.trim();
+  const action = running ? runningMessageAction : "start";
+  composer.hidden = !selectedThreadId;
+  messageInput.disabled = !selectedThreadId || !ready || sending || interrupting || goalUpdating;
+  deliveryControl.hidden = !running;
+  for (const button of deliveryControl.children) {
+    const selected = button.dataset.action === runningMessageAction;
+    button.dataset.selected = String(selected);
+    button.setAttribute("aria-checked", String(selected));
+    button.disabled = sending
+      || interrupting
+      || (button.dataset.action === "queue" && queued)
+      || (button.dataset.action === "steer" && !control.turnId);
+  }
+  interruptButton.hidden = !running && !interrupting;
+  interruptButton.disabled = !ready || sending || interrupting || goalUpdating;
+  sendButton.dataset.action = action;
+  const sendLabel = action === "queue"
+    ? "加入等待"
+    : action === "steer" ? "Steer 当前任务" : "发送消息";
+  sendButton.setAttribute("aria-label", sendLabel);
+  sendButton.title = sendLabel;
   sendButton.disabled = !selectedThreadId
     || !ready
     || sending
     || interrupting
     || goalUpdating
-    || (!running && !messageInput.value.trim());
+    || uploadingImages
+    || failedImages
+    || !hasMessageContent
+    || goalNeedsText
+    || queued
+    || (action === "steer" && !control.turnId);
 
   let state = "idle";
   if (composerError) {
@@ -904,18 +1187,26 @@ function updateComposer() {
   } else if (goalUpdating) {
     state = "sending";
     composerStatus.textContent = "正在更新目标";
+  } else if (uploadingImages) {
+    state = "sending";
+    composerStatus.textContent = "正在上传图片";
   } else if (interrupting) {
     state = "interrupting";
     composerStatus.textContent = "正在中断";
   } else if (sending) {
     state = "sending";
-    composerStatus.textContent = "正在发送";
+    composerStatus.textContent = action === "queue"
+      ? "正在加入等待"
+      : action === "steer" ? "正在 Steer" : "正在发送";
   } else if (requests.some((request) => request.type !== "unsupported" && !request.responding)) {
     state = "approval";
     composerStatus.textContent = "Codex 正在等待你的批准";
   } else if (requests.some((request) => request.type === "unsupported" && !request.responding)) {
     state = "approval";
     composerStatus.textContent = "请在电脑端处理此请求";
+  } else if (queued) {
+    state = "queued";
+    composerStatus.textContent = "消息将在当前任务完成后发送";
   } else if (control.busy) {
     state = "busy";
     composerStatus.textContent = "Codex 正在执行";
@@ -923,6 +1214,7 @@ function updateComposer() {
     composerStatus.textContent = "";
   }
   composer.dataset.state = state;
+  composer.dataset.running = String(running);
   composerStatus.dataset.state = state;
   updateComposerControlAvailability();
 }
@@ -1001,6 +1293,88 @@ function clipLiveText(value) {
   return String(value ?? "").slice(0, MAX_LIVE_MESSAGE_LENGTH);
 }
 
+function safeMessageImages(value) {
+  return (Array.isArray(value) ? value : []).flatMap((image) => {
+    const src = typeof image?.src === "string" ? image.src.trim() : "";
+    if (!(
+      /^\/api\/images\/[a-z]+_[a-f0-9]{32}$/.test(src)
+      || /^https:\/\//i.test(src)
+      || /^data:image\/(?:png|jpeg|webp|gif);base64,/i.test(src)
+    )) return [];
+    return [{ src, alt: String(image.alt || "图片").slice(0, 160) }];
+  });
+}
+
+function renderImageViewer() {
+  const image = viewerImages[viewerImageIndex];
+  if (!image) return closeImageViewer();
+  imageViewerImage.src = image.src;
+  imageViewerImage.alt = image.alt;
+  imageViewerCaption.textContent = image.alt;
+  const multiple = viewerImages.length > 1;
+  imageViewerPrev.hidden = !multiple;
+  imageViewerNext.hidden = !multiple;
+}
+
+function openImageViewer(images, index = 0) {
+  viewerImages = safeMessageImages(images);
+  if (!viewerImages.length) return;
+  viewerImageIndex = Math.max(0, Math.min(index, viewerImages.length - 1));
+  imageViewer.hidden = false;
+  renderImageViewer();
+  imageViewer.focus?.();
+}
+
+function closeImageViewer() {
+  viewerImages = [];
+  viewerImageIndex = 0;
+  imageViewer.hidden = true;
+  imageViewerImage.removeAttribute?.("src");
+  imageViewerImage.alt = "";
+  imageViewerCaption.textContent = "";
+}
+
+function moveImageViewer(offset) {
+  if (viewerImages.length < 2) return;
+  viewerImageIndex = (viewerImageIndex + offset + viewerImages.length) % viewerImages.length;
+  renderImageViewer();
+}
+
+function updateMessageImages(record, value) {
+  const images = safeMessageImages(value);
+  const signature = JSON.stringify(images);
+  if (record.mediaSignature === signature) return;
+  record.mediaSignature = signature;
+  record.media.replaceChildren();
+  record.media.hidden = images.length === 0;
+  record.media.dataset.count = String(images.length);
+  if (!images.length) return;
+  if (!record.mediaAttached) {
+    record.article.append(record.media);
+    record.mediaAttached = true;
+  }
+  images.forEach((image, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "message-image-button";
+    button.setAttribute("aria-label", `查看图片：${image.alt}`);
+    button.title = image.alt;
+    const preview = document.createElement("img");
+    preview.src = image.src;
+    preview.alt = image.alt;
+    preview.loading = "lazy";
+    preview.decoding = "async";
+    preview.referrerPolicy = "no-referrer";
+    preview.addEventListener("error", () => {
+      button.dataset.error = "true";
+      button.setAttribute("aria-label", `图片加载失败：${image.alt}`);
+    });
+    button.append(preview);
+    button.addEventListener("click", () => openImageViewer(images, index));
+    record.media.append(button);
+  });
+}
+
 function createMessageNode(message) {
   const article = document.createElement("article");
   article.className = "message";
@@ -1017,9 +1391,22 @@ function createMessageNode(message) {
   const receipt = document.createElement("span");
   receipt.className = "message-receipt";
   receipt.hidden = true;
+  const media = document.createElement("div");
+  media.className = "message-media";
+  media.hidden = true;
   article.append(meta, body, receipt);
 
-  const record = { article, author, time, body, receipt, kind: "message" };
+  const record = {
+    article,
+    author,
+    time,
+    body,
+    receipt,
+    media,
+    mediaAttached: false,
+    mediaSignature: "",
+    kind: "message",
+  };
   updateMessageNode(record, message);
   return record;
 }
@@ -1040,9 +1427,16 @@ function updateMessageNode(record, message) {
   if (record.author.textContent !== author) record.author.textContent = author;
   if (record.time.textContent !== time) record.time.textContent = time;
   if (record.body.textContent !== message.text) record.body.textContent = message.text;
+  record.body.hidden = !message.text;
+  updateMessageImages(record, message.images);
 
   const receipt = message.role === "user"
-    ? { sending: "发送中", sent: "已送达" }[message.deliveryState] || ""
+    ? {
+        sending: "发送中",
+        sent: "已送达",
+        queued: "等待中",
+        steered: "已 Steer",
+      }[message.deliveryState] || ""
     : "";
   record.receipt.hidden = !receipt;
   if (record.receipt.textContent !== receipt) record.receipt.textContent = receipt;
@@ -1098,34 +1492,94 @@ function updateReasoningNode(record, message) {
   record.status = status;
 }
 
+function messagesByTurn(messages) {
+  const turns = [];
+  for (const message of groupActivityMessages(messages)) {
+    const turnId = message.turnId || "legacy";
+    let turn = turns.at(-1);
+    if (!turn || turn.id !== turnId) {
+      turn = { id: turnId, messages: [] };
+      turns.push(turn);
+    }
+    turn.messages.push(message);
+  }
+  return turns;
+}
+
+function historyTurnSummary(turn, index) {
+  const userMessage = turn.messages.find((message) => message.role === "user");
+  const text = String(userMessage?.text || "").replace(/\s+/g, " ").trim();
+  if (text) return text.length > 72 ? `${text.slice(0, 72)}…` : text;
+  if (userMessage?.images?.length) return "图片消息";
+  return `历史回合 ${index + 1}`;
+}
+
+function historyTurnNode(turn, index, articles) {
+  const details = document.createElement("details");
+  details.className = "history-turn";
+  details.dataset.turnId = turn.id;
+  const expansionKey = `${selectedThreadId}\u0000${turn.id}`;
+  details.open = expandedTurns.has(expansionKey);
+
+  const summary = document.createElement("summary");
+  summary.className = "history-turn-summary";
+  const title = document.createElement("span");
+  title.className = "history-turn-title";
+  title.textContent = historyTurnSummary(turn, index);
+  const meta = document.createElement("span");
+  meta.className = "history-turn-meta";
+  meta.textContent = formatTime(turn.messages[0]?.timestamp) || "历史";
+  summary.append(title, meta);
+
+  const content = document.createElement("div");
+  content.className = "history-turn-content";
+  content.append(...articles);
+  details.append(summary, content);
+  details.addEventListener("toggle", () => {
+    if (details.open) expandedTurns.add(expansionKey);
+    else expandedTurns.delete(expansionKey);
+  });
+  return details;
+}
+
+function messageRecord(message) {
+  let record = messageNodes.get(message.id);
+  if (message.kind === "activityGroup") {
+    record = {
+      article: renderActivityGroup(message),
+      kind: "activityGroup",
+    };
+    messageNodes.set(message.id, record);
+  } else if (message.kind === "reasoning") {
+    if (!record || record.kind !== "reasoning") {
+      record = createReasoningNode(message);
+      messageNodes.set(message.id, record);
+    } else {
+      updateReasoningNode(record, message);
+    }
+  } else if (!record || record.kind !== "message") {
+    record = createMessageNode(message);
+    messageNodes.set(message.id, record);
+  } else {
+    updateMessageNode(record, message);
+  }
+  return record;
+}
+
 function reconcileMessageNodes(messages) {
   const ordered = [];
   const visibleIds = new Set();
 
-  for (const message of groupActivityMessages(messages)) {
-    visibleIds.add(message.id);
-    let record = messageNodes.get(message.id);
-
-    if (message.kind === "activityGroup") {
-      record = {
-        article: renderActivityGroup(message),
-        kind: "activityGroup",
-      };
-      messageNodes.set(message.id, record);
-    } else if (message.kind === "reasoning") {
-      if (!record || record.kind !== "reasoning") {
-        record = createReasoningNode(message);
-        messageNodes.set(message.id, record);
-      } else {
-        updateReasoningNode(record, message);
-      }
-    } else if (!record || record.kind !== "message") {
-      record = createMessageNode(message);
-      messageNodes.set(message.id, record);
-    } else {
-      updateMessageNode(record, message);
-    }
-    ordered.push(record.article);
+  const turns = messagesByTurn(messages);
+  const activeTurnId = currentThread?.control?.turnId || "";
+  for (const [index, turn] of turns.entries()) {
+    const articles = turn.messages.map((message) => {
+      visibleIds.add(message.id);
+      return messageRecord(message).article;
+    });
+    const latest = index === turns.length - 1;
+    if (latest || turn.id === activeTurnId) ordered.push(...articles);
+    else ordered.push(historyTurnNode(turn, index, articles));
   }
 
   for (const id of messageNodes.keys()) {
@@ -1283,6 +1737,7 @@ function upsertCurrentMessage(message, { markBusy = true } = {}) {
 function liveMessage(value, text = value.text) {
   return {
     id: value.itemId,
+    turnId: value.turnId || "",
     role: "assistant",
     kind: value.kind === "commentary" ? "commentary" : "message",
     text: clipLiveText(text),
@@ -1292,6 +1747,20 @@ function liveMessage(value, text = value.text) {
 
 function handleMessageStart(value) {
   if (!ensureCurrentThreadForLive(value.threadId)) return;
+
+  if (pendingMessage && value.turnId) {
+    pendingMessage = { ...pendingMessage, turnId: value.turnId };
+  }
+  if (value.turnId) {
+    currentThread = {
+      ...currentThread,
+      control: {
+        ...(currentThread.control || {}),
+        busy: true,
+        turnId: value.turnId,
+      },
+    };
+  }
 
   const previous = liveMessages.get(value.itemId);
   if (previous?.completed) return;
@@ -1329,6 +1798,7 @@ function flushMessageDeltas(epoch, threadId) {
       ?.find((message) => message.id === itemId);
     const base = live?.message || persisted || {
       id: itemId,
+      turnId: currentThread?.control?.turnId || "",
       role: "assistant",
       kind: "message",
       text: "",
@@ -1427,12 +1897,33 @@ function insertPendingMessage(messages) {
 
 function persistedMessageMatchesPending(message, pending) {
   if (message.role !== "user" || pending.knownMessageIds.has(message.id)) return false;
-  if (message.text === pending.text) return true;
+  if (pending.clientId && message.clientId === pending.clientId) return true;
+  if (pending.text && message.text === pending.text) return true;
   const invokedText = [
     ...(pending.skillNames || []).map((name) => `$${name}`),
     pending.text,
   ].join("\n");
-  return message.text === invokedText;
+  return Boolean(pending.text) && message.text === invokedText;
+}
+
+function restoreQueuedMessage(thread) {
+  const queued = thread.control?.queue;
+  if (pendingMessage || !queued) return;
+  const clientId = queued.clientMessageId || `queued-${queued.queuedAt || Date.now()}`;
+  pendingMessage = {
+    id: `pending-${clientId}`,
+    turnId: `queued-${clientId}`,
+    clientId,
+    role: "user",
+    kind: "message",
+    text: queued.text || "",
+    timestamp: queued.queuedAt || Math.floor(Date.now() / 1_000),
+    pending: false,
+    deliveryState: "queued",
+    skillNames: queued.skillNames || [],
+    images: queued.images || [],
+    knownMessageIds: new Set((thread.messages || []).map((message) => message.id)),
+  };
 }
 
 function renderThread(
@@ -1446,6 +1937,7 @@ function renderThread(
     mergeThreadWithDesktopSnapshot(thread),
     authoritativeSnapshot,
   );
+  restoreQueuedMessage(currentThread);
   if (!currentThread.control?.busy && !interruptRequestThreads.has(thread.id)) {
     interruptingThreads.delete(thread.id);
   }
@@ -1487,6 +1979,12 @@ function renderThread(
   reconcileMessageNodes(displayMessages);
 
   if (autoScroll && hasMessages && followOutput) {
+    const initialRender = !messageList.dataset.rendered;
+    if (initialRender) {
+      messageList.scrollTop = messageList.scrollHeight;
+      messageList.dataset.rendered = "true";
+      return;
+    }
     const epoch = selectionEpoch;
     const threadId = currentThread.id;
     requestAnimationFrame(() => {
@@ -1576,6 +2074,60 @@ function connectEvents(subscriptionEpoch = selectionEpoch) {
     if (!validLiveEvent(value, subscriptionThreadId)) return;
     handleMessageDone(value);
   });
+  source.addEventListener("queueStarted", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!value || value.threadId !== subscriptionThreadId) return;
+    if (
+      pendingMessage
+      && (!value.clientMessageId || pendingMessage.clientId === value.clientMessageId)
+    ) {
+      pendingMessage = {
+        ...pendingMessage,
+        turnId: value.turnId || pendingMessage.turnId,
+        deliveryState: "sending",
+      };
+    }
+    if (!ensureCurrentThreadForLive(value.threadId)) return;
+    currentThread = {
+      ...currentThread,
+      control: {
+        ...(currentThread.control || {}),
+        busy: true,
+        phase: "starting",
+        turnId: value.turnId || currentThread.control?.turnId || null,
+        queued: false,
+        queue: null,
+      },
+    };
+    renderThread(currentThread, { authoritativeSnapshot: false });
+  });
+  source.addEventListener("queueFailed", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!value || value.threadId !== subscriptionThreadId) return;
+    const failedPending = pendingMessage
+      && (!value.clientMessageId || pendingMessage.clientId === value.clientMessageId)
+      ? pendingMessage
+      : null;
+    if (failedPending) {
+      pendingMessage = null;
+      if (!messageInput.value && failedPending.text) messageInput.value = failedPending.text;
+      resizeComposer();
+    }
+    if (currentThread?.id === value.threadId) {
+      currentThread = {
+        ...currentThread,
+        control: {
+          ...(currentThread.control || {}),
+          queued: false,
+          queue: null,
+        },
+      };
+      composerError = `${value.message || "等待消息发送失败"}${failedPending?.images?.length ? "，请重新选择图片" : ""}`;
+      renderThread(currentThread, { authoritativeSnapshot: false });
+    }
+  });
   source.addEventListener("status", (event) => {
     if (!isCurrentSubscription()) return;
     const value = eventValue(event);
@@ -1606,12 +2158,15 @@ function connectEvents(subscriptionEpoch = selectionEpoch) {
 async function selectThread(threadId) {
   const epoch = ++selectionEpoch;
   closeComposerMenu();
+  closeImageViewer();
+  discardPendingImages();
   resetLiveRendering();
   selectedThreadId = threadId;
   currentThread = null;
   pendingMessage = null;
   composerCatalog = null;
   composerError = "";
+  runningMessageAction = "queue";
   messageInput.value = "";
   resizeComposer();
   messageList.replaceChildren();
@@ -1643,16 +2198,31 @@ async function selectThread(threadId) {
   }
 }
 
+function createClientMessageId() {
+  try {
+    return globalThis.crypto?.randomUUID?.() || `web-${Date.now()}-${nextPendingImageId++}`;
+  } catch {
+    return `web-${Date.now()}-${nextPendingImageId++}`;
+  }
+}
+
 async function sendMessage(event) {
   event.preventDefault();
   const text = messageInput.value.trim();
   const threadId = selectedThreadId;
+  const control = currentThread?.control || {};
+  const running = Boolean(control.busy);
+  const action = running ? runningMessageAction : "start";
+  const readyImages = pendingImages.filter((image) => image.status === "ready");
   if (
-    !text
+    (!text && !readyImages.length)
     || !threadId
     || sendingThreads.has(threadId)
     || interruptingThreads.has(threadId)
-    || currentThread?.control?.busy
+    || control.queued
+    || (action === "steer" && !control.turnId)
+    || pendingImages.some((image) => image.status !== "ready")
+    || (!running && composerSelection.mode === "goal" && !text)
   ) return;
 
   const selection = {
@@ -1661,7 +2231,14 @@ async function sendMessage(event) {
     mode: composerSelection.mode,
     skillNames: [...(composerSelection.skillNames || [])],
   };
-  const payload = { text };
+  const clientId = createClientMessageId();
+  const payload = {
+    text,
+    action,
+    clientMessageId: clientId,
+    imageIds: readyImages.map((image) => image.id),
+  };
+  if (action === "steer") payload.expectedTurnId = control.turnId;
   if (composerCatalog?.models?.length && selection.model) {
     Object.assign(payload, selection);
   }
@@ -1669,6 +2246,10 @@ async function sendMessage(event) {
   const knownMessageIds = new Set((currentThread?.messages || []).map((message) => message.id));
   const optimisticMessage = {
     id: `pending-${Date.now()}`,
+    turnId: action === "steer" && control.turnId
+      ? control.turnId
+      : `${action}-${clientId}`,
+    clientId,
     role: "user",
     kind: "message",
     text,
@@ -1676,13 +2257,19 @@ async function sendMessage(event) {
     pending: true,
     deliveryState: "sending",
     skillNames: selection.skillNames,
+    images: readyImages.map((image) => ({
+      src: image.src,
+      alt: image.name || "上传的图片",
+    })),
     knownMessageIds,
   };
   sendingThreads.add(threadId);
   closeComposerMenu();
   pendingMessage = optimisticMessage;
+  pendingImages = [];
   composerError = "";
   messageInput.value = "";
+  renderPendingImages();
   resizeComposer();
   if (currentThread) {
     renderThread(currentThread, { authoritativeSnapshot: false });
@@ -1699,10 +2286,14 @@ async function sendMessage(event) {
       renderComposerControls();
     }
     if (pendingMessage?.id === optimisticMessage.id) {
+      const deliveryState = result.delivery === "queued"
+        ? "queued"
+        : result.delivery === "steered" ? "steered" : "sent";
       pendingMessage = {
         ...pendingMessage,
         pending: false,
-        deliveryState: "sent",
+        turnId: result.turnId || pendingMessage.turnId,
+        deliveryState,
         delivery: result.delivery || "accepted",
       };
     }
@@ -1726,11 +2317,17 @@ async function sendMessage(event) {
           messageInput.value = text;
           resizeComposer();
         }
+        if (!pendingImages.length) {
+          pendingImages = readyImages;
+          renderPendingImages();
+        }
         if (currentThread) {
           renderThread(currentThread, { authoritativeSnapshot: false });
         }
       }
       composerError = error.message;
+    } else {
+      for (const image of readyImages) void deleteUploadedImage(image.id);
     }
   } finally {
     sendingThreads.delete(threadId);
@@ -1781,13 +2378,6 @@ async function interruptTurn(event) {
     }
     updateComposer();
   }
-}
-
-function submitComposer(event) {
-  if (currentThread?.control?.busy || interruptingThreads.has(selectedThreadId)) {
-    return interruptTurn(event);
-  }
-  return sendMessage(event);
 }
 
 async function respondToApproval(token, decision) {
@@ -1859,7 +2449,17 @@ authForm.addEventListener("submit", async (event) => {
 });
 
 threadSearch.addEventListener("input", renderThreads);
-composer.addEventListener("submit", submitComposer);
+composer.addEventListener("submit", sendMessage);
+interruptButton.addEventListener("click", interruptTurn);
+for (const button of deliveryControl.children) {
+  button.addEventListener("click", () => chooseRunningMessageAction(button.dataset.action));
+}
+imageUploadButton.addEventListener("click", () => imageInput.click?.());
+imageInput.addEventListener("change", () => {
+  const files = imageInput.files;
+  imageInput.value = "";
+  void addPendingImages(files);
+});
 modelControl.addEventListener("click", () => toggleComposerMenu("model"));
 effortControl.addEventListener("click", () => toggleComposerMenu("effort"));
 skillControl.addEventListener("click", () => toggleComposerMenu("skills"));
@@ -1887,11 +2487,44 @@ messageInput.addEventListener("input", () => {
   resizeComposer();
   updateComposer();
 });
+messageInput.addEventListener("paste", (event) => {
+  const images = [...(event.clipboardData?.files || [])]
+    .filter((file) => !file.type || file.type.startsWith("image/"));
+  if (!images.length) return;
+  event.preventDefault();
+  void addPendingImages(images);
+});
 messageInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     composer.requestSubmit();
   }
+});
+composer.addEventListener("dragover", (event) => {
+  if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
+  event.preventDefault();
+  composer.classList.add("is-dragging-image");
+});
+composer.addEventListener("dragleave", () => composer.classList.remove("is-dragging-image"));
+composer.addEventListener("drop", (event) => {
+  composer.classList.remove("is-dragging-image");
+  const images = [...(event.dataTransfer?.files || [])]
+    .filter((file) => !file.type || file.type.startsWith("image/"));
+  if (!images.length) return;
+  event.preventDefault();
+  void addPendingImages(images);
+});
+imageViewerClose.addEventListener("click", closeImageViewer);
+imageViewerPrev.addEventListener("click", () => moveImageViewer(-1));
+imageViewerNext.addEventListener("click", () => moveImageViewer(1));
+imageViewer.addEventListener("click", (event) => {
+  if (event.target === imageViewer) closeImageViewer();
+});
+document.addEventListener?.("keydown", (event) => {
+  if (imageViewer.hidden) return;
+  if (event.key === "Escape") closeImageViewer();
+  else if (event.key === "ArrowLeft") moveImageViewer(-1);
+  else if (event.key === "ArrowRight") moveImageViewer(1);
 });
 backButton.addEventListener("click", () => app.classList.remove("conversation-open"));
 refreshButton.addEventListener("click", () => {

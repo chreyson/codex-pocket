@@ -17,6 +17,7 @@ const ELEMENT_IDS = [
   "thread-empty",
   "thread-empty-title",
   "thread-empty-detail",
+  "thread-action-status",
   "thread-search",
   "connection-state",
   "connection-label",
@@ -38,15 +39,26 @@ const ELEMENT_IDS = [
   "goal-objective",
   "goal-complete",
   "goal-clear",
+  "composer-images",
+  "image-input",
+  "image-upload-button",
   "message-input",
   "model-control",
   "model-label",
   "effort-control",
   "effort-label",
   "composer-status",
+  "delivery-control",
+  "interrupt-button",
   "send-button",
   "back-button",
   "refresh-button",
+  "image-viewer",
+  "image-viewer-image",
+  "image-viewer-caption",
+  "image-viewer-close",
+  "image-viewer-prev",
+  "image-viewer-next",
 ];
 
 class FakeClassList {
@@ -187,6 +199,7 @@ function threadDetail(id, text) {
     ...threadSummary(id),
     messages: [{
       id: `${id}-message`,
+      turnId: `${id}-turn`,
       role: "assistant",
       kind: "message",
       text,
@@ -263,18 +276,30 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
   elements["auth-screen"].hidden = true;
   elements.app.hidden = true;
   elements["thread-empty"].hidden = true;
+  elements["thread-action-status"].hidden = true;
   elements["message-list"].hidden = true;
   elements["approval-tray"].hidden = true;
   elements.composer.hidden = true;
   elements["composer-menu"].hidden = true;
   elements["selected-skills"].hidden = true;
+  elements["composer-images"].hidden = true;
   elements["goal-banner"].hidden = true;
+  elements["delivery-control"].hidden = true;
+  elements["interrupt-button"].hidden = true;
+  elements["interrupt-button"].setAttribute("aria-label", "中断任务");
   elements["skill-count"].hidden = true;
+  elements["image-viewer"].hidden = true;
   for (const mode of ["default", "plan", "goal"]) {
     const button = new FakeElement("button");
     button.dataset.mode = mode;
     button.setAttribute("aria-checked", String(mode === "default"));
     elements["mode-control"].append(button);
+  }
+  for (const action of ["queue", "steer"]) {
+    const button = new FakeElement("button");
+    button.dataset.action = action;
+    button.setAttribute("aria-checked", String(action === "queue"));
+    elements["delivery-control"].append(button);
   }
 
   const document = {
@@ -311,11 +336,16 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
   const source = await fs.readFile(APP_SOURCE_URL, "utf8");
   const hooks = `\n;globalThis.__appTest = {
     selectThread,
+    createProjectThread,
     sendMessage,
     interruptTurn,
     connectEvents,
     fetchJsonWithTimeout,
     showAuth,
+    addPendingImages,
+    removePendingImage,
+    openImageViewer,
+    closeImageViewer,
     getState: () => ({
       threads,
       selectedThreadId,
@@ -324,6 +354,8 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
       sendingThreads: [...sendingThreads],
       interruptingThreads: [...interruptingThreads],
       interruptRequestThreads: [...interruptRequestThreads],
+      creatingProjects: [...creatingProjects],
+      expandedTurns: [...expandedTurns],
       resolvingRequests: [...resolvingRequests],
       goalUpdating,
       eventSource,
@@ -340,6 +372,16 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
         skillNames: [...(composerSelection.skillNames || [])],
       },
       composerMenuKind,
+      pendingImages: pendingImages.map((image) => ({
+        id: image.id,
+        name: image.name,
+        src: image.src,
+        status: image.status,
+        localId: image.localId,
+      })),
+      viewerImages: [...viewerImages],
+      viewerImageIndex,
+      runningMessageAction,
     }),
   };`;
   vm.runInContext(`"use strict";\n${source}${hooks}`, context, { filename: "public/app.js" });
@@ -421,22 +463,59 @@ test("thread navigation groups conversations by project and search opens matchin
   assert.equal(harness.elements["thread-list"].children.length, 2);
   const sharedGroup = harness.elements["thread-list"].children[0];
   const [sharedHeader, sharedItems] = sharedGroup.children;
+  const [sharedToggle, sharedCreate] = sharedHeader.children;
   assert.match(sharedHeader.textContent, /Shared project/);
+  assert.equal(sharedCreate.getAttribute("aria-label"), "在 Shared project 中新建会话");
   assert.equal(sharedItems.children.length, 2);
-  assert.equal(sharedHeader.getAttribute("aria-expanded"), "true");
+  assert.equal(sharedToggle.getAttribute("aria-expanded"), "true");
 
-  sharedHeader.listeners.get("click")[0]();
+  sharedToggle.listeners.get("click")[0]();
   assert.equal(sharedItems.hidden, true);
-  assert.equal(sharedHeader.getAttribute("aria-expanded"), "false");
+  assert.equal(sharedToggle.getAttribute("aria-expanded"), "false");
 
   harness.elements["thread-search"].value = "needle";
   harness.elements["thread-search"].listeners.get("input")[0]();
   assert.equal(harness.elements["thread-list"].children.length, 1);
   const [matchingHeader, matchingItems] = harness.elements["thread-list"].children[0].children;
-  assert.equal(matchingHeader.getAttribute("aria-expanded"), "true");
+  const [matchingToggle] = matchingHeader.children;
+  assert.equal(matchingToggle.getAttribute("aria-expanded"), "true");
   assert.equal(matchingItems.hidden, false);
   assert.equal(matchingItems.children.length, 1);
   assert.match(matchingItems.textContent, /Thread B/);
+});
+
+test("a project can create and open a new conversation without exposing its cwd", async () => {
+  const calls = [];
+  const created = {
+    ...threadSummary("NEW"),
+    title: "New conversation",
+    project: "Shared project",
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, {
+        status: { state: "ready" },
+        threads: [{ ...threadSummary("A"), project: "Shared project" }],
+      });
+    }
+    if (url === "/api/threads" && options.method === "POST") {
+      return jsonResponse(201, { ok: true, thread: created });
+    }
+    if (url === "/api/threads/NEW") {
+      return jsonResponse(200, { ...threadDetail("NEW", ""), ...created, messages: [] });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.createProjectThread("Shared project", "A");
+
+  const createCall = calls.find((call) => call.url === "/api/threads");
+  assert.deepEqual(JSON.parse(createCall.body), { projectThreadId: "A" });
+  assert.equal(harness.hooks.getState().selectedThreadId, "NEW");
+  assert.equal(harness.elements["conversation-title"].textContent, "New conversation");
+  assert.equal(harness.elements["thread-action-status"].hidden, true);
+  assert.equal(createCall.body.includes("cwd"), false);
 });
 
 test("consecutive tool activity renders as one compact group and merges duplicates", async () => {
@@ -464,6 +543,64 @@ test("consecutive tool activity renders as one compact group and merges duplicat
   assert.match(rendered[1].textContent, /运行 rg -n renderThread public\/app\.js/);
   assert.match(rendered[1].textContent, /×2/);
   assert.match(rendered[1].textContent, /读取 app\.js/);
+});
+
+test("completed history turns collapse while the latest turn stays expanded", async () => {
+  const summary = threadSummary("A");
+  const detail = {
+    ...summary,
+    messages: [
+      { id: "old-user", turnId: "turn-old", role: "user", kind: "message", text: "检查旧问题", timestamp: 1 },
+      { id: "old-answer", turnId: "turn-old", role: "assistant", kind: "message", text: "旧问题已处理", timestamp: 1 },
+      { id: "new-user", turnId: "turn-new", role: "user", kind: "message", text: "继续新任务", timestamp: 2 },
+      { id: "new-answer", turnId: "turn-new", role: "assistant", kind: "message", text: "正在继续", timestamp: 2 },
+    ],
+    control: { busy: false, requests: [] },
+  };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [summary] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  let rendered = harness.elements["message-list"].children;
+  assert.equal(rendered.length, 3);
+  assert.equal(rendered[0].tagName, "DETAILS");
+  assert.equal(rendered[0].open, false);
+  assert.match(rendered[0].children[0].textContent, /检查旧问题/);
+  assert.deepEqual(rendered.slice(1).map((node) => node.dataset.role), ["user", "assistant"]);
+
+  rendered[0].open = true;
+  rendered[0].listeners.get("toggle")[0]();
+  emitSse(harness.eventSources.at(-1), "thread", {
+    ...detail,
+    messages: detail.messages.map((message) => message.id === "new-answer"
+      ? { ...message, text: "新任务已更新" }
+      : message),
+  });
+  rendered = harness.elements["message-list"].children;
+  assert.equal(rendered[0].open, true);
+  assert.match(rendered.at(-1).textContent, /新任务已更新/);
+});
+
+test("the first authoritative conversation snapshot lands at the bottom immediately", async () => {
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, threadDetail("A", "最后一条消息"));
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+  harness.elements["message-list"].scrollHeight = 1_240;
+
+  await harness.hooks.selectThread("A");
+
+  assert.equal(harness.elements["message-list"].scrollTop, 1_240);
+  assert.equal(harness.elements["message-list"].dataset.rendered, "true");
+  assert.equal(harness.pendingAnimationFrames(), 0);
 });
 
 test("composer controls send the selected model effort mode and skills", async () => {
@@ -505,12 +642,21 @@ test("composer controls send the selected model effort mode and skills", async (
 
   harness.elements["message-input"].value = "制定实现计划";
   await harness.hooks.sendMessage({ preventDefault() {} });
-  assert.deepEqual(sentBody, {
+  assert.match(sentBody.clientMessageId, /^(?:[0-9a-f-]{36}|web-)/);
+  assert.deepEqual({
+    text: sentBody.text,
+    model: sentBody.model,
+    effort: sentBody.effort,
+    mode: sentBody.mode,
+    skillNames: sentBody.skillNames,
+    imageIds: sentBody.imageIds,
+  }, {
     text: "制定实现计划",
     model: "gpt-terra",
     effort: "medium",
     mode: "plan",
     skillNames: ["docs"],
+    imageIds: [],
   });
 });
 
@@ -554,6 +700,92 @@ test("goal mode creates an active goal and can clear it from the composer", asyn
   assert.equal(harness.elements["goal-banner"].hidden, true);
   assert.equal(harness.hooks.getState().composerSelection.mode, "default");
   assert.equal(calls.some((call) => call.url === "/api/threads/A/goal" && call.method === "DELETE"), true);
+});
+
+test("image attachments upload, preview, and send as structured ids", async () => {
+  const uploadId = `img_${"a".repeat(32)}`;
+  let sentBody;
+  let uploadOptions;
+  const detail = {
+    ...threadDetail("A", "ready"),
+    composerOptions: composerOptions(),
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/uploads") {
+      uploadOptions = options;
+      return jsonResponse(201, {
+        image: {
+          id: uploadId,
+          src: `/api/images/${uploadId}`,
+          alt: "screen.png",
+          mimeType: "image/png",
+        },
+      });
+    }
+    if (url === "/api/threads/A/messages") {
+      sentBody = JSON.parse(options.body);
+      return jsonResponse(202, { delivery: "app-server", control: { busy: true } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  await harness.hooks.addPendingImages([{
+    name: "screen.png",
+    type: "image/png",
+    size: 128,
+  }]);
+
+  assert.equal(uploadOptions.method, "POST");
+  assert.equal(uploadOptions.headers["Content-Type"], "image/png");
+  assert.equal(harness.hooks.getState().pendingImages[0].status, "ready");
+  assert.equal(harness.elements["composer-images"].hidden, false);
+  assert.equal(harness.elements["send-button"].disabled, false);
+
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  assert.equal(sentBody.text, "");
+  assert.deepEqual(sentBody.imageIds, [uploadId]);
+  assert.match(sentBody.clientMessageId, /^(?:[0-9a-f-]{36}|web-)/);
+  assert.equal(harness.hooks.getState().pendingImages.length, 0);
+  assert.equal(harness.hooks.getState().pendingMessage.images[0].src, `/api/images/${uploadId}`);
+});
+
+test("conversation images open in the full-screen viewer", async () => {
+  const imageId = `asset_${"b".repeat(32)}`;
+  const detail = {
+    ...threadDetail("A", "unused"),
+    messages: [{
+      id: "image-message",
+      role: "assistant",
+      kind: "image",
+      text: "检查结果",
+      images: [{ src: `/api/images/${imageId}`, alt: "结果截图" }],
+      timestamp: 1,
+    }],
+  };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  const article = harness.elements["message-list"].children[0];
+  const media = article.children.find((child) => child.className === "message-media");
+  assert.ok(media);
+  assert.equal(media.children[0].children[0].src, `/api/images/${imageId}`);
+  media.children[0].listeners.get("click")[0]();
+  assert.equal(harness.elements["image-viewer"].hidden, false);
+  assert.equal(harness.elements["image-viewer-image"].src, `/api/images/${imageId}`);
+  assert.equal(harness.elements["image-viewer-caption"].textContent, "结果截图");
+  harness.hooks.closeImageViewer();
+  assert.equal(harness.elements["image-viewer"].hidden, true);
 });
 
 test("desktop snapshots render live thinking and tool state without replacing history", async () => {
@@ -683,7 +915,7 @@ test("a rejected desktop-owned send restores the draft instead of showing delive
   assert.doesNotMatch(harness.elements["message-list"].textContent, /继续执行|已送达/);
 });
 
-test("a running turn exposes stop, waits for idle, and then accepts a follow-up", async () => {
+test("a running turn keeps the composer editable and exposes a separate stop action", async () => {
   const interruptResult = deferred();
   const calls = [];
   const detail = {
@@ -707,15 +939,18 @@ test("a running turn exposes stop, waits for idle, and then accepts a follow-up"
   });
 
   await harness.hooks.selectThread("A");
-  assert.equal(harness.elements["message-input"].disabled, true);
-  assert.equal(harness.elements["send-button"].disabled, false);
-  assert.equal(harness.elements["send-button"].dataset.action, "interrupt");
-  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "中断任务");
+  assert.equal(harness.elements["message-input"].disabled, false);
+  assert.equal(harness.elements["delivery-control"].hidden, false);
+  assert.equal(harness.elements["interrupt-button"].hidden, false);
+  assert.equal(harness.elements["send-button"].disabled, true);
+  assert.equal(harness.elements["send-button"].dataset.action, "queue");
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "加入等待");
+  assert.equal(harness.elements["interrupt-button"].getAttribute("aria-label"), "中断任务");
 
   const interrupting = harness.hooks.interruptTurn({ preventDefault() {} });
   await eventually(() => harness.hooks.getState().interruptRequestThreads.includes("A"));
   assert.equal(harness.elements["composer-status"].textContent, "正在中断");
-  assert.equal(harness.elements["send-button"].disabled, true);
+  assert.equal(harness.elements["interrupt-button"].disabled, true);
   assert.deepEqual(
     calls.filter((call) => call.method === "POST").map((call) => call.url),
     ["/api/threads/A/interrupt"],
@@ -736,13 +971,98 @@ test("a running turn exposes stop, waits for idle, and then accepts a follow-up"
   });
   assert.equal(harness.hooks.getState().interruptingThreads.includes("A"), false);
   assert.equal(harness.elements["message-input"].disabled, false);
-  assert.equal(harness.elements["send-button"].dataset.action, "send");
+  assert.equal(harness.elements["delivery-control"].hidden, true);
+  assert.equal(harness.elements["interrupt-button"].hidden, true);
+  assert.equal(harness.elements["send-button"].dataset.action, "start");
   assert.equal(harness.elements["composer-status"].textContent, "");
 
   harness.elements["message-input"].value = "继续处理下一步";
   harness.elements["message-input"].listeners.get("input")[0]();
   assert.equal(harness.elements["send-button"].disabled, false);
   assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "发送消息");
+});
+
+test("a running turn queues a follow-up by default", async () => {
+  let sentBody;
+  const detail = {
+    ...threadDetail("A", "正在执行"),
+    status: "active",
+    control: { busy: true, phase: "running", turnId: "turn-1", requests: [] },
+    composerOptions: composerOptions(),
+  };
+  detail.messages[0].turnId = "turn-1";
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/messages") {
+      sentBody = JSON.parse(options.body);
+      return jsonResponse(202, {
+        delivery: "queued",
+        turnId: null,
+        control: {
+          busy: true,
+          phase: "running",
+          turnId: "turn-1",
+          queued: true,
+          queue: { clientMessageId: sentBody.clientMessageId, text: sentBody.text },
+        },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "完成后继续测试";
+  harness.elements["message-input"].listeners.get("input")[0]();
+  await harness.hooks.sendMessage({ preventDefault() {} });
+
+  assert.equal(sentBody.action, "queue");
+  assert.equal("expectedTurnId" in sentBody, false);
+  assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "queued");
+  assert.equal(harness.elements["message-list"].children.at(-1).children[2].textContent, "等待中");
+  assert.equal(harness.elements["send-button"].disabled, true);
+  assert.match(harness.elements["composer-status"].textContent, /当前任务完成后发送/);
+});
+
+test("Steer sends input to the active turn with its expected turn id", async () => {
+  let sentBody;
+  const detail = {
+    ...threadDetail("A", "正在执行"),
+    status: "active",
+    control: { busy: true, phase: "running", turnId: "turn-1", requests: [] },
+    composerOptions: composerOptions(),
+  };
+  detail.messages[0].turnId = "turn-1";
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/messages") {
+      sentBody = JSON.parse(options.body);
+      return jsonResponse(202, {
+        delivery: "steered",
+        turnId: "turn-1",
+        control: { busy: true, phase: "running", turnId: "turn-1" },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  const steer = harness.elements["delivery-control"].children[1];
+  steer.listeners.get("click")[0]();
+  harness.elements["message-input"].value = "先检查失败日志";
+  harness.elements["message-input"].listeners.get("input")[0]();
+  await harness.hooks.sendMessage({ preventDefault() {} });
+
+  assert.equal(sentBody.action, "steer");
+  assert.equal(sentBody.expectedTurnId, "turn-1");
+  assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "steered");
+  assert.equal(harness.elements["send-button"].dataset.action, "steer");
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "Steer 当前任务");
 });
 
 test("returning to authentication clears in-flight composer state", async () => {
@@ -871,10 +1191,8 @@ test("an optimistic user message stays before live replies that beat the send re
   await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
 
   let rendered = harness.elements["message-list"].children;
-  assert.deepEqual(
-    rendered.map((article) => article.dataset.role),
-    ["assistant", "user"],
-  );
+  assert.equal(rendered[0].tagName, "DETAILS");
+  assert.equal(rendered[1].dataset.role, "user");
   assert.equal(rendered[1].children[1].textContent, "test");
 
   const source = harness.eventSources.at(-1);
@@ -890,20 +1208,20 @@ test("an optimistic user message stays before live replies that beat the send re
 
   rendered = harness.elements["message-list"].children;
   assert.deepEqual(
-    rendered.map((article) => article.dataset.role),
-    ["assistant", "user", "assistant"],
+    rendered.slice(1).map((article) => article.dataset.role),
+    ["user", "assistant"],
   );
   assert.deepEqual(
-    rendered.map((article) => article.children[1].textContent),
-    ["earlier message", "test", "我在，继续即可。"],
+    rendered.slice(1).map((article) => article.children[1].textContent),
+    ["test", "我在，继续即可。"],
   );
 
   sendResult.resolve(jsonResponse(202, { control: { busy: true } }));
   await sending;
   rendered = harness.elements["message-list"].children;
   assert.deepEqual(
-    rendered.map((article) => article.children[1].textContent),
-    ["earlier message", "test", "我在，继续即可。"],
+    rendered.slice(1).map((article) => article.children[1].textContent),
+    ["test", "我在，继续即可。"],
   );
 });
 

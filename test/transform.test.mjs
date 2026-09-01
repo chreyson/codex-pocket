@@ -61,6 +61,7 @@ test("thread summary exposes useful metadata without the full cwd", () => {
 test("thread detail keeps conversation and redacts raw tool output", () => {
   const detail = sanitizeThreadDetail(sampleThread);
   assert.deepEqual(detail.messages.map((message) => message.role), ["user", "assistant", "system", "system"]);
+  assert.deepEqual(detail.messages.map((message) => message.turnId), Array(4).fill("turn-1"));
   assert.match(detail.messages[2].text, /^运行 curl/);
   assert.match(detail.messages[2].text, /Authorization: Bearer \[已隐藏\]/);
   assert.equal(detail.messages[2].activityType, "command");
@@ -124,6 +125,7 @@ test("desktop snapshots expose reasoning and restore chronological turn order", 
     "answer-old",
     "reasoning-live",
   ]);
+  assert.deepEqual(snapshot.messages.map((message) => message.turnId), ["turn-old", "turn-new"]);
   assert.equal(snapshot.messages[1].kind, "reasoning");
   assert.equal(snapshot.messages[1].text, "Inspecting realtime state");
   assert.equal(snapshot.messages[1].activityStatus, "inProgress");
@@ -173,4 +175,71 @@ test("malformed desktop records receive stable ids and safe timestamps", () => {
   assert.deepEqual(snapshot.messages.map((message) => message.timestamp), [null, null]);
   assert.equal(snapshot.updatedAt, 0);
   assert.equal(snapshot.control.busy, false);
+});
+
+test("a stale active thread status without a running turn stays idle", () => {
+  const snapshot = sanitizeDesktopThreadSnapshot({
+    thread: {
+      id: "thread-stale-active",
+      status: { type: "active" },
+    },
+    turns: [{ id: "turn-complete", status: "completed", items: [] }],
+  });
+
+  assert.equal(snapshot.control.busy, false);
+  assert.equal(snapshot.control.turnId, null);
+});
+
+test("thread detail exposes safe image descriptors without local paths", () => {
+  const sources = [];
+  const detail = sanitizeThreadDetail({
+    id: "thread-images",
+    cwd: "C:\\work\\sample-app",
+    turns: [{
+      id: "turn-images",
+      status: "completed",
+      items: [
+        {
+          id: "user-images",
+          clientId: "web-image-message",
+          type: "userMessage",
+          content: [
+            { type: "localImage", path: "C:\\private\\camera.png" },
+            { type: "text", text: "检查这张图" },
+          ],
+        },
+        {
+          id: "agent-images",
+          type: "agentMessage",
+          text: "结果如下\n![预览](C:\\private\\result.png)",
+        },
+        { id: "view-image", type: "imageView", path: "C:\\private\\view.png" },
+        {
+          id: "generated-image",
+          type: "imageGeneration",
+          result: "generated-base64",
+          revisedPrompt: "生成预览",
+        },
+      ],
+    }],
+  }, {
+    resolveImage(source) {
+      sources.push(source);
+      return {
+        src: `/api/images/asset_${String(sources.length).padStart(32, "0")}`,
+        alt: source.alt,
+      };
+    },
+  });
+
+  assert.equal(detail.messages.length, 4);
+  assert.equal(detail.messages[0].clientId, "web-image-message");
+  assert.equal(detail.messages[0].text, "检查这张图");
+  assert.equal(detail.messages[0].images.length, 1);
+  assert.equal(detail.messages[1].text, "结果如下");
+  assert.equal(detail.messages[1].images.length, 1);
+  assert.equal(detail.messages[2].kind, "image");
+  assert.equal(detail.messages[3].kind, "image");
+  assert.deepEqual(sources.map((source) => source.type), ["local", "local", "local", "data"]);
+  assert.doesNotMatch(JSON.stringify(detail), /C:\\\\private/);
 });

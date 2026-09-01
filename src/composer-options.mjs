@@ -24,27 +24,36 @@ function normalizedEfforts(model) {
 }
 
 function normalizedModels(value) {
-  const models = Array.isArray(value?.models) ? value.models : [];
-  return models
-    .filter((model) => model && !model.hidden)
-    .map((model) => {
-      const id = cleanString(model.model || model.id, 160);
-      const efforts = normalizedEfforts(model);
-      const configuredDefault = cleanString(model.defaultReasoningEffort, 32);
-      const defaultEffort = efforts.some((effort) => effort.id === configuredDefault)
-        ? configuredDefault
-        : efforts[0]?.id || "";
-      return {
-        id,
-        name: cleanString(model.displayName || id, 160),
-        description: cleanString(model.description, 600),
-        specialty: cleanString(model.modelSpecialty, 160),
-        isDefault: Boolean(model.isDefault),
-        defaultEffort,
-        efforts,
-      };
-    })
-    .filter((model) => model.id);
+  const seen = new Set();
+  const normalized = [];
+  for (const model of Array.isArray(value?.models) ? value.models : []) {
+    if (!model || model.hidden) continue;
+    const id = cleanString(model.model || model.id, 160);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const efforts = normalizedEfforts(model);
+    const configuredDefault = cleanString(model.defaultReasoningEffort, 32);
+    const defaultEffort = efforts.some((effort) => effort.id === configuredDefault)
+      ? configuredDefault
+      : efforts[0]?.id || "";
+    const inputModalities = Array.isArray(model.inputModalities)
+      ? [...new Set(model.inputModalities
+        .map((item) => cleanString(item, 32))
+        .filter((item) => ["text", "image", "audio"].includes(item)))]
+      : [];
+    normalized.push({
+      id,
+      name: cleanString(model.displayName || id, 160),
+      description: cleanString(model.description, 600),
+      specialty: cleanString(model.modelSpecialty, 160),
+      isDefault: Boolean(model.isDefault),
+      defaultEffort,
+      efforts,
+      inputModalities,
+      supportsImages: inputModalities.length === 0 || inputModalities.includes("image"),
+    });
+  }
+  return normalized;
 }
 
 function normalizedSkills(value) {
@@ -147,6 +156,9 @@ export function resolveComposerSelection(payload, catalog) {
   }
   if (!model.efforts.length && payload.effort) {
     throw selectionError("这个模型不接受推理强度设置");
+  }
+  if ((payload.imageIds || []).length && !model.supportsImages) {
+    throw selectionError("所选模型不支持图片输入");
   }
 
   const mode = payload.mode || "default";

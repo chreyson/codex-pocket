@@ -4,11 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServer } from "./codex-client.mjs";
 import { CodexDesktopBridge } from "./codex-desktop-bridge.mjs";
+import { ImageStore, MAX_IMAGE_BYTES } from "./image-store.mjs";
 import { boundedInteger, loopbackHost } from "./runtime-config.mjs";
 import {
+  collectTrackedThreadIds,
   parseApprovalPayload,
   parseGoalPayload,
   parseMessagePayload,
+  parseThreadCreatePayload,
+  resolveMessageDispatch,
   sanitizeServerRequest,
 } from "./control.mjs";
 import {
@@ -34,6 +38,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.resolve(process.env.RELAY_DATA_DIR || path.join(ROOT, ".data"));
+const IMAGE_DIR = path.join(DATA_DIR, "images");
 const HOST = loopbackHost(process.env.HOST);
 const PORT = boundedInteger(process.env.PORT, 4_173, { min: 1, max: 65_535 });
 const POLL_INTERVAL_MS = boundedInteger(
@@ -59,6 +64,11 @@ const MIME_TYPES = {
 };
 
 await fs.mkdir(DATA_DIR, { recursive: true });
+const imageStore = new ImageStore(IMAGE_DIR);
+await imageStore.init();
+const threadImageOptions = {
+  resolveImage: (source) => imageStore.registerThreadImage(source),
+};
 const tokenPath = path.join(DATA_DIR, "access-token");
 let accessToken = normalizeAccessToken(process.env.CODEX_RELAY_TOKEN);
 if (!accessToken) {
@@ -77,6 +87,8 @@ const codex = new CodexAppServer();
 const desktopBridge = new CodexDesktopBridge();
 let codexState = "starting";
 let codexError = "";
+const queuedTurns = new Map();
+const drainingQueuedThreads = new Set();
 codex.on("ready", () => {
   codexState = "ready";
   codexError = "";
@@ -91,7 +103,10 @@ codex.on("notification", (message) => {
   if (message.method !== "item/agentMessage/delta") schedulePoll(30);
 });
 codex.on("serverRequest", () => schedulePoll(10));
-codex.on("control", () => schedulePoll(10));
+codex.on("control", ({ threadId } = {}) => {
+  schedulePoll(10);
+  if (threadId) queueMicrotask(() => observeQueuedTurn(threadId, codex.isThreadBusy(threadId)));
+});
 
 const clients = new Set();
 let pollTimer = null;
@@ -106,7 +121,7 @@ let latestThreadsHash = "";
 function commonHeaders(extra = {}) {
   return {
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'self'; connect-src 'self'; img-src 'self' data: https:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -131,7 +146,13 @@ function isAuthorized(request) {
   return safeTokenEqual(requestToken(request), accessToken);
 }
 
-async function readBody(request, limit = 4_096) {
+async function readBodyBuffer(request, limit = 4_096) {
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > limit) {
+    const error = new Error("请求内容过大");
+    error.status = 413;
+    throw error;
+  }
   const chunks = [];
   let length = 0;
   for await (const chunk of request) {
@@ -143,7 +164,11 @@ async function readBody(request, limit = 4_096) {
     }
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+async function readBody(request, limit = 4_096) {
+  return (await readBodyBuffer(request, limit)).toString("utf8");
 }
 
 async function readJson(request, limit = 16_384) {
@@ -214,14 +239,86 @@ function desktopMutationError(message, code) {
   return error;
 }
 
+function publicQueuedTurn(value) {
+  if (!value) return null;
+  return {
+    clientMessageId: value.clientMessageId || "",
+    text: value.text,
+    skillNames: value.skillNames,
+    images: value.imageIds.map((id) => ({
+      src: `/api/images/${encodeURIComponent(id)}`,
+      alt: "上传的图片",
+    })),
+    queuedAt: value.queuedAt,
+  };
+}
+
+function pocketThreadControlState(threadId) {
+  const queued = queuedTurns.get(threadId);
+  return {
+    ...codex.threadControlState(threadId),
+    queued: Boolean(queued),
+    queue: publicQueuedTurn(queued),
+  };
+}
+
+function observeQueuedTurn(threadId, busy) {
+  const queued = queuedTurns.get(threadId);
+  if (!queued) return false;
+  if (!busy) queued.ready = true;
+  void drainQueuedTurn(threadId);
+  return true;
+}
+
+async function drainQueuedTurn(threadId) {
+  const queued = queuedTurns.get(threadId);
+  if (
+    !queued
+    || !queued.ready
+    || drainingQueuedThreads.has(threadId)
+    || codex.isThreadBusy(threadId)
+  ) {
+    return false;
+  }
+
+  drainingQueuedThreads.add(threadId);
+  try {
+    const result = await codex.startTurn(threadId, queued.text, queued.options);
+    if (queuedTurns.get(threadId) !== queued) return false;
+    queuedTurns.delete(threadId);
+    broadcastMessageEvent("queueStarted", {
+      threadId,
+      clientMessageId: queued.clientMessageId || "",
+      turnId: result.turn?.id || null,
+    });
+    schedulePoll(10);
+    scheduleDesktopPoll(0);
+    return true;
+  } catch (error) {
+    if (error.code === "TURN_ACTIVE") return false;
+    if (queuedTurns.get(threadId) === queued) queuedTurns.delete(threadId);
+    broadcastMessageEvent("queueFailed", {
+      threadId,
+      clientMessageId: queued.clientMessageId || "",
+      message: isDesktopWriterConflict(error)
+        ? DESKTOP_SEND_UNAVAILABLE
+        : error.message || "等待消息发送失败",
+    });
+    schedulePoll(10);
+    return false;
+  } finally {
+    drainingQueuedThreads.delete(threadId);
+  }
+}
+
 async function loadThreadState(threadId) {
   try {
     const result = await codex.readThread(threadId);
     if (!result?.thread?.id) throw new Error("Codex App Server 返回的会话快照无效");
     const thread = {
-      ...sanitizeThreadDetail(result.thread),
+      ...sanitizeThreadDetail(result.thread, threadImageOptions),
       control: {
-        ...codex.threadControlState(threadId),
+        ...pocketThreadControlState(threadId),
         requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
       },
     };
@@ -235,11 +332,13 @@ async function loadThreadState(threadId) {
   } catch (appServerError) {
     try {
       const desktopValue = await desktopBridge.readThread(threadId, { turnLimit: 10 });
-      const snapshot = sanitizeDesktopThreadSnapshot(desktopValue);
+      const snapshot = sanitizeDesktopThreadSnapshot(desktopValue, threadImageOptions);
       const thread = {
         ...snapshot,
         control: {
           ...snapshot.control,
+          queued: Boolean(queuedTurns.get(threadId)),
+          queue: publicQueuedTurn(queuedTurns.get(threadId)),
           requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
         },
       };
@@ -320,7 +419,7 @@ async function runPoll() {
       for (const client of clients) sseSend(client, "threads", threads);
     }
 
-    const watchedIds = [...new Set([...clients].map((client) => client.threadId).filter(Boolean))];
+    const watchedIds = collectTrackedThreadIds(clients, queuedTurns.keys());
     for (const threadId of watchedIds) {
       try {
         const { thread, agentMessages } = await loadThreadState(threadId);
@@ -333,6 +432,7 @@ async function runPoll() {
           }
         }
         if (broadcasted) codex.confirmLiveAgentMessageSnapshot(threadId, agentMessages);
+        observeQueuedTurn(threadId, thread.control?.busy);
       } catch (error) {
         for (const client of clients) {
           if (client.threadId === threadId) sseSend(client, "threadError", { message: error.message });
@@ -378,7 +478,10 @@ async function runDesktopPoll() {
     const results = await Promise.all(watchedIds.map(async (threadId) => {
       try {
         const value = await desktopBridge.readThread(threadId);
-        return { threadId, snapshot: sanitizeDesktopThreadSnapshot(value) };
+        return {
+          threadId,
+          snapshot: sanitizeDesktopThreadSnapshot(value, threadImageOptions),
+        };
       } catch (error) {
         return { threadId, error };
       }
@@ -430,6 +533,14 @@ async function serveStatic(response, pathname) {
 const sessionLimiter = new FixedWindowRateLimiter({ limit: 10 });
 const actionLimiter = new FixedWindowRateLimiter({ limit: 24 });
 
+function enforceActionRateLimit(request) {
+  const address = request.socket.remoteAddress || "unknown";
+  if (actionLimiter.allow(address)) return;
+  const error = new Error("操作过于频繁，请稍后再试");
+  error.status = 429;
+  throw error;
+}
+
 function parseThreadRoute(pathname) {
   const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|interrupt|approvals|goal)(?:\/([^/]+))?)?$/);
   if (!match) return null;
@@ -450,6 +561,59 @@ function isThreadMutation(method, route) {
   if (!route?.action) return false;
   if (route.action === "goal") return ["POST", "DELETE"].includes(method);
   return method === "POST" && ["messages", "interrupt", "approvals"].includes(route.action);
+}
+
+async function prepareGoalForTurn(threadId, message, selection, goal, dispatch) {
+  if (dispatch === "steer" || selection.mode !== "goal" || goal?.status === "active") {
+    return goal;
+  }
+  if (goal?.status === "paused") {
+    return publicGoal(await codex.setGoal(threadId, { status: "active" }));
+  }
+  if (!message.text) {
+    const error = new Error("目标模式需要输入目标内容，不能只发送图片");
+    error.status = 400;
+    throw error;
+  }
+  return publicGoal(await codex.setGoal(threadId, {
+    objective: message.text,
+    status: "active",
+  }));
+}
+
+async function prepareTurn(threadId, message) {
+  const statePromise = loadThreadState(threadId);
+  const [{ thread: current }, catalog] = await Promise.all([
+    statePromise,
+    loadComposerCatalog(
+      threadId,
+      statePromise.then((state) => state.catalogThread),
+    ),
+  ]);
+  const selection = resolveComposerSelection(message, catalog);
+  const dispatch = resolveMessageDispatch(message.action || "start", current);
+  const images = await imageStore.resolveUploads(message.imageIds || []);
+  const goal = await prepareGoalForTurn(
+    threadId,
+    message,
+    selection,
+    catalog.goal,
+    dispatch,
+  );
+
+  return {
+    current,
+    dispatch,
+    goal,
+    images,
+    selection,
+    options: {
+      ...selection,
+      images,
+      clientMessageId: message.clientMessageId,
+      mode: selection.mode === "goal" ? "default" : selection.mode,
+    },
+  };
 }
 
 const server = createServer(async (request, response) => {
@@ -479,6 +643,38 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 401, { error: "Unauthorized" });
     }
 
+    if (request.method === "POST" && pathname === "/api/uploads") {
+      enforceActionRateLimit(request);
+      const data = await readBodyBuffer(request, MAX_IMAGE_BYTES);
+      const image = await imageStore.saveUpload(data, {
+        fileName: request.headers["x-file-name"],
+        contentType: request.headers["content-type"],
+      });
+      return sendJson(response, 201, { ok: true, image });
+    }
+
+    const uploadRoute = pathname.match(/^\/api\/uploads\/(img_[a-f0-9]{32})$/);
+    if (request.method === "DELETE" && uploadRoute) {
+      const removed = await imageStore.removeUpload(uploadRoute[1]);
+      return sendJson(response, removed ? 200 : 404, removed
+        ? { ok: true }
+        : { error: "图片附件已失效" });
+    }
+
+    const imageRoute = pathname.match(/^\/api\/images\/([a-z]+_[a-f0-9]{32})$/);
+    if (request.method === "GET" && imageRoute) {
+      const image = await imageStore.readImage(imageRoute[1]);
+      response.writeHead(200, commonHeaders({
+        "Content-Type": image.mimeType,
+        "Content-Length": String(image.data.length),
+        "Cache-Control": "private, max-age=3600",
+        "Content-Disposition": "inline",
+        "Cross-Origin-Resource-Policy": "same-origin",
+      }));
+      response.end(image.data);
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/api/bootstrap") {
       const threads = await loadThreads();
       latestThreads = threads;
@@ -489,12 +685,26 @@ const server = createServer(async (request, response) => {
       });
     }
 
+    if (request.method === "POST" && pathname === "/api/threads") {
+      enforceActionRateLimit(request);
+      const { projectThreadId } = parseThreadCreatePayload(await readJson(request, 2_048));
+      const source = await codex.readThread(projectThreadId, { includeTurns: false });
+      const cwd = typeof source.thread?.cwd === "string" ? source.thread.cwd.trim() : "";
+      if (!source.thread?.id || !cwd) {
+        const error = new Error("无法读取这个项目的工作目录");
+        error.status = 409;
+        throw error;
+      }
+      const result = await codex.startThread({ cwd });
+      if (!result.thread?.id) throw new Error("Codex 未返回新会话");
+      const thread = sanitizeThreadSummary(result.thread);
+      schedulePoll(0);
+      return sendJson(response, 201, { ok: true, thread });
+    }
+
     const threadRoute = parseThreadRoute(pathname);
     if (isThreadMutation(request.method, threadRoute)) {
-      const address = request.socket.remoteAddress || "unknown";
-      if (!actionLimiter.allow(address)) {
-        return sendJson(response, 429, { error: "操作过于频繁，请稍后再试" });
-      }
+      enforceActionRateLimit(request);
     }
     if (request.method === "GET" && threadRoute && !threadRoute.action) {
       return sendJson(response, 200, await loadThreadPage(threadRoute.threadId));
@@ -502,47 +712,75 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && threadRoute?.action === "messages" && !threadRoute.requestToken) {
       const message = parseMessagePayload(await readJson(request));
-      const { text } = message;
-      const statePromise = loadThreadState(threadRoute.threadId);
-      const [{ thread: current }, catalog] = await Promise.all([
-        statePromise,
-        loadComposerCatalog(
-          threadRoute.threadId,
-          statePromise.then((state) => state.catalogThread),
-        ),
-      ]);
-      if (current.status === "active" && !current.control.busy) {
-        throw desktopMutationError(DESKTOP_SEND_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
+      if ((message.action || "start") === "queue" && queuedTurns.has(threadRoute.threadId)) {
+        const error = new Error("这个会话已经有一条等待消息");
+        error.status = 409;
+        throw error;
       }
-      const selection = resolveComposerSelection(message, catalog);
-      let goal = catalog.goal;
-      if (selection.mode === "goal" && !["active", "paused"].includes(goal?.status)) {
-        goal = publicGoal(await codex.setGoal(threadRoute.threadId, {
-          objective: text,
-          status: "active",
-        }));
-      } else if (selection.mode === "goal" && goal?.status === "paused") {
-        goal = publicGoal(await codex.setGoal(threadRoute.threadId, { status: "active" }));
+      const prepared = await prepareTurn(threadRoute.threadId, message);
+      const { current, dispatch, goal, selection } = prepared;
+
+      if (dispatch === "queue") {
+        const queued = {
+          text: message.text,
+          imageIds: message.imageIds || [],
+          clientMessageId: message.clientMessageId || "",
+          skillNames: selection.skills.map((skill) => skill.name),
+          queuedAt: Math.floor(Date.now() / 1_000),
+          ready: false,
+          options: prepared.options,
+        };
+        queuedTurns.set(threadRoute.threadId, queued);
+        imageStore.commitUploads(message.imageIds || []);
+        schedulePoll(10);
+        return sendJson(response, 202, {
+          ok: true,
+          delivery: "queued",
+          turnId: null,
+          selection: {
+            model: selection.model,
+            effort: selection.effort,
+            mode: selection.mode,
+            skillNames: queued.skillNames,
+          },
+          goal,
+          control: {
+            ...pocketThreadControlState(threadRoute.threadId),
+            requests: current.control.requests || [],
+          },
+        });
       }
 
       let result;
-      let delivery;
+      let delivery = "app-server";
       try {
-        result = await codex.startTurn(threadRoute.threadId, text, {
-          ...selection,
-          mode: selection.mode === "goal" ? "default" : selection.mode,
-        });
-        delivery = "app-server";
+        if (dispatch === "steer") {
+          result = await codex.steerTurn(threadRoute.threadId, message.text, {
+            ...prepared.options,
+            turnId: message.expectedTurnId || current.control.turnId,
+          });
+          delivery = "steered";
+        } else {
+          result = await codex.startTurn(
+            threadRoute.threadId,
+            message.text,
+            prepared.options,
+          );
+        }
       } catch (error) {
         if (!isDesktopWriterConflict(error)) throw error;
         throw desktopMutationError(DESKTOP_SEND_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
       }
+      imageStore.commitUploads(message.imageIds || []);
       schedulePoll(10);
       scheduleDesktopPoll(0);
       return sendJson(response, 202, {
         ok: true,
         delivery,
-        turnId: result.turn?.id || null,
+        turnId: result.turn?.id
+          || message.expectedTurnId
+          || current.control.turnId
+          || null,
         selection: {
           model: selection.model,
           effort: selection.effort,
@@ -551,9 +789,9 @@ const server = createServer(async (request, response) => {
         },
         goal,
         control: {
-          ...codex.threadControlState(threadRoute.threadId),
+          ...pocketThreadControlState(threadRoute.threadId),
           busy: true,
-          phase: "starting",
+          phase: dispatch === "steer" ? "running" : "starting",
         },
       });
     }
@@ -576,6 +814,7 @@ const server = createServer(async (request, response) => {
       } else {
         const snapshot = sanitizeDesktopThreadSnapshot(
           await desktopBridge.readThread(threadRoute.threadId),
+          threadImageOptions,
         );
         if (!snapshot.control?.busy) {
           const error = new Error("当前没有正在执行的任务");

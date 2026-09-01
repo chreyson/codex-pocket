@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   MAX_MESSAGE_LENGTH,
+  collectTrackedThreadIds,
   parseApprovalPayload,
   parseGoalPayload,
   parseMessagePayload,
+  parseThreadCreatePayload,
+  resolveMessageDispatch,
   sanitizeServerRequest,
 } from "../src/control.mjs";
 
@@ -39,6 +42,111 @@ test("message payloads accept bounded Codex composer settings", () => {
   assert.throws(
     () => parseMessagePayload({ text: "test", skillNames: Array(17).fill("docs") }),
     (error) => error.status === 400,
+  );
+});
+
+test("message payloads accept image-only input and validate upload ids", () => {
+  const first = `img_${"a".repeat(32)}`;
+  const second = `img_${"b".repeat(32)}`;
+  assert.deepEqual(parseMessagePayload({
+    text: "",
+    imageIds: [first, first, second],
+    clientMessageId: "web-message-1",
+  }), {
+    text: "",
+    imageIds: [first, second],
+    clientMessageId: "web-message-1",
+  });
+  assert.throws(
+    () => parseMessagePayload({ text: "", imageIds: ["../../secret.png"] }),
+    (error) => error.status === 400,
+  );
+  assert.throws(
+    () => parseMessagePayload({
+      text: "image flood",
+      imageIds: Array.from({ length: 5 }, (_, index) => `img_${String(index).padStart(32, "0")}`),
+    }),
+    (error) => error.status === 400,
+  );
+});
+
+test("message payloads validate waiting and Steer delivery metadata", () => {
+  assert.deepEqual(parseMessagePayload({
+    text: "先检查测试",
+    action: "steer",
+    expectedTurnId: "turn-42",
+  }), {
+    text: "先检查测试",
+    action: "steer",
+    expectedTurnId: "turn-42",
+  });
+  assert.deepEqual(parseMessagePayload({ text: "完成后继续", action: "queue" }), {
+    text: "完成后继续",
+    action: "queue",
+  });
+  assert.throws(
+    () => parseMessagePayload({ text: "test", action: "interrupt" }),
+    (error) => error.status === 400,
+  );
+  assert.throws(
+    () => parseMessagePayload({ text: "test", expectedTurnId: "" }),
+    (error) => error.status === 400,
+  );
+});
+
+test("new conversation payloads contain only a project thread id", () => {
+  assert.deepEqual(parseThreadCreatePayload({ projectThreadId: " thread-1 " }), {
+    projectThreadId: "thread-1",
+  });
+  assert.throws(
+    () => parseThreadCreatePayload({ projectThreadId: "" }),
+    (error) => error.status === 400,
+  );
+  assert.throws(
+    () => parseThreadCreatePayload({ cwd: "C:\\secret\\project" }),
+    (error) => error.status === 400,
+  );
+});
+
+test("an idle thread is started even when its persisted status still says active", () => {
+  assert.equal(resolveMessageDispatch("start", {
+    status: "active",
+    control: { busy: false },
+  }), "start");
+  assert.equal(resolveMessageDispatch("queue", {
+    status: "active",
+    control: { busy: false },
+  }), "start");
+  assert.equal(resolveMessageDispatch("queue", {
+    status: "active",
+    control: { busy: true },
+  }), "queue");
+  assert.equal(resolveMessageDispatch("steer", {
+    control: { busy: true, turnId: "turn-1" },
+  }), "steer");
+  assert.throws(
+    () => resolveMessageDispatch("start", { control: { busy: true, turnId: "turn-1" } }),
+    (error) => error.status === 409 && error.code === "TURN_ACTIVE",
+  );
+  assert.throws(
+    () => resolveMessageDispatch("steer", { control: { busy: false } }),
+    (error) => error.status === 409 && error.code === "NO_ACTIVE_TURN",
+  );
+  assert.throws(
+    () => resolveMessageDispatch("steer", { control: { busy: true, turnId: null } }),
+    (error) => error.status === 409 && error.code === "TURN_STARTING",
+  );
+});
+
+test("queued conversations remain tracked without a connected browser", () => {
+  const clients = new Set([
+    { threadId: "thread-visible" },
+    { threadId: "thread-shared" },
+    { threadId: "" },
+  ]);
+  assert.deepEqual(
+    collectTrackedThreadIds(clients, ["thread-queued", "thread-shared", null]),
+    ["thread-queued", "thread-shared", "thread-visible"],
   );
 });
 

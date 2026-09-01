@@ -52,18 +52,69 @@ export function sanitizeThreadSummary(thread) {
   };
 }
 
-function userText(content = []) {
-  return (Array.isArray(content) ? content : [])
-    .map((item) => {
-      if (item?.type === "text") return item.text;
-      if (item?.type === "image" || item?.type === "localImage") return "[图片]";
-      if (item?.type === "audio" || item?.type === "localAudio") return "[音频]";
-      if (item?.type === "mention") return `@${item.name || "会话"}`;
-      if (item?.type === "skill") return `$${item.name || "skill"}`;
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
+function resolvedImage(resolveImage, source) {
+  if (typeof resolveImage !== "function") return null;
+  try {
+    const value = resolveImage(source);
+    return value && typeof value.src === "string" && value.src ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function userContent(content = [], resolveImage) {
+  const lines = [];
+  const images = [];
+  for (const item of Array.isArray(content) ? content : []) {
+    if (item?.type === "text" && item.text) lines.push(item.text);
+    else if (item?.type === "localImage") {
+      const image = resolvedImage(resolveImage, {
+        type: "local",
+        path: item.path,
+        alt: "上传的图片",
+      });
+      if (image) images.push(image);
+      else lines.push("[图片]");
+    } else if (item?.type === "image") {
+      const image = resolvedImage(resolveImage, {
+        type: "url",
+        url: item.url,
+        alt: "上传的图片",
+      });
+      if (image) images.push(image);
+      else lines.push("[图片]");
+    } else if (item?.type === "audio" || item?.type === "localAudio") lines.push("[音频]");
+    else if (item?.type === "mention") lines.push(`@${item.name || "会话"}`);
+    else if (item?.type === "skill") lines.push(`$${item.name || "skill"}`);
+  }
+  return { text: lines.filter(Boolean).join("\n"), images };
+}
+
+function agentContent(value, resolveImage) {
+  const images = [];
+  const lines = String(value ?? "").split("\n");
+  const remaining = [];
+  for (const line of lines) {
+    const match = line.match(/^\s*!\[([^\]]*)\]\((.+)\)\s*$/);
+    if (!match) {
+      remaining.push(line);
+      continue;
+    }
+    let target = match[2].trim();
+    if (target.startsWith("<") && target.endsWith(">")) {
+      target = target.slice(1, -1).trim();
+    }
+    const source = /^(?:https:|data:image\/)/i.test(target)
+      ? { type: "url", url: target, alt: match[1] || "图片" }
+      : { type: "local", path: target, alt: match[1] || "图片" };
+    const image = resolvedImage(resolveImage, source);
+    if (image) images.push(image);
+    else remaining.push(line);
+  }
+  return {
+    text: remaining.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    images,
+  };
 }
 
 function commandText(item) {
@@ -141,7 +192,7 @@ function inferredItemStatus(turn, item, index, itemCount) {
   return turnRunning && index === itemCount - 1 ? "inProgress" : "completed";
 }
 
-export function sanitizeThreadDetail(thread) {
+export function sanitizeThreadDetail(thread, { resolveImage } = {}) {
   const source = thread && typeof thread === "object" ? thread : {};
   const messages = [];
   const turns = Array.isArray(source.turns) ? source.turns : [];
@@ -154,8 +205,19 @@ export function sanitizeThreadDetail(thread) {
       if (!item || typeof item !== "object") continue;
       const itemId = messageId(item.id, `${turnId}-item-${index}`);
       if (item.type === "userMessage") {
-        const text = userText(item.content);
-        if (text) messages.push({ id: itemId, role: "user", kind: "message", text: clip(text), timestamp: startedAt });
+        const content = userContent(item.content, resolveImage);
+        if (content.text || content.images.length) {
+          messages.push({
+            id: itemId,
+            turnId,
+            clientId: typeof item.clientId === "string" ? clip(item.clientId, 200) : "",
+            role: "user",
+            kind: "message",
+            text: clip(content.text),
+            images: content.images,
+            timestamp: startedAt,
+          });
+        }
         continue;
       }
 
@@ -165,6 +227,7 @@ export function sanitizeThreadDetail(thread) {
         if (text || ["inProgress", "running"].includes(status)) {
           messages.push({
             id: itemId,
+            turnId,
             role: "assistant",
             kind: "reasoning",
             text: clip(text),
@@ -176,12 +239,62 @@ export function sanitizeThreadDetail(thread) {
       }
 
       if (item.type === "agentMessage") {
-        if (item.text) {
+        const content = agentContent(item.text, resolveImage);
+        if (content.text || content.images.length) {
           messages.push({
             id: itemId,
+            turnId,
             role: "assistant",
             kind: item.phase === "commentary" ? "commentary" : "message",
-            text: clip(item.text),
+            text: clip(content.text),
+            images: content.images,
+            timestamp: startedAt,
+          });
+        }
+        continue;
+      }
+
+      if (item.type === "imageView") {
+        const image = resolvedImage(resolveImage, {
+          type: "local",
+          path: item.path,
+          alt: "查看的图片",
+        });
+        if (image) {
+          messages.push({
+            id: itemId,
+            turnId,
+            role: "system",
+            kind: "image",
+            label: "图片",
+            text: "",
+            images: [image],
+            timestamp: startedAt,
+          });
+        }
+        continue;
+      }
+
+      if (item.type === "imageGeneration") {
+        const image = item.savedPath
+          ? resolvedImage(resolveImage, {
+            type: "local",
+            path: item.savedPath,
+            alt: "生成的图片",
+          })
+          : resolvedImage(resolveImage, {
+            type: "data",
+            data: item.result,
+            alt: "生成的图片",
+          });
+        if (image) {
+          messages.push({
+            id: itemId,
+            turnId,
+            role: "assistant",
+            kind: "image",
+            text: clip(item.revisedPrompt || "", 2_000),
+            images: [image],
             timestamp: startedAt,
           });
         }
@@ -189,7 +302,7 @@ export function sanitizeThreadDetail(thread) {
       }
 
       if (item.type === "plan" && item.text) {
-        messages.push({ id: itemId, role: "assistant", kind: "plan", text: clip(item.text), timestamp: startedAt });
+        messages.push({ id: itemId, turnId, role: "assistant", kind: "plan", text: clip(item.text), timestamp: startedAt });
         continue;
       }
 
@@ -197,6 +310,7 @@ export function sanitizeThreadDetail(thread) {
       if (activity) {
         messages.push({
           id: itemId,
+          turnId,
           role: "system",
           kind: "activity",
           label: activity.label,
@@ -211,6 +325,7 @@ export function sanitizeThreadDetail(thread) {
     if (turn.status === "failed" && turn.error?.message) {
       messages.push({
         id: `${turnId}-error`,
+        turnId,
         role: "system",
         kind: "error",
         label: "错误",
@@ -226,7 +341,7 @@ export function sanitizeThreadDetail(thread) {
   };
 }
 
-export function sanitizeDesktopThreadSnapshot(value) {
+export function sanitizeDesktopThreadSnapshot(value, options = {}) {
   const sourceThread = value?.thread;
   if (typeof sourceThread?.id !== "string" || !sourceThread.id) {
     throw new Error("Codex App 返回的会话快照无效");
@@ -239,10 +354,10 @@ export function sanitizeDesktopThreadSnapshot(value) {
   const activeTurn = [...turns].reverse().find(
     (turn) => ["inProgress", "running"].includes(turn?.status),
   );
-  const busy = statusType(sourceThread.status) === "active" || Boolean(activeTurn);
+  const busy = Boolean(activeTurn);
 
   return {
-    ...sanitizeThreadDetail({ ...sourceThread, turns }),
+    ...sanitizeThreadDetail({ ...sourceThread, turns }, options),
     partial: true,
     control: {
       busy,

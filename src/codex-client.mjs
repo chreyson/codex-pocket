@@ -9,6 +9,30 @@ function clipLiveMessageText(value) {
   return String(value ?? "").slice(0, MAX_LIVE_MESSAGE_LENGTH);
 }
 
+function turnInput(text, options = {}) {
+  const input = (options.skills || []).map((skill) => ({
+    type: "skill",
+    name: skill.name,
+    path: skill.path,
+  }));
+  for (const image of options.images || []) {
+    if (!image?.path) continue;
+    input.push({
+      type: "localImage",
+      path: image.path,
+      detail: image.detail || "auto",
+    });
+  }
+  const messageText = typeof text === "string" ? text.trim() : "";
+  if (messageText) input.push({ type: "text", text: messageText, text_elements: [] });
+  if (!messageText && !input.some((item) => item.type === "localImage")) {
+    const error = new Error("A Codex turn requires text or an image");
+    error.code = "EMPTY_INPUT";
+    throw error;
+  }
+  return input;
+}
+
 export function appServerLaunchSpec(command, {
   platform = process.platform,
   comspec = process.env.ComSpec || "cmd.exe",
@@ -213,6 +237,29 @@ export class CodexAppServer extends EventEmitter {
       this.activeTurns.delete(thread.id);
       this.interruptingThreads.delete(thread.id);
     }
+  }
+
+  _rememberThreadSession(result, expectedThreadId = "") {
+    const threadId = result?.thread?.id;
+    if (
+      typeof threadId !== "string"
+      || !threadId
+      || (expectedThreadId && threadId !== expectedThreadId)
+    ) {
+      const error = new Error("Codex App Server returned an invalid thread response");
+      error.code = "INVALID_THREAD_RESPONSE";
+      throw error;
+    }
+
+    this.loadedThreads.add(threadId);
+    this._captureThreadState(result.thread);
+    this.threadSettings.set(threadId, {
+      model: result.model || "",
+      effort: result.reasoningEffort || null,
+      serviceTier: result.serviceTier || null,
+      collaborationMode: null,
+    });
+    return threadId;
   }
 
   _removeRequestsForThread(threadId) {
@@ -521,18 +568,20 @@ export class CodexAppServer extends EventEmitter {
     };
   }
 
+  async startThread({ cwd = "" } = {}) {
+    await this.start();
+    const params = { ephemeral: false };
+    if (cwd) params.cwd = cwd;
+    const result = await this.request("thread/start", params);
+    this._rememberThreadSession(result);
+    return result;
+  }
+
   async resumeThread(threadId) {
     await this.start();
     if (this.loadedThreads.has(threadId)) return this.threadSettings.get(threadId) || null;
     const result = await this.request("thread/resume", { threadId });
-    this.loadedThreads.add(threadId);
-    this._captureThreadState(result.thread);
-    this.threadSettings.set(threadId, {
-      model: result.model || "",
-      effort: result.reasoningEffort || null,
-      serviceTier: result.serviceTier || null,
-      collaborationMode: null,
-    });
+    this._rememberThreadSession(result, threadId);
     return result;
   }
 
@@ -553,16 +602,11 @@ export class CodexAppServer extends EventEmitter {
         throw error;
       }
 
-      const input = (options.skills || []).map((skill) => ({
-        type: "skill",
-        name: skill.name,
-        path: skill.path,
-      }));
-      input.push({ type: "text", text, text_elements: [] });
       const params = {
         threadId,
-        input,
+        input: turnInput(text, options),
       };
+      if (options.clientMessageId) params.clientUserMessageId = options.clientMessageId;
       if (options.model) params.model = options.model;
       if (options.effort) params.effort = options.effort;
       if (["default", "plan"].includes(options.mode) && options.model) {
@@ -592,6 +636,24 @@ export class CodexAppServer extends EventEmitter {
       this.startingThreads.delete(threadId);
       this.emit("control", { threadId });
     }
+  }
+
+  async steerTurn(threadId, text, options = {}) {
+    await this.start();
+    const expectedTurnId = options.turnId || this.activeTurns.get(threadId);
+    if (!expectedTurnId) {
+      const error = new Error("This Codex conversation has no steerable active turn");
+      error.code = "NO_ACTIVE_TURN";
+      throw error;
+    }
+    return this.request("turn/steer", {
+      threadId,
+      expectedTurnId,
+      input: turnInput(text, options),
+      ...(options.clientMessageId
+        ? { clientUserMessageId: options.clientMessageId }
+        : {}),
+    });
   }
 
   async interruptTurn(threadId, turnId = this.activeTurns.get(threadId)) {

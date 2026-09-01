@@ -16,6 +16,7 @@ function rawCatalog() {
         displayName: "Balanced",
         description: "Everyday work",
         defaultReasoningEffort: "medium",
+        inputModalities: ["text", "image"],
         isDefault: true,
         hidden: false,
         supportedReasoningEfforts: [
@@ -63,6 +64,8 @@ test("composer catalog exposes account options without leaking skill paths", () 
   assert.equal(catalog.defaultEffort, "medium");
   assert.deepEqual(catalog.modes, ["default", "plan"]);
   assert.equal(catalog.features.goal, true);
+  assert.equal(publicValue.models[0].supportsImages, true);
+  assert.deepEqual(publicValue.models[0].inputModalities, ["text", "image"]);
   assert.equal(publicValue.skills[0].name, "docs");
   assert.equal("path" in publicValue.skills[0], false);
   assert.equal(catalog.skills[0].path, "C:\\private\\docs\\SKILL.md");
@@ -134,4 +137,37 @@ test("models without configurable reasoning effort remain sendable", () => {
     }, catalog),
     /不接受推理强度/,
   );
+});
+
+test("composer selections reject images for text-only models", () => {
+  const catalog = normalizeComposerCatalog({
+    models: [{
+      model: "text-only",
+      isDefault: true,
+      inputModalities: ["text"],
+    }],
+    modes: [],
+  });
+
+  assert.equal(catalog.models[0].supportsImages, false);
+  assert.throws(
+    () => resolveComposerSelection({
+      model: "text-only",
+      text: "inspect",
+      imageIds: [`img_${"a".repeat(32)}`],
+    }, catalog),
+    /不支持图片输入/,
+  );
+});
+
+test("duplicate model records are collapsed before rendering the catalog", () => {
+  const catalog = normalizeComposerCatalog({
+    models: [
+      { model: "gpt-test", displayName: "First", isDefault: true },
+      { model: "gpt-test", displayName: "Duplicate" },
+    ],
+  });
+
+  assert.equal(catalog.models.length, 1);
+  assert.equal(catalog.models[0].name, "First");
 });
