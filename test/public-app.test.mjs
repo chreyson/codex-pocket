@@ -586,6 +586,73 @@ test("completed history turns collapse while the latest turn stays expanded", as
   assert.match(rendered.at(-1).textContent, /新任务已更新/);
 });
 
+test("each user command starts a history turn even when raw turn ids disagree", async () => {
+  const summary = threadSummary("A");
+  const firstCommand = "First command keeps its complete prompt in the history heading, including this tail marker";
+  const detail = {
+    ...summary,
+    messages: [
+      { id: "command-1", turnId: "shared-turn", role: "user", kind: "message", text: firstCommand, timestamp: 1 },
+      { id: "answer-1", turnId: "shared-turn", role: "assistant", kind: "message", text: "First response", timestamp: 1 },
+      { id: "command-2", turnId: "shared-turn", role: "user", kind: "message", text: "Steer command", timestamp: 2 },
+      { id: "activity-2", turnId: "different-turn", role: "system", kind: "activity", label: "Tool", activityType: "tool", activityStatus: "completed", text: "Tool output", timestamp: 2 },
+      { id: "answer-2", turnId: "different-turn", role: "assistant", kind: "message", text: "Second response", timestamp: 2 },
+      { id: "command-3", turnId: "latest-turn", role: "user", kind: "message", text: "Latest command", timestamp: 3 },
+      { id: "answer-3", turnId: "latest-turn", role: "assistant", kind: "message", text: "Latest response", timestamp: 3 },
+    ],
+    control: { busy: false, requests: [] },
+  };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [summary] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  const rendered = harness.elements["message-list"].children;
+  assert.equal(rendered.length, 4);
+  assert.deepEqual(rendered.slice(0, 2).map((node) => node.tagName), ["DETAILS", "DETAILS"]);
+  assert.equal(rendered[0].children[0].children[0].textContent, firstCommand);
+  assert.match(rendered[0].children[1].textContent, /First command.*First response/);
+  assert.match(rendered[1].children[1].textContent, /Steer command.*Tool output.*Second response/);
+  assert.deepEqual(rendered.slice(2).map((node) => node.dataset.role), ["user", "assistant"]);
+});
+
+test("leading records without a user command share one context fold", async () => {
+  const summary = threadSummary("A");
+  const detail = {
+    ...summary,
+    messages: [
+      { id: "orphan-error", turnId: "orphan-a", role: "system", kind: "error", text: "Earlier failure", timestamp: 1 },
+      { id: "orphan-answer", turnId: "orphan-b", role: "assistant", kind: "message", text: "Earlier continuation", timestamp: 2 },
+      { id: "command-old", turnId: "turn-old", role: "user", kind: "message", text: "Visible old command", timestamp: 3 },
+      { id: "answer-old", turnId: "turn-old", role: "assistant", kind: "message", text: "Visible old response", timestamp: 3 },
+      { id: "command-new", turnId: "turn-new", role: "user", kind: "message", text: "Latest command", timestamp: 4 },
+      { id: "answer-new", turnId: "turn-new", role: "assistant", kind: "message", text: "Latest response", timestamp: 4 },
+    ],
+    control: { busy: false, requests: [] },
+  };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [summary] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  const rendered = harness.elements["message-list"].children;
+  assert.equal(rendered.length, 4);
+  assert.equal(rendered[0].className, "history-turn history-context");
+  assert.match(rendered[0].children[0].textContent, /早期上下文/);
+  assert.match(rendered[0].children[1].textContent, /Earlier failure.*Earlier continuation/);
+  assert.equal(rendered[1].className, "history-turn");
+  assert.match(rendered[1].children[0].textContent, /Visible old command/);
+  assert.deepEqual(rendered.slice(2).map((node) => node.dataset.role), ["user", "assistant"]);
+});
+
 test("the first authoritative conversation snapshot lands at the bottom immediately", async () => {
   const harness = await createHarness(async (url) => {
     if (url === "/api/bootstrap") {
@@ -876,6 +943,12 @@ test("optimistic messages show sending and delivered receipts", async () => {
   });
 
   await harness.hooks.selectThread("A");
+  emitSse(harness.eventSources.at(-1), "desktopThread", {
+    ...threadSummary("A"),
+    partial: true,
+    messages: [],
+    control: { busy: false, phase: "idle", turnId: null },
+  });
   harness.elements["message-input"].value = "马上开始";
   const sending = harness.hooks.sendMessage({ preventDefault() {} });
   await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
@@ -890,10 +963,11 @@ test("optimistic messages show sending and delivered receipts", async () => {
   userMessage = harness.elements["message-list"].children.at(-1);
   assert.equal(userMessage.children[2].textContent, "已送达");
   assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "sent");
+  assert.equal(harness.hooks.getState().currentThread.control.busy, true);
 });
 
-test("a rejected desktop-owned send restores the draft instead of showing delivered", async () => {
-  const errorMessage = "这个任务正由 Codex Desktop 占用，Web 端无法可靠写入";
+test("a rejected send restores the draft instead of showing delivered", async () => {
+  const errorMessage = "Codex Desktop 持有这个会话，当前无法从 Web 端转交图片";
   const harness = await createHarness(async (url) => {
     if (url === "/api/bootstrap") {
       return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
@@ -1192,6 +1266,7 @@ test("an optimistic user message stays before live replies that beat the send re
 
   let rendered = harness.elements["message-list"].children;
   assert.equal(rendered[0].tagName, "DETAILS");
+  assert.match(rendered[0].children[0].textContent, /早期上下文/);
   assert.equal(rendered[1].dataset.role, "user");
   assert.equal(rendered[1].children[1].textContent, "test");
 

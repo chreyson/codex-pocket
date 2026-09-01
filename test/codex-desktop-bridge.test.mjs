@@ -166,3 +166,63 @@ test("desktop discovery selects an endpoint that supports the requested tool", a
     "read-capable",
   );
 });
+
+test("desktop follow-ups use the App-owned send tool with model and effort", async () => {
+  const calls = [];
+  const bridge = new CodexDesktopBridge({
+    discover: async () => ["desktop-pipe"],
+    request: async (_pipePath, method, params) => {
+      calls.push({ method, params });
+      if (method === "tools/list") {
+        return {
+          tools: [
+            { name: "send_message_to_thread", namespace: "codex_app" },
+          ],
+        };
+      }
+      return { success: true, contentItems: [] };
+    },
+  });
+
+  const result = await bridge.sendMessage("thread-1", "continue", {
+    model: "gpt-test",
+    effort: "high",
+  });
+
+  assert.equal(result.success, true);
+  const toolCall = calls.find((call) => call.method === "tools/call");
+  assert.equal(toolCall.params.tool, "send_message_to_thread");
+  assert.deepEqual(toolCall.params.arguments, {
+    threadId: "thread-1",
+    prompt: "continue",
+    model: "gpt-test",
+    thinking: "high",
+  });
+});
+
+test("desktop follow-ups are not retried after an ambiguous timeout", async () => {
+  let toolCalls = 0;
+  const bridge = new CodexDesktopBridge({
+    discover: async () => ["desktop-pipe"],
+    request: async (_pipePath, method) => {
+      if (method === "tools/list") {
+        return {
+          tools: [
+            { name: "send_message_to_thread", namespace: "codex_app" },
+          ],
+        };
+      }
+      toolCalls += 1;
+      throw Object.assign(new Error("delivery result unknown"), {
+        code: "DESKTOP_BRIDGE_TIMEOUT",
+      });
+    },
+  });
+
+  await assert.rejects(
+    bridge.sendMessage("thread-1", "send once"),
+    (error) => error.code === "DESKTOP_BRIDGE_DELIVERY_UNKNOWN"
+      && /避免重复发送/.test(error.message),
+  );
+  assert.equal(toolCalls, 1);
+});

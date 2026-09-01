@@ -4,6 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServer } from "./codex-client.mjs";
 import { CodexDesktopBridge } from "./codex-desktop-bridge.mjs";
+import {
+  isDesktopWriterConflict,
+  startTurnWithDesktopFallback,
+} from "./desktop-delivery.mjs";
 import { ImageStore, MAX_IMAGE_BYTES } from "./image-store.mjs";
 import { boundedInteger, loopbackHost } from "./runtime-config.mjs";
 import {
@@ -52,7 +56,8 @@ const DESKTOP_SYNC_INTERVAL_MS = boundedInteger(
   { min: 150, max: 10_000 },
 );
 const MAX_SSE_BUFFER_BYTES = 512 * 1024;
-const DESKTOP_SEND_UNAVAILABLE = "这个任务正由 Codex Desktop 占用，Web 端无法可靠写入。请完全退出 Codex Desktop（Codex Pocket 控制器可以继续运行），然后重试";
+const DESKTOP_SEND_UNAVAILABLE = "Codex Desktop 正在使用这个会话，Web 端暂时无法完成该操作。请稍后重试或回到 Codex Desktop 操作";
+const DESKTOP_STEER_UNAVAILABLE = "这个任务正在 Codex Desktop 中执行，Web 端目前无法可靠 Steer。请回到 Codex Desktop 操作";
 const DESKTOP_INTERRUPT_UNAVAILABLE = "这个任务正在 Codex Desktop 中执行，Web 端目前无法可靠中断。请回到 Codex Desktop 操作";
 
 const MIME_TYPES = {
@@ -228,10 +233,6 @@ async function loadThreads() {
     .map(sanitizeThreadSummary);
 }
 
-function isDesktopWriterConflict(error) {
-  return /already has an active writer/i.test(String(error?.message || ""));
-}
-
 function desktopMutationError(message, code) {
   const error = new Error(message);
   error.code = code;
@@ -283,7 +284,14 @@ async function drainQueuedTurn(threadId) {
 
   drainingQueuedThreads.add(threadId);
   try {
-    const result = await codex.startTurn(threadId, queued.text, queued.options);
+    const { result } = await startTurnWithDesktopFallback({
+      codex,
+      desktopBridge,
+      threadId,
+      text: queued.text,
+      options: queued.options,
+      transformOptions: threadImageOptions,
+    });
     if (queuedTurns.get(threadId) !== queued) return false;
     queuedTurns.delete(threadId);
     broadcastMessageEvent("queueStarted", {
@@ -761,15 +769,20 @@ const server = createServer(async (request, response) => {
           });
           delivery = "steered";
         } else {
-          result = await codex.startTurn(
-            threadRoute.threadId,
-            message.text,
-            prepared.options,
-          );
+          const started = await startTurnWithDesktopFallback({
+            codex,
+            desktopBridge,
+            threadId: threadRoute.threadId,
+            text: message.text,
+            options: prepared.options,
+            transformOptions: threadImageOptions,
+          });
+          result = started.result;
+          delivery = started.delivery;
         }
       } catch (error) {
         if (!isDesktopWriterConflict(error)) throw error;
-        throw desktopMutationError(DESKTOP_SEND_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
+        throw desktopMutationError(DESKTOP_STEER_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
       }
       imageStore.commitUploads(message.imageIds || []);
       schedulePoll(10);
@@ -925,6 +938,9 @@ const server = createServer(async (request, response) => {
     ].includes(error.code)) {
       status = 503;
       message = "Codex App 连接暂时不可用，请重试";
+    } else if (error.code === "DESKTOP_BRIDGE_DELIVERY_UNKNOWN") {
+      status = 504;
+      message = error.message;
     } else if (/already has an active writer/i.test(message)) {
       status = 409;
       message = DESKTOP_SEND_UNAVAILABLE;

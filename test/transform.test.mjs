@@ -73,6 +73,32 @@ test("thread detail keeps conversation and redacts raw tool output", () => {
   assert.doesNotMatch(detail.messages[3].text, /\[object Object\]/);
 });
 
+test("hook prompts become user commands for cross-task Desktop messages", () => {
+  const detail = sanitizeThreadDetail({
+    ...sampleThread,
+    turns: [{
+      id: "turn-hook",
+      status: "completed",
+      startedAt: 102,
+      items: [
+        {
+          id: "hook-1",
+          type: "hookPrompt",
+          fragments: [
+            { hookRunId: "run-1", text: "First instruction" },
+            { hookRunId: "run-1", text: "Continue from another task" },
+          ],
+        },
+        { id: "agent-hook", type: "agentMessage", text: "Completed" },
+      ],
+    }],
+  });
+
+  assert.deepEqual(detail.messages.map((message) => message.role), ["user", "assistant"]);
+  assert.equal(detail.messages[0].text, "First instruction\nContinue from another task");
+  assert.equal(detail.messages[0].turnId, "turn-hook");
+});
+
 test("failed commands are not labeled as running", () => {
   const detail = sanitizeThreadDetail({
     ...sampleThread,

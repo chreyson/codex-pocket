@@ -671,10 +671,11 @@ textarea:focus-visible {
 .history-turn-summary {
   min-height: 44px;
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 9px;
-  padding: 4px 2px;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 9px;
+  row-gap: 3px;
+  padding: 9px 2px;
   color: var(--muted);
   cursor: pointer;
   list-style: none;
@@ -685,8 +686,11 @@ textarea:focus-visible {
 }
 
 .history-turn-summary::before {
+  grid-column: 1;
+  grid-row: 1 / span 2;
   width: 6px;
   height: 6px;
+  margin-top: 6px;
   border-right: 1.5px solid currentColor;
   border-bottom: 1.5px solid currentColor;
   content: "";
@@ -698,18 +702,26 @@ textarea:focus-visible {
 }
 
 .history-turn-title {
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
+  display: -webkit-box;
   overflow: hidden;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .history-turn-meta {
+  grid-column: 2;
+  grid-row: 2;
   color: var(--subtle);
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .history-turn-content {

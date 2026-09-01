@@ -165,6 +165,13 @@ function parseToolJson(result, toolName) {
   }
 }
 
+function assertToolSuccess(result) {
+  if (!result?.success) {
+    throw bridgeError(resultErrorMessage(result), "DESKTOP_BRIDGE_TOOL_ERROR");
+  }
+  return result;
+}
+
 export class CodexDesktopBridge {
   constructor({
     discover = discoverCodexAppPipePaths,
@@ -287,5 +294,26 @@ export class CodexDesktopBridge {
       { retry: true },
     );
     return parseToolJson(result, "read_thread");
+  }
+
+  async sendMessage(threadId, prompt, { model = "", effort = "" } = {}) {
+    const args = { threadId, prompt };
+    if (model) args.model = model;
+    if (effort) args.thinking = effort;
+    try {
+      const result = await this._callWithReconnect(
+        "send_message_to_thread",
+        threadId,
+        args,
+      );
+      return assertToolSuccess(result);
+    } catch (error) {
+      if (error.code !== "DESKTOP_BRIDGE_TIMEOUT") throw error;
+      throw bridgeError(
+        "Codex Desktop 的发送结果未确认，请先在 Desktop 中检查，避免重复发送",
+        "DESKTOP_BRIDGE_DELIVERY_UNKNOWN",
+        error,
+      );
+    }
   }
 }

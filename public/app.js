@@ -1492,32 +1492,42 @@ function updateReasoningNode(record, message) {
   record.status = status;
 }
 
-function messagesByTurn(messages) {
+function messagesByCommand(messages) {
   const turns = [];
-  for (const message of groupActivityMessages(messages)) {
-    const turnId = message.turnId || "legacy";
+  for (const [index, message] of groupActivityMessages(messages).entries()) {
+    const sourceTurnId = message.turnId || "";
+    const startsCommand = message.role === "user";
     let turn = turns.at(-1);
-    if (!turn || turn.id !== turnId) {
-      turn = { id: turnId, messages: [] };
+    if (startsCommand || !turn) {
+      const seed = message.id || sourceTurnId || String(index);
+      turn = {
+        id: `${startsCommand ? "command" : "orphan"}:${seed}`,
+        userMessage: startsCommand ? message : null,
+        sourceTurnIds: new Set(),
+        messages: [],
+      };
       turns.push(turn);
     }
+    if (sourceTurnId) turn.sourceTurnIds.add(sourceTurnId);
     turn.messages.push(message);
   }
   return turns;
 }
 
 function historyTurnSummary(turn, index) {
-  const userMessage = turn.messages.find((message) => message.role === "user");
+  const userMessage = turn.userMessage
+    || turn.messages.find((message) => message.role === "user");
   const text = String(userMessage?.text || "").replace(/\s+/g, " ").trim();
-  if (text) return text.length > 72 ? `${text.slice(0, 72)}…` : text;
+  if (text) return text;
   if (userMessage?.images?.length) return "图片消息";
   return `历史回合 ${index + 1}`;
 }
 
-function historyTurnNode(turn, index, articles) {
+function historyTurnNode(turn, index, articles, { context = false } = {}) {
   const details = document.createElement("details");
-  details.className = "history-turn";
-  details.dataset.turnId = turn.id;
+  details.className = context ? "history-turn history-context" : "history-turn";
+  details.dataset.commandId = context ? "" : turn.id;
+  details.dataset.turnId = [...turn.sourceTurnIds][0] || "";
   const expansionKey = `${selectedThreadId}\u0000${turn.id}`;
   details.open = expandedTurns.has(expansionKey);
 
@@ -1525,10 +1535,11 @@ function historyTurnNode(turn, index, articles) {
   summary.className = "history-turn-summary";
   const title = document.createElement("span");
   title.className = "history-turn-title";
-  title.textContent = historyTurnSummary(turn, index);
+  title.textContent = context ? "早期上下文" : historyTurnSummary(turn, index);
   const meta = document.createElement("span");
   meta.className = "history-turn-meta";
-  meta.textContent = formatTime(turn.messages[0]?.timestamp) || "历史";
+  const time = formatTime(turn.userMessage?.timestamp || turn.messages[0]?.timestamp);
+  meta.textContent = [time || "历史", `${turn.messages.length} 条记录`].join(" · ");
   summary.append(title, meta);
 
   const content = document.createElement("div");
@@ -1570,7 +1581,7 @@ function reconcileMessageNodes(messages) {
   const ordered = [];
   const visibleIds = new Set();
 
-  const turns = messagesByTurn(messages);
+  const turns = messagesByCommand(messages);
   const activeTurnId = currentThread?.control?.turnId || "";
   for (const [index, turn] of turns.entries()) {
     const articles = turn.messages.map((message) => {
@@ -1578,8 +1589,11 @@ function reconcileMessageNodes(messages) {
       return messageRecord(message).article;
     });
     const latest = index === turns.length - 1;
-    if (latest || turn.id === activeTurnId) ordered.push(...articles);
-    else ordered.push(historyTurnNode(turn, index, articles));
+    const active = activeTurnId && turn.sourceTurnIds.has(activeTurnId);
+    if (latest || active) ordered.push(...articles);
+    else ordered.push(historyTurnNode(turn, index, articles, {
+      context: !turn.userMessage,
+    }));
   }
 
   for (const id of messageNodes.keys()) {
@@ -2295,6 +2309,17 @@ async function sendMessage(event) {
         turnId: result.turnId || pendingMessage.turnId,
         deliveryState,
         delivery: result.delivery || "accepted",
+      };
+    }
+    if (result.delivery === "codex-app" && desktopThreadSnapshot?.id === threadId) {
+      desktopThreadSnapshot = {
+        ...desktopThreadSnapshot,
+        control: {
+          ...(desktopThreadSnapshot.control || {}),
+          busy: true,
+          phase: "starting",
+          turnId: result.turnId || desktopThreadSnapshot.control?.turnId || null,
+        },
       };
     }
     if (currentThread) {

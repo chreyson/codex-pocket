@@ -90,6 +90,13 @@ function userContent(content = [], resolveImage) {
   return { text: lines.filter(Boolean).join("\n"), images };
 }
 
+function hookPromptText(fragments = []) {
+  return (Array.isArray(fragments) ? fragments : [])
+    .map((fragment) => typeof fragment?.text === "string" ? fragment.text.trim() : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
 function agentContent(value, resolveImage) {
   const images = [];
   const lines = String(value ?? "").split("\n");
@@ -204,6 +211,22 @@ export function sanitizeThreadDetail(thread, { resolveImage } = {}) {
     for (const [index, item] of items.entries()) {
       if (!item || typeof item !== "object") continue;
       const itemId = messageId(item.id, `${turnId}-item-${index}`);
+      if (item.type === "hookPrompt") {
+        const text = hookPromptText(item.fragments);
+        if (text) {
+          messages.push({
+            id: itemId,
+            turnId,
+            role: "user",
+            kind: "message",
+            text: clip(text),
+            images: [],
+            timestamp: startedAt,
+          });
+        }
+        continue;
+      }
+
       if (item.type === "userMessage") {
         const content = userContent(item.content, resolveImage);
         if (content.text || content.images.length) {
