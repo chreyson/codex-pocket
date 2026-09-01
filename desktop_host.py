@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import os
+import platform
+import shutil
+import subprocess
 import threading
 import time
 import webbrowser
@@ -79,13 +82,67 @@ def copy_windows_text(value: str) -> bool:
             kernel32.GlobalFree(handle)
 
 
+def copy_system_text(value: str, system_name: str | None = None) -> bool:
+    system_name = (system_name or platform.system()).lower()
+    if system_name == "windows":
+        return copy_windows_text(value)
+
+    commands = []
+    if system_name == "darwin":
+        commands.append(["pbcopy"])
+    elif system_name == "linux":
+        commands.extend(
+            [
+                ["wl-copy"],
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ]
+        )
+
+    for command in commands:
+        executable = shutil.which(command[0])
+        if not executable:
+            continue
+        try:
+            result = subprocess.run(
+                [executable, *command[1:]],
+                input=value,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def webview_start_options(system_name: str | None = None) -> dict:
+    options = {"debug": False, "private_mode": True}
+    if (system_name or platform.system()).lower() == "windows":
+        options["gui"] = "edgechromium"
+    return options
+
+
+def desktop_dependency_message(system_name: str | None = None) -> str:
+    system_name = (system_name or platform.system()).lower()
+    if system_name == "windows":
+        return "缺少 WebView2 桌面组件。请重新双击 Install-CodexPocket.cmd 完成安装。"
+    if system_name == "darwin":
+        return "缺少 macOS 桌面组件。请重新双击 Install-CodexPocket.command 完成安装。"
+    return "缺少 Linux 桌面组件。请重新运行 Install-CodexPocket.sh 完成安装。"
+
+
 class DesktopController:
     def __init__(
         self,
         manager_factory: Callable = ServiceManager,
         *,
         opener: Callable[[str], object] = webbrowser.open,
-        clipboard_writer: Callable[[str], bool] = copy_windows_text,
+        clipboard_writer: Callable[[str], bool] = copy_system_text,
     ):
         self._lock = threading.RLock()
         self._opener = opener
@@ -190,12 +247,16 @@ class DesktopController:
         return self._update(error="")
 
     def copy_text(self, value: str) -> bool:
+        if not isinstance(value, str):
+            return False
         state = self._snapshot()
         if value not in {state["publicUrl"], state["accessKey"]} or not value:
             return False
         return bool(self._clipboard_writer(value))
 
     def open_url(self, value: str) -> bool:
+        if not isinstance(value, str):
+            return False
         state = self._snapshot()
         if value != state["publicUrl"] or not value.startswith("https://"):
             return False
@@ -239,9 +300,7 @@ def main() -> int:
         try:
             import webview
         except ImportError:
-            show_dependency_error(
-                "缺少 WebView2 桌面组件。请重新运行 CodexPocket.cmd 完成首次安装。"
-            )
+            show_dependency_error(desktop_dependency_message())
             return 1
 
         enable_windows_dpi_awareness()
@@ -258,7 +317,7 @@ def main() -> int:
         )
         window.events.closed += controller.shutdown
         try:
-            webview.start(gui="edgechromium", debug=False, private_mode=True)
+            webview.start(**webview_start_options())
         finally:
             controller.shutdown()
         return 0

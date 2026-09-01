@@ -1,8 +1,15 @@
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from desktop_host import DesktopController, main
+from desktop_host import (
+    DesktopController,
+    copy_system_text,
+    desktop_dependency_message,
+    main,
+    webview_start_options,
+)
 
 
 class FakeManager:
@@ -35,6 +42,47 @@ def wait_for_state(controller, phase, timeout=1):
 
 
 class DesktopHostTests(unittest.TestCase):
+    def test_webview_backend_is_only_forced_on_windows(self):
+        self.assertEqual(webview_start_options("Windows")["gui"], "edgechromium")
+        self.assertNotIn("gui", webview_start_options("Darwin"))
+        self.assertNotIn("gui", webview_start_options("Linux"))
+
+    def test_macos_clipboard_uses_pbcopy(self):
+        with (
+            patch("desktop_host.shutil.which", return_value="/usr/bin/pbcopy"),
+            patch(
+                "desktop_host.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+        ):
+            self.assertTrue(copy_system_text("访问密钥", "Darwin"))
+
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/pbcopy"])
+        self.assertEqual(run.call_args.kwargs["input"], "访问密钥")
+
+    def test_linux_clipboard_falls_back_to_xclip(self):
+        def which(name):
+            return "/usr/bin/xclip" if name == "xclip" else None
+
+        with (
+            patch("desktop_host.shutil.which", side_effect=which),
+            patch(
+                "desktop_host.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+        ):
+            self.assertTrue(copy_system_text("key", "Linux"))
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/xclip", "-selection", "clipboard"],
+        )
+
+    def test_dependency_message_names_the_platform_installer(self):
+        self.assertIn("Install-CodexPocket.cmd", desktop_dependency_message("Windows"))
+        self.assertIn("Install-CodexPocket.command", desktop_dependency_message("Darwin"))
+        self.assertIn("Install-CodexPocket.sh", desktop_dependency_message("Linux"))
+
     def test_main_rejects_a_second_instance_before_starting_webview(self):
         with (
             patch("desktop_host.SingleInstanceLock") as lock_type,
@@ -73,9 +121,11 @@ class DesktopHostTests(unittest.TestCase):
         state = wait_for_state(controller, "running")
 
         self.assertFalse(controller.copy_text("not-the-key"))
+        self.assertFalse(controller.copy_text(["not", "text"]))
         self.assertTrue(controller.copy_text(state["accessKey"]))
         self.assertEqual(copied, ["sample-key"])
         self.assertFalse(controller.open_url("https://other.example.test"))
+        self.assertFalse(controller.open_url({"url": "https://pocket.example.test"}))
         self.assertTrue(controller.open_url(state["publicUrl"]))
         self.assertEqual(opened, ["https://pocket.example.test"])
 

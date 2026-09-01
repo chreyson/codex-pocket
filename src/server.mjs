@@ -4,15 +4,29 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServer } from "./codex-client.mjs";
 import { CodexDesktopBridge } from "./codex-desktop-bridge.mjs";
+import { boundedInteger, loopbackHost } from "./runtime-config.mjs";
 import {
   parseApprovalPayload,
+  parseGoalPayload,
   parseMessagePayload,
   sanitizeServerRequest,
 } from "./control.mjs";
-import { sanitizeThreadDetail, sanitizeThreadSummary } from "./transform.mjs";
 import {
+  normalizeComposerCatalog,
+  publicComposerCatalog,
+  publicGoal,
+  resolveComposerSelection,
+} from "./composer-options.mjs";
+import {
+  sanitizeDesktopThreadSnapshot,
+  sanitizeThreadDetail,
+  sanitizeThreadSummary,
+} from "./transform.mjs";
+import {
+  FixedWindowRateLimiter,
   SESSION_COOKIE,
   createAccessToken,
+  normalizeAccessToken,
   requestToken,
   safeTokenEqual,
 } from "./security.mjs";
@@ -20,9 +34,21 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.resolve(process.env.RELAY_DATA_DIR || path.join(ROOT, ".data"));
-const HOST = process.env.HOST || "127.0.0.1";
-const PORT = Number(process.env.PORT || 4173);
-const POLL_INTERVAL_MS = Math.max(700, Number(process.env.POLL_INTERVAL_MS || 1_200));
+const HOST = loopbackHost(process.env.HOST);
+const PORT = boundedInteger(process.env.PORT, 4_173, { min: 1, max: 65_535 });
+const POLL_INTERVAL_MS = boundedInteger(
+  process.env.POLL_INTERVAL_MS,
+  1_200,
+  { min: 700, max: 60_000 },
+);
+const DESKTOP_SYNC_INTERVAL_MS = boundedInteger(
+  process.env.DESKTOP_SYNC_INTERVAL_MS,
+  250,
+  { min: 150, max: 10_000 },
+);
+const MAX_SSE_BUFFER_BYTES = 512 * 1024;
+const DESKTOP_SEND_UNAVAILABLE = "这个任务正由 Codex Desktop 占用，Web 端无法可靠写入。请完全退出 Codex Desktop（Codex Pocket 控制器可以继续运行），然后重试";
+const DESKTOP_INTERRUPT_UNAVAILABLE = "这个任务正在 Codex Desktop 中执行，Web 端目前无法可靠中断。请回到 Codex Desktop 操作";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -34,11 +60,14 @@ const MIME_TYPES = {
 
 await fs.mkdir(DATA_DIR, { recursive: true });
 const tokenPath = path.join(DATA_DIR, "access-token");
-let accessToken = process.env.CODEX_RELAY_TOKEN || "";
+let accessToken = normalizeAccessToken(process.env.CODEX_RELAY_TOKEN);
 if (!accessToken) {
   try {
-    accessToken = (await fs.readFile(tokenPath, "utf8")).trim();
+    accessToken = normalizeAccessToken(await fs.readFile(tokenPath, "utf8"));
   } catch {
+    // Missing or unreadable development tokens are replaced below.
+  }
+  if (!accessToken) {
     accessToken = createAccessToken();
     await fs.writeFile(tokenPath, `${accessToken}\n`, { encoding: "utf8", mode: 0o600 });
   }
@@ -66,7 +95,11 @@ codex.on("control", () => schedulePoll(10));
 
 const clients = new Set();
 let pollTimer = null;
+let pollDueAt = 0;
 let polling = false;
+let desktopPollTimer = null;
+let desktopPollDueAt = 0;
+let desktopPolling = false;
 let latestThreads = [];
 let latestThreadsHash = "";
 
@@ -84,8 +117,14 @@ function commonHeaders(extra = {}) {
 }
 
 function sendJson(response, status, value, headers = {}) {
+  if (response.destroyed || response.writableEnded) return false;
+  if (response.headersSent) {
+    response.destroy();
+    return false;
+  }
   response.writeHead(status, commonHeaders({ "Content-Type": "application/json; charset=utf-8", ...headers }));
   response.end(JSON.stringify(value));
+  return true;
 }
 
 function isAuthorized(request) {
@@ -125,9 +164,25 @@ async function readJson(request, limit = 16_384) {
 }
 
 function sseSend(client, event, value) {
-  if (client.response.destroyed || client.response.writableEnded) return false;
-  client.response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
-  return true;
+  const { response } = client;
+  if (response.destroyed || response.writableEnded) {
+    clients.delete(client);
+    return false;
+  }
+  const payload = `event: ${event}\ndata: ${JSON.stringify(value)}\n\n`;
+  if ((response.writableLength || 0) + Buffer.byteLength(payload) > MAX_SSE_BUFFER_BYTES) {
+    clients.delete(client);
+    response.destroy();
+    return false;
+  }
+  try {
+    response.write(payload);
+    return true;
+  } catch {
+    clients.delete(client);
+    response.destroy();
+    return false;
+  }
 }
 
 function broadcastMessageEvent(event, value) {
@@ -142,33 +197,113 @@ codex.on("messageDone", (value) => broadcastMessageEvent("messageDone", value));
 
 async function loadThreads() {
   const result = await codex.listThreads();
-  return (result.data || []).map(sanitizeThreadSummary);
+  const data = Array.isArray(result?.data) ? result.data : [];
+  return data
+    .filter((thread) => thread && typeof thread === "object" && typeof thread.id === "string")
+    .map(sanitizeThreadSummary);
+}
+
+function isDesktopWriterConflict(error) {
+  return /already has an active writer/i.test(String(error?.message || ""));
+}
+
+function desktopMutationError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  return error;
 }
 
 async function loadThreadState(threadId) {
-  const result = await codex.readThread(threadId);
-  const thread = {
-    ...sanitizeThreadDetail(result.thread),
-    control: {
-      ...codex.threadControlState(threadId),
-      requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
-    },
-  };
-  const agentMessages = (result.thread?.turns || []).flatMap((turn) =>
-    (turn.items || [])
-      .filter((item) => item.type === "agentMessage" && item.id)
-      .map((item) => ({ id: item.id, role: "assistant", text: String(item.text ?? "") })),
-  );
-  return { thread, agentMessages };
+  try {
+    const result = await codex.readThread(threadId);
+    if (!result?.thread?.id) throw new Error("Codex App Server 返回的会话快照无效");
+    const thread = {
+      ...sanitizeThreadDetail(result.thread),
+      control: {
+        ...codex.threadControlState(threadId),
+        requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
+      },
+    };
+    const turns = Array.isArray(result.thread.turns) ? result.thread.turns : [];
+    const agentMessages = turns.flatMap((turn) =>
+      (Array.isArray(turn?.items) ? turn.items : [])
+        .filter((item) => item?.type === "agentMessage" && item.id)
+        .map((item) => ({ id: item.id, role: "assistant", text: String(item.text ?? "") })),
+    );
+    return { thread, agentMessages, catalogThread: result.thread };
+  } catch (appServerError) {
+    try {
+      const desktopValue = await desktopBridge.readThread(threadId, { turnLimit: 10 });
+      const snapshot = sanitizeDesktopThreadSnapshot(desktopValue);
+      const thread = {
+        ...snapshot,
+        control: {
+          ...snapshot.control,
+          requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
+        },
+      };
+      const agentMessages = snapshot.messages
+        .filter((message) =>
+          message.role === "assistant"
+          && ["message", "commentary"].includes(message.kind))
+        .map((message) => ({
+          id: message.id,
+          role: message.role,
+          text: message.text,
+        }));
+      return { thread, agentMessages, catalogThread: desktopValue.thread };
+    } catch {
+      throw appServerError;
+    }
+  }
 }
 
-async function loadThread(threadId) {
-  return (await loadThreadState(threadId)).thread;
+async function loadComposerCatalog(threadId, catalogThread = null) {
+  return normalizeComposerCatalog(await codex.composerCatalog(threadId, {
+    thread: catalogThread,
+  }));
+}
+
+async function loadThreadPage(threadId) {
+  const statePromise = loadThreadState(threadId);
+  const catalogResult = loadComposerCatalog(
+    threadId,
+    statePromise.then((state) => state.catalogThread),
+  ).then(
+    (catalog) => ({ catalog }),
+    (error) => ({ error }),
+  );
+  const [{ thread }, composer] = await Promise.all([statePromise, catalogResult]);
+  if (composer.catalog) {
+    const composerOptions = publicComposerCatalog(composer.catalog);
+    return { ...thread, composerOptions };
+  }
+  return {
+    ...thread,
+    composerOptions: {
+      models: [],
+      skills: [],
+      modes: ["default"],
+      defaultModel: "",
+      defaultEffort: "",
+      goal: null,
+      features: { plan: false, goal: false, skills: false },
+      error: composer.error?.message || "无法读取 Codex 设置",
+    },
+  };
 }
 
 function schedulePoll(delay = POLL_INTERVAL_MS) {
+  const dueAt = Date.now() + delay;
+  if (pollTimer && pollDueAt <= dueAt) return;
   if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(runPoll, delay);
+  pollDueAt = dueAt;
+  pollTimer = setTimeout(() => {
+    pollTimer = null;
+    pollDueAt = 0;
+    void runPoll();
+  }, Math.max(0, dueAt - Date.now()));
 }
 
 async function runPoll() {
@@ -218,6 +353,60 @@ async function runPoll() {
   }
 }
 
+function scheduleDesktopPoll(delay = DESKTOP_SYNC_INTERVAL_MS) {
+  const dueAt = Date.now() + delay;
+  if (desktopPollTimer && desktopPollDueAt <= dueAt) return;
+  if (desktopPollTimer) clearTimeout(desktopPollTimer);
+  desktopPollDueAt = dueAt;
+  desktopPollTimer = setTimeout(() => {
+    desktopPollTimer = null;
+    desktopPollDueAt = 0;
+    void runDesktopPoll();
+  }, Math.max(0, dueAt - Date.now()));
+}
+
+async function runDesktopPoll() {
+  if (desktopPolling) return scheduleDesktopPoll();
+  const watchedIds = [...new Set(
+    [...clients].map((client) => client.threadId).filter(Boolean),
+  )];
+  if (!watchedIds.length) return scheduleDesktopPoll(1_000);
+
+  desktopPolling = true;
+  let nextDelay = DESKTOP_SYNC_INTERVAL_MS;
+  try {
+    const results = await Promise.all(watchedIds.map(async (threadId) => {
+      try {
+        const value = await desktopBridge.readThread(threadId);
+        return { threadId, snapshot: sanitizeDesktopThreadSnapshot(value) };
+      } catch (error) {
+        return { threadId, error };
+      }
+    }));
+
+    for (const { threadId, snapshot, error } of results) {
+      if (error) {
+        if ([
+          "DESKTOP_BRIDGE_UNAVAILABLE",
+          "DESKTOP_BRIDGE_TOOL_UNAVAILABLE",
+        ].includes(error.code)) nextDelay = Math.max(nextDelay, 3_000);
+        else nextDelay = Math.max(nextDelay, 750);
+        continue;
+      }
+
+      const hash = JSON.stringify(snapshot);
+      for (const client of clients) {
+        if (client.threadId !== threadId || client.desktopThreadHash === hash) continue;
+        client.desktopThreadHash = hash;
+        sseSend(client, "desktopThread", snapshot);
+      }
+    }
+  } finally {
+    desktopPolling = false;
+    scheduleDesktopPoll(nextDelay);
+  }
+}
+
 async function serveStatic(response, pathname) {
   const relative = pathname === "/" ? "index.html" : pathname.slice(1);
   const resolved = path.resolve(PUBLIC_DIR, relative);
@@ -238,22 +427,11 @@ async function serveStatic(response, pathname) {
   }
 }
 
-const sessionAttempts = new Map();
-const actionAttempts = new Map();
-
-function allowAttempt(attempts, address, limit) {
-  const now = Date.now();
-  const current = attempts.get(address);
-  if (!current || now - current.startedAt > 60_000) {
-    attempts.set(address, { startedAt: now, count: 1 });
-    return true;
-  }
-  current.count += 1;
-  return current.count <= limit;
-}
+const sessionLimiter = new FixedWindowRateLimiter({ limit: 10 });
+const actionLimiter = new FixedWindowRateLimiter({ limit: 24 });
 
 function parseThreadRoute(pathname) {
-  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|approvals)(?:\/([^/]+))?)?$/);
+  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|interrupt|approvals|goal)(?:\/([^/]+))?)?$/);
   if (!match) return null;
   try {
     return {
@@ -268,23 +446,31 @@ function parseThreadRoute(pathname) {
   }
 }
 
-const server = createServer(async (request, response) => {
-  const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-  const pathname = url.pathname;
+function isThreadMutation(method, route) {
+  if (!route?.action) return false;
+  if (route.action === "goal") return ["POST", "DELETE"].includes(method);
+  return method === "POST" && ["messages", "interrupt", "approvals"].includes(route.action);
+}
 
+const server = createServer(async (request, response) => {
   try {
+    const url = new URL(request.url || "/", "http://localhost");
+    const pathname = url.pathname;
+
     if (request.method === "GET" && pathname === "/api/health") {
       return sendJson(response, 200, { ok: true, codex: codexState });
     }
 
     if (request.method === "POST" && pathname === "/api/session") {
       const address = request.socket.remoteAddress || "unknown";
-      if (!allowAttempt(sessionAttempts, address, 10)) return sendJson(response, 429, { error: "Too many attempts" });
+      if (!sessionLimiter.allow(address)) return sendJson(response, 429, { error: "Too many attempts" });
       await readBody(request);
       const token = requestToken(request);
       if (!safeTokenEqual(token, accessToken)) return sendJson(response, 401, { error: "访问密钥无效" });
-      const forwardedProto = String(request.headers["x-forwarded-proto"] || "");
-      const secure = forwardedProto.includes("https") || process.env.FORCE_SECURE_COOKIE === "1";
+      const forwardedProto = String(request.headers["x-forwarded-proto"] || "")
+        .split(",")
+        .some((value) => value.trim().toLowerCase() === "https");
+      const secure = forwardedProto || process.env.FORCE_SECURE_COOKIE === "1";
       const cookie = `${SESSION_COOKIE}=${encodeURIComponent(accessToken)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${secure ? "; Secure" : ""}`;
       return sendJson(response, 200, { ok: true }, { "Set-Cookie": cookie });
     }
@@ -304,35 +490,66 @@ const server = createServer(async (request, response) => {
     }
 
     const threadRoute = parseThreadRoute(pathname);
+    if (isThreadMutation(request.method, threadRoute)) {
+      const address = request.socket.remoteAddress || "unknown";
+      if (!actionLimiter.allow(address)) {
+        return sendJson(response, 429, { error: "操作过于频繁，请稍后再试" });
+      }
+    }
     if (request.method === "GET" && threadRoute && !threadRoute.action) {
-      return sendJson(response, 200, await loadThread(threadRoute.threadId));
+      return sendJson(response, 200, await loadThreadPage(threadRoute.threadId));
     }
 
     if (request.method === "POST" && threadRoute?.action === "messages" && !threadRoute.requestToken) {
-      const address = request.socket.remoteAddress || "unknown";
-      if (!allowAttempt(actionAttempts, address, 24)) {
-        return sendJson(response, 429, { error: "发送过于频繁，请稍后再试" });
-      }
-      const { text } = parseMessagePayload(await readJson(request));
-      const current = await loadThread(threadRoute.threadId);
+      const message = parseMessagePayload(await readJson(request));
+      const { text } = message;
+      const statePromise = loadThreadState(threadRoute.threadId);
+      const [{ thread: current }, catalog] = await Promise.all([
+        statePromise,
+        loadComposerCatalog(
+          threadRoute.threadId,
+          statePromise.then((state) => state.catalogThread),
+        ),
+      ]);
       if (current.status === "active" && !current.control.busy) {
-        return sendJson(response, 409, { error: "这个会话正在电脑端执行，请完成后再发送" });
+        throw desktopMutationError(DESKTOP_SEND_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
       }
+      const selection = resolveComposerSelection(message, catalog);
+      let goal = catalog.goal;
+      if (selection.mode === "goal" && !["active", "paused"].includes(goal?.status)) {
+        goal = publicGoal(await codex.setGoal(threadRoute.threadId, {
+          objective: text,
+          status: "active",
+        }));
+      } else if (selection.mode === "goal" && goal?.status === "paused") {
+        goal = publicGoal(await codex.setGoal(threadRoute.threadId, { status: "active" }));
+      }
+
       let result;
       let delivery;
       try {
-        result = await desktopBridge.sendMessage(threadRoute.threadId, text);
-        delivery = result.delivery;
-      } catch (error) {
-        if (error.code !== "DESKTOP_BRIDGE_UNAVAILABLE") throw error;
-        result = await codex.startTurn(threadRoute.threadId, text);
+        result = await codex.startTurn(threadRoute.threadId, text, {
+          ...selection,
+          mode: selection.mode === "goal" ? "default" : selection.mode,
+        });
         delivery = "app-server";
+      } catch (error) {
+        if (!isDesktopWriterConflict(error)) throw error;
+        throw desktopMutationError(DESKTOP_SEND_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
       }
       schedulePoll(10);
+      scheduleDesktopPoll(0);
       return sendJson(response, 202, {
         ok: true,
         delivery,
         turnId: result.turn?.id || null,
+        selection: {
+          model: selection.model,
+          effort: selection.effort,
+          mode: selection.mode,
+          skillNames: selection.skills.map((skill) => skill.name),
+        },
+        goal,
         control: {
           ...codex.threadControlState(threadRoute.threadId),
           busy: true,
@@ -341,11 +558,65 @@ const server = createServer(async (request, response) => {
       });
     }
 
-    if (request.method === "POST" && threadRoute?.action === "approvals" && threadRoute.requestToken) {
-      const address = request.socket.remoteAddress || "unknown";
-      if (!allowAttempt(actionAttempts, address, 24)) {
-        return sendJson(response, 429, { error: "操作过于频繁，请稍后再试" });
+    if (request.method === "POST" && threadRoute?.action === "interrupt" && !threadRoute.requestToken) {
+      await readJson(request, 2_048);
+      const localControl = codex.threadControlState(threadRoute.threadId);
+      let delivery;
+      let interruption;
+      let turnId = localControl.turnId;
+      if (localControl.busy) {
+        if (!turnId) {
+          const error = new Error("Codex 正在启动这个任务，请稍后再中断");
+          error.code = "TURN_STARTING";
+          throw error;
+        }
+        await codex.interruptTurn(threadRoute.threadId, turnId);
+        delivery = "app-server";
+        interruption = "hard";
+      } else {
+        const snapshot = sanitizeDesktopThreadSnapshot(
+          await desktopBridge.readThread(threadRoute.threadId),
+        );
+        if (!snapshot.control?.busy) {
+          const error = new Error("当前没有正在执行的任务");
+          error.code = "NO_ACTIVE_TURN";
+          throw error;
+        }
+        turnId = snapshot.control.turnId || null;
+        throw desktopMutationError(
+          DESKTOP_INTERRUPT_UNAVAILABLE,
+          "DESKTOP_INTERRUPT_UNAVAILABLE",
+        );
       }
+
+      schedulePoll(0);
+      scheduleDesktopPoll(0);
+      return sendJson(response, 202, {
+        ok: true,
+        delivery,
+        interruption,
+        turnId,
+        control: {
+          busy: true,
+          phase: "interrupting",
+          turnId,
+        },
+      });
+    }
+
+    if (threadRoute?.action === "goal" && !threadRoute.requestToken) {
+      if (request.method === "POST") {
+        const value = parseGoalPayload(await readJson(request));
+        const goal = await codex.setGoal(threadRoute.threadId, value);
+        return sendJson(response, 200, { ok: true, goal: publicGoal(goal) });
+      }
+      if (request.method === "DELETE") {
+        const result = await codex.clearGoal(threadRoute.threadId);
+        return sendJson(response, 200, { ok: true, cleared: Boolean(result.cleared) });
+      }
+    }
+
+    if (request.method === "POST" && threadRoute?.action === "approvals" && threadRoute.requestToken) {
       const record = codex.pendingServerRequests(threadRoute.threadId)
         .find((item) => item.token === threadRoute.requestToken);
       if (!record) return sendJson(response, 404, { error: "这个审批请求已经失效" });
@@ -371,6 +642,7 @@ const server = createServer(async (request, response) => {
         response,
         threadId: url.searchParams.get("threadId") || "",
         threadHash: "",
+        desktopThreadHash: "",
       };
       clients.add(client);
       sseSend(client, "threads", latestThreads);
@@ -379,6 +651,7 @@ const server = createServer(async (request, response) => {
         sseSend(client, liveMessage.event, liveMessage.value);
       }
       schedulePoll(10);
+      scheduleDesktopPoll(0);
       request.on("close", () => clients.delete(client));
       return;
     }
@@ -394,12 +667,28 @@ const server = createServer(async (request, response) => {
     if (error.code === "TURN_ACTIVE") {
       status = 409;
       message = "Codex 正在处理这个会话，请完成后再发送";
-    } else if (error.code === "DESKTOP_SEND_FAILED") {
+    } else if (error.code === "TURN_STARTING") {
       status = 409;
-      message = error.message || "Codex App 未接受这条消息";
+      message = error.message;
+    } else if (error.code === "NO_ACTIVE_TURN") {
+      status = 409;
+      message = "当前没有正在执行的任务";
+    } else if ([
+      "DESKTOP_WRITER_CONFLICT",
+      "DESKTOP_INTERRUPT_UNAVAILABLE",
+    ].includes(error.code)) {
+      status = 409;
+      message = error.message;
+    } else if ([
+      "DESKTOP_BRIDGE_CONNECTION",
+      "DESKTOP_BRIDGE_TIMEOUT",
+      "DESKTOP_BRIDGE_TOOL_UNAVAILABLE",
+    ].includes(error.code)) {
+      status = 503;
+      message = "Codex App 连接暂时不可用，请重试";
     } else if (/already has an active writer/i.test(message)) {
       status = 409;
-      message = "会话仍由 Codex App 持有，但 Pocket 未连接到桌面桥接。请保持 Codex App 打开并重新开启 Pocket 服务";
+      message = DESKTOP_SEND_UNAVAILABLE;
     } else if (error.code === "REQUEST_NOT_FOUND") {
       status = 404;
       message = "这个审批请求已经失效";
@@ -411,9 +700,23 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, HOST, async () => {
+server.headersTimeout = 15_000;
+server.requestTimeout = 45_000;
+server.keepAliveTimeout = 5_000;
+server.maxHeadersCount = 100;
+
+server.on("error", (error) => {
+  codexState = "error";
+  codexError = error.message;
+  console.error(`Codex Pocket server error: ${error.message}`);
+  codex.stop();
+  process.exitCode = 1;
+});
+
+server.listen(PORT, HOST, () => {
   const localUrl = `http://${HOST}:${PORT}/`;
-  await fs.writeFile(path.join(DATA_DIR, "local-url.txt"), `${localUrl}\n`, "utf8");
+  void fs.writeFile(path.join(DATA_DIR, "local-url.txt"), `${localUrl}\n`, "utf8")
+    .catch((error) => console.error(`Unable to write local URL: ${error.message}`));
   console.log(`Codex Pocket: ${localUrl}`);
   console.log("Use the access key from the desktop controller to sign in.");
   codex.start().catch((error) => {
@@ -421,11 +724,26 @@ server.listen(PORT, HOST, async () => {
     codexError = error.message;
   });
   schedulePoll(50);
+  scheduleDesktopPoll(50);
 });
 
+let shuttingDown = false;
+
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   if (pollTimer) clearTimeout(pollTimer);
+  if (desktopPollTimer) clearTimeout(desktopPollTimer);
+  for (const client of clients) {
+    try {
+      client.response.end();
+    } catch {
+      client.response.destroy();
+    }
+  }
+  clients.clear();
   codex.stop();
+  if (!server.listening) return process.exit(0);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 2_000).unref();
 }

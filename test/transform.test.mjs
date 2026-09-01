@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sanitizeThreadDetail, sanitizeThreadSummary } from "../src/transform.mjs";
+import {
+  sanitizeDesktopThreadSnapshot,
+  sanitizeThreadDetail,
+  sanitizeThreadSummary,
+} from "../src/transform.mjs";
 
 const sampleThread = {
   id: "thread-1",
@@ -80,4 +84,93 @@ test("failed commands are not labeled as running", () => {
 
   assert.match(detail.messages[0].text, /命令执行失败/);
   assert.doesNotMatch(detail.messages[0].text, /命令执行中/);
+});
+
+test("desktop snapshots expose reasoning and restore chronological turn order", () => {
+  const snapshot = sanitizeDesktopThreadSnapshot({
+    thread: {
+      id: "thread-1",
+      title: "实时任务",
+      cwd: "C:\\work\\sample-app",
+      status: { type: "active" },
+      updatedAt: 300,
+    },
+    page: { order: "newest_first" },
+    turns: [
+      {
+        id: "turn-new",
+        status: "inProgress",
+        startedAt: 200,
+        items: [{
+          id: "reasoning-live",
+          type: "reasoning",
+          summary: ["**Inspecting realtime state**"],
+        }],
+      },
+      {
+        id: "turn-old",
+        status: "completed",
+        startedAt: 100,
+        items: [{
+          id: "answer-old",
+          type: "agentMessage",
+          text: "上一轮完成",
+        }],
+      },
+    ],
+  });
+
+  assert.deepEqual(snapshot.messages.map((message) => message.id), [
+    "answer-old",
+    "reasoning-live",
+  ]);
+  assert.equal(snapshot.messages[1].kind, "reasoning");
+  assert.equal(snapshot.messages[1].text, "Inspecting realtime state");
+  assert.equal(snapshot.messages[1].activityStatus, "inProgress");
+  assert.equal(snapshot.title, "实时任务");
+  assert.equal(snapshot.control.busy, true);
+  assert.equal(snapshot.control.turnId, "turn-new");
+  assert.equal(snapshot.partial, true);
+});
+
+test("malformed turn collections degrade without breaking the conversation", () => {
+  assert.deepEqual(
+    sanitizeThreadDetail({
+      id: "thread-malformed",
+      title: "Malformed",
+      turns: [null, { id: "turn-1", items: { unexpected: true } }],
+    }).messages,
+    [],
+  );
+  assert.equal(sanitizeThreadSummary(null).title, "未命名会话");
+});
+
+test("malformed desktop records receive stable ids and safe timestamps", () => {
+  const snapshot = sanitizeDesktopThreadSnapshot({
+    thread: {
+      id: "thread-malformed",
+      title: "Malformed desktop thread",
+      status: { type: "idle" },
+      updatedAt: "not-a-timestamp",
+    },
+    turns: [
+      null,
+      {
+        startedAt: "invalid",
+        items: [
+          null,
+          { type: "userMessage", content: [{ type: "text", text: "hello" }] },
+          { type: "agentMessage", text: "world" },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(snapshot.messages.map((message) => message.id), [
+    "turn-0-item-1",
+    "turn-0-item-2",
+  ]);
+  assert.deepEqual(snapshot.messages.map((message) => message.timestamp), [null, null]);
+  assert.equal(snapshot.updatedAt, 0);
+  assert.equal(snapshot.control.busy, false);
 });

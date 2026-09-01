@@ -1,4 +1,5 @@
 import path from "node:path";
+import { commandPreview } from "./redaction.mjs";
 
 const MAX_TEXT_LENGTH = 80_000;
 
@@ -7,15 +8,28 @@ function clip(value, limit = MAX_TEXT_LENGTH) {
   return text.length > limit ? `${text.slice(0, limit)}\n\n[内容过长，已截断]` : text;
 }
 
+function messageId(value, fallback) {
+  if (typeof value === "string" && value) return value;
+  if (Number.isFinite(value)) return String(value);
+  return fallback;
+}
+
+function timestamp(value, fallback = 0) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
 function statusType(status) {
-  if (typeof status === "string") return status;
-  return status?.type || "unknown";
+  const value = typeof status === "string" ? status : status?.type;
+  return typeof value === "string" && value ? clip(value, 64) : "unknown";
 }
 
 function sourceType(source) {
   if (typeof source === "string") return source;
   if (!source || typeof source !== "object") return "unknown";
-  return source.type || Object.keys(source)[0] || "unknown";
+  const value = source.type || Object.keys(source)[0];
+  return typeof value === "string" && value ? clip(value, 64) : "unknown";
 }
 
 function projectName(cwd) {
@@ -25,20 +39,21 @@ function projectName(cwd) {
 }
 
 export function sanitizeThreadSummary(thread) {
+  const source = thread && typeof thread === "object" ? thread : {};
   return {
-    id: thread.id,
-    title: clip(thread.name || thread.preview || "未命名会话", 160),
-    preview: clip(thread.preview || "", 240),
-    project: projectName(thread.cwd),
-    status: statusType(thread.status),
-    source: sourceType(thread.source),
-    updatedAt: thread.updatedAt || thread.recencyAt || thread.createdAt || 0,
-    createdAt: thread.createdAt || 0,
+    id: source.id,
+    title: clip(source.name || source.title || source.preview || "未命名会话", 160),
+    preview: clip(source.preview || "", 240),
+    project: projectName(source.cwd),
+    status: statusType(source.status),
+    source: sourceType(source.source),
+    updatedAt: timestamp(source.updatedAt || source.recencyAt || source.createdAt),
+    createdAt: timestamp(source.createdAt),
   };
 }
 
 function userText(content = []) {
-  return content
+  return (Array.isArray(content) ? content : [])
     .map((item) => {
       if (item?.type === "text") return item.text;
       if (item?.type === "image" || item?.type === "localImage") return "[图片]";
@@ -51,23 +66,8 @@ function userText(content = []) {
     .join("\n");
 }
 
-function commandSummary(value) {
-  const raw = Array.isArray(value) ? value.join(" ") : value;
-  if (typeof raw !== "string" || !raw.trim()) return "";
-  const redacted = raw
-    .replace(/\s+/g, " ")
-    .replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^'"\s]+/gi, "$1[已隐藏]")
-    .replace(/((?:--?(?:api[-_]?key|token|secret|password|passwd|pwd|authorization|auth|cookie))\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s]+)/gi, "$1[已隐藏]")
-    .replace(/((?:--?(?:api[-_]?key|token|secret|password|passwd|pwd|authorization|auth|cookie))\s+)(?:"[^"]*"|'[^']*'|[^\s]+)/gi, "$1[已隐藏]")
-    .replace(/(\b(?:api[-_]?key|token|secret|password|passwd|pwd|authorization|auth|cookie)\s*=\s*)(?:"[^"]*"|'[^'"\s;&|]+)/gi, "$1[已隐藏]")
-    .replace(/([?&](?:api[-_]?key|token|secret|password|passwd|pwd|auth|cookie)=)[^&\s]+/gi, "$1[已隐藏]")
-    .replace(/(https?:\/\/)[^/@\s]+:[^/@\s]+@/gi, "$1[已隐藏]@")
-    .trim();
-  return redacted.length > 260 ? `${redacted.slice(0, 259)}…` : redacted;
-}
-
 function commandText(item) {
-  const summary = commandSummary(item.command);
+  const summary = commandPreview(item.command);
   if (item.status === "completed") {
     if (Number.isInteger(item.exitCode) && item.exitCode !== 0) {
       return summary ? `运行失败（退出码 ${item.exitCode}）：${summary}` : `命令失败（退出码 ${item.exitCode}）`;
@@ -105,6 +105,7 @@ function fileChangeText(item) {
 }
 
 function activityMessage(item) {
+  if (!item || typeof item !== "object") return null;
   switch (item.type) {
     case "commandExecution":
       return { type: "command", label: "终端", status: item.status, text: commandText(item) };
@@ -125,64 +126,128 @@ function activityMessage(item) {
   }
 }
 
+function reasoningText(item) {
+  const summaries = Array.isArray(item.summary) ? item.summary : [];
+  return summaries
+    .map((summary) => typeof summary === "string" ? summary : summary?.text)
+    .filter(Boolean)
+    .map((summary) => String(summary).replace(/^\*\*([\s\S]*)\*\*$/, "$1"))
+    .join("\n");
+}
+
+function inferredItemStatus(turn, item, index, itemCount) {
+  if (item.status) return item.status;
+  const turnRunning = ["inProgress", "running"].includes(turn.status);
+  return turnRunning && index === itemCount - 1 ? "inProgress" : "completed";
+}
+
 export function sanitizeThreadDetail(thread) {
+  const source = thread && typeof thread === "object" ? thread : {};
   const messages = [];
-  for (const turn of thread.turns || []) {
-    const timestamp = turn.startedAt || null;
-    for (const item of turn.items || []) {
+  const turns = Array.isArray(source.turns) ? source.turns : [];
+  for (const [turnIndex, turn] of turns.entries()) {
+    if (!turn || typeof turn !== "object") continue;
+    const turnId = messageId(turn.id, `turn-${turnIndex}`);
+    const startedAt = timestamp(turn.startedAt, null);
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (const [index, item] of items.entries()) {
+      if (!item || typeof item !== "object") continue;
+      const itemId = messageId(item.id, `${turnId}-item-${index}`);
       if (item.type === "userMessage") {
         const text = userText(item.content);
-        if (text) messages.push({ id: item.id, role: "user", kind: "message", text: clip(text), timestamp });
+        if (text) messages.push({ id: itemId, role: "user", kind: "message", text: clip(text), timestamp: startedAt });
+        continue;
+      }
+
+      if (item.type === "reasoning") {
+        const status = inferredItemStatus(turn, item, index, items.length);
+        const text = reasoningText(item);
+        if (text || ["inProgress", "running"].includes(status)) {
+          messages.push({
+            id: itemId,
+            role: "assistant",
+            kind: "reasoning",
+            text: clip(text),
+            activityStatus: status,
+            timestamp: startedAt,
+          });
+        }
         continue;
       }
 
       if (item.type === "agentMessage") {
         if (item.text) {
           messages.push({
-            id: item.id,
+            id: itemId,
             role: "assistant",
             kind: item.phase === "commentary" ? "commentary" : "message",
             text: clip(item.text),
-            timestamp,
+            timestamp: startedAt,
           });
         }
         continue;
       }
 
       if (item.type === "plan" && item.text) {
-        messages.push({ id: item.id, role: "assistant", kind: "plan", text: clip(item.text), timestamp });
+        messages.push({ id: itemId, role: "assistant", kind: "plan", text: clip(item.text), timestamp: startedAt });
         continue;
       }
 
       const activity = activityMessage(item);
       if (activity) {
         messages.push({
-          id: item.id,
+          id: itemId,
           role: "system",
           kind: "activity",
           label: activity.label,
           activityType: activity.type,
           activityStatus: activity.status,
           text: clip(activity.text, 4_000),
-          timestamp,
+          timestamp: startedAt,
         });
       }
     }
 
     if (turn.status === "failed" && turn.error?.message) {
       messages.push({
-        id: `${turn.id}-error`,
+        id: `${turnId}-error`,
         role: "system",
         kind: "error",
         label: "错误",
         text: clip(turn.error.message, 4_000),
-        timestamp,
+        timestamp: startedAt,
       });
     }
   }
 
   return {
-    ...sanitizeThreadSummary(thread),
+    ...sanitizeThreadSummary(source),
     messages,
+  };
+}
+
+export function sanitizeDesktopThreadSnapshot(value) {
+  const sourceThread = value?.thread;
+  if (typeof sourceThread?.id !== "string" || !sourceThread.id) {
+    throw new Error("Codex App 返回的会话快照无效");
+  }
+
+  const turns = Array.isArray(value.turns)
+    ? value.turns.filter((turn) => turn && typeof turn === "object")
+    : [];
+  if (value.page?.order === "newest_first") turns.reverse();
+  const activeTurn = [...turns].reverse().find(
+    (turn) => ["inProgress", "running"].includes(turn?.status),
+  );
+  const busy = statusType(sourceThread.status) === "active" || Boolean(activeTurn);
+
+  return {
+    ...sanitizeThreadDetail({ ...sourceThread, turns }),
+    partial: true,
+    control: {
+      busy,
+      phase: busy ? "running" : "idle",
+      turnId: activeTurn?.id || null,
+    },
   };
 }

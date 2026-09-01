@@ -48,7 +48,10 @@ export function encodeNativeFrame(message) {
   return frame;
 }
 
-export function requestNativePipe(pipePath, method, params, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export function requestNativePipe(pipePath, method, params, {
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  createConnection = net.createConnection,
+} = {}) {
   return new Promise((resolve, reject) => {
     const id = 1;
     let socket;
@@ -75,7 +78,7 @@ export function requestNativePipe(pipePath, method, params, { timeoutMs = DEFAUL
     }, timeoutMs);
 
     try {
-      socket = net.createConnection(pipePath);
+      socket = createConnection(pipePath);
     } catch (error) {
       failConnection(error);
       return;
@@ -111,6 +114,10 @@ export function requestNativePipe(pipePath, method, params, { timeoutMs = DEFAUL
           finish(reject, bridgeError("Codex App 返回了无效数据", "DESKTOP_BRIDGE_PROTOCOL", error));
           return;
         }
+        if (!response || typeof response !== "object" || Array.isArray(response)) {
+          finish(reject, bridgeError("Codex App 返回了无效响应", "DESKTOP_BRIDGE_PROTOCOL"));
+          return;
+        }
         if (String(response.id) !== String(id)) continue;
         if (response.error) {
           const error = bridgeError(
@@ -133,9 +140,28 @@ function resultErrorMessage(result) {
   if (!text) return "Codex App 未接受这条消息";
   try {
     const value = JSON.parse(text);
-    return value.error || value.message || text;
+    return String(value?.error || value?.message || text);
   } catch {
     return text;
+  }
+}
+
+function parseToolJson(result, toolName) {
+  if (!result?.success) {
+    throw bridgeError(resultErrorMessage(result), "DESKTOP_BRIDGE_TOOL_ERROR");
+  }
+
+  const text = result.contentItems
+    ?.find((item) => item?.type === "inputText" && typeof item.text === "string")
+    ?.text;
+  if (!text) {
+    throw bridgeError(`Codex App 的 ${toolName} 没有返回数据`, "DESKTOP_BRIDGE_PROTOCOL");
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw bridgeError(`Codex App 的 ${toolName} 返回了无效数据`, "DESKTOP_BRIDGE_PROTOCOL", error);
   }
 }
 
@@ -152,76 +178,114 @@ export class CodexDesktopBridge {
     this.discoveryPromise = null;
   }
 
-  async _discoverEndpoint() {
-    if (this.endpoint) return this.endpoint;
-    if (this.discoveryPromise) return this.discoveryPromise;
+  async _discoverEndpoint(requiredTool) {
+    if (this.endpoint?.tools.has(requiredTool)) return this.endpoint;
+    this.endpoint = null;
 
-    this.discoveryPromise = (async () => {
-      const paths = await this.discover();
-      if (paths.length === 0) {
-        throw bridgeError("未检测到正在运行的 Codex App", "DESKTOP_BRIDGE_UNAVAILABLE");
-      }
-
-      const attempts = await Promise.all(paths.map(async (pipePath) => {
-        try {
-          const result = await this.request(
-            pipePath,
-            "tools/list",
-            { threadStartKind: "all" },
-            { timeoutMs: Math.min(this.timeoutMs, 1_500) },
-          );
-          const tool = result?.tools?.find((item) => item.name === "send_message_to_thread");
-          return tool ? { pipePath, namespace: tool.namespace || "codex_app" } : null;
-        } catch {
-          return null;
+    if (!this.discoveryPromise) {
+      this.discoveryPromise = (async () => {
+        const paths = await this.discover();
+        if (paths.length === 0) {
+          throw bridgeError("未检测到正在运行的 Codex App", "DESKTOP_BRIDGE_UNAVAILABLE");
         }
-      }));
 
-      const endpoint = attempts.find(Boolean);
-      if (!endpoint) {
-        throw bridgeError("无法连接正在运行的 Codex App", "DESKTOP_BRIDGE_UNAVAILABLE");
-      }
-      this.endpoint = endpoint;
-      return endpoint;
-    })();
+        const attempts = await Promise.all(paths.map(async (pipePath) => {
+          try {
+            const result = await this.request(
+              pipePath,
+              "tools/list",
+              { threadStartKind: "all" },
+              { timeoutMs: Math.min(this.timeoutMs, 1_500) },
+            );
+            const tools = new Map(
+              (result?.tools || []).map((item) => [
+                item.name,
+                item.namespace || "codex_app",
+              ]),
+            );
+            return { pipePath, tools };
+          } catch {
+            return null;
+          }
+        }));
 
-    try {
-      return await this.discoveryPromise;
-    } finally {
-      this.discoveryPromise = null;
+        const available = attempts.filter(Boolean);
+        if (!available.length) {
+          throw bridgeError("无法连接正在运行的 Codex App", "DESKTOP_BRIDGE_UNAVAILABLE");
+        }
+        return available;
+      })();
     }
+
+    const discovery = this.discoveryPromise;
+    let available;
+    try {
+      available = await discovery;
+    } finally {
+      if (this.discoveryPromise === discovery) this.discoveryPromise = null;
+    }
+
+    const endpoint = available.find((candidate) => candidate.tools.has(requiredTool));
+    if (!endpoint) {
+      throw bridgeError(
+        `当前 Codex App 不支持 ${requiredTool}`,
+        "DESKTOP_BRIDGE_TOOL_UNAVAILABLE",
+      );
+    }
+    this.endpoint = endpoint;
+    return endpoint;
   }
 
-  async _callSendTool(threadId, prompt) {
-    const endpoint = await this._discoverEndpoint();
+  async _callTool(tool, threadId, args) {
+    const endpoint = await this._discoverEndpoint(tool);
+    const namespace = endpoint.tools.get(tool);
+    if (!namespace) {
+      throw bridgeError(
+        `当前 Codex App 不支持 ${tool}`,
+        "DESKTOP_BRIDGE_TOOL_UNAVAILABLE",
+      );
+    }
     return this.request(
       endpoint.pipePath,
       "tools/call",
       {
-        arguments: { threadId, prompt },
+        arguments: args,
         callId: `codex-pocket-${randomUUID()}`,
-        namespace: endpoint.namespace,
+        namespace,
         threadId,
-        tool: "send_message_to_thread",
+        tool,
         turnId: `codex-pocket-${randomUUID()}`,
       },
       { timeoutMs: this.timeoutMs },
     );
   }
 
-  async sendMessage(threadId, prompt) {
-    let result;
+  async _callWithReconnect(tool, threadId, args, { retry = false } = {}) {
     try {
-      result = await this._callSendTool(threadId, prompt);
+      return await this._callTool(tool, threadId, args);
     } catch (error) {
-      if (!["DESKTOP_BRIDGE_CONNECTION", "DESKTOP_BRIDGE_TIMEOUT"].includes(error.code)) throw error;
+      if (![
+        "DESKTOP_BRIDGE_CONNECTION",
+        "DESKTOP_BRIDGE_TIMEOUT",
+      ].includes(error.code)) throw error;
       this.endpoint = null;
-      result = await this._callSendTool(threadId, prompt);
+      if (!retry) throw error;
+      return this._callTool(tool, threadId, args);
     }
+  }
 
-    if (!result?.success) {
-      throw bridgeError(resultErrorMessage(result), "DESKTOP_SEND_FAILED");
-    }
-    return { delivery: "codex-app", contentItems: result.contentItems || [] };
+  async readThread(threadId, { turnLimit = 2 } = {}) {
+    const result = await this._callWithReconnect(
+      "read_thread",
+      threadId,
+      {
+        threadId,
+        turnLimit,
+        includeOutputs: false,
+        maxOutputCharsPerItem: 20_000,
+      },
+      { retry: true },
+    );
+    return parseToolJson(result, "read_thread");
   }
 }

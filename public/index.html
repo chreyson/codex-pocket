@@ -84,13 +84,52 @@
         <div id="approval-tray" class="approval-tray" aria-live="assertive" hidden></div>
 
         <form id="composer" class="composer-shell" hidden>
+          <div id="composer-menu" class="composer-menu" role="dialog" hidden></div>
           <div class="composer-box">
+            <div class="composer-context-row">
+              <div id="mode-control" class="mode-control" role="radiogroup" aria-label="工作模式">
+                <button class="mode-option" type="button" role="radio" data-mode="default" aria-checked="true">执行</button>
+                <button class="mode-option" type="button" role="radio" data-mode="plan" aria-checked="false">计划</button>
+                <button class="mode-option" type="button" role="radio" data-mode="goal" aria-checked="false">目标</button>
+              </div>
+              <button id="skill-control" class="composer-control skill-control" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span class="skill-symbol" aria-hidden="true">$</span>
+                <span id="skill-label">Skills</span>
+                <span id="skill-count" class="control-count" hidden></span>
+              </button>
+            </div>
+
+            <div id="goal-banner" class="goal-banner" hidden>
+              <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="3"></circle></svg>
+              <span class="goal-copy"><span>目标</span><strong id="goal-objective"></strong></span>
+              <button id="goal-complete" class="goal-action" type="button" aria-label="完成目标" title="完成目标">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"></path></svg>
+              </button>
+              <button id="goal-clear" class="goal-action" type="button" aria-label="清除目标" title="清除目标">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"></path></svg>
+              </button>
+            </div>
+
+            <div id="selected-skills" class="selected-skills" aria-label="已选 Skills" hidden></div>
             <label class="sr-only" for="message-input">发送消息给 Codex</label>
             <textarea id="message-input" rows="1" maxlength="12000" placeholder="给 Codex 发送消息" autocomplete="off"></textarea>
             <div class="composer-footer">
-              <span id="composer-status" class="composer-status" role="status"></span>
-              <button id="send-button" class="send-button" type="submit" aria-label="发送消息" title="发送消息" disabled>
-                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 19V5"></path><path d="m5 12 7-7 7 7"></path></svg>
+              <div class="composer-footer-main">
+                <div class="composer-settings">
+                  <button id="model-control" class="composer-control" type="button" aria-haspopup="dialog" aria-expanded="false">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 4.5 7.5v9L12 21l7.5-4.5v-9Z"></path><path d="m4.5 7.5 7.5 4.5 7.5-4.5M12 12v9"></path></svg>
+                    <span id="model-label">模型</span>
+                  </button>
+                  <button id="effort-control" class="composer-control" type="button" aria-haspopup="dialog" aria-expanded="false">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 15h3V9H5zM10.5 18h3V6h-3zM16 20h3V4h-3z"></path></svg>
+                    <span id="effort-label">强度</span>
+                  </button>
+                </div>
+                <span id="composer-status" class="composer-status" role="status"></span>
+              </div>
+              <button id="send-button" class="send-button" type="submit" data-action="send" aria-label="发送消息" title="发送消息" disabled>
+                <svg class="send-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 19V5"></path><path d="m5 12 7-7 7 7"></path></svg>
+                <svg class="stop-icon" aria-hidden="true" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
               </button>
             </div>
           </div>

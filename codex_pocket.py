@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
@@ -15,8 +16,14 @@ import time
 import urllib.request
 import webbrowser
 from pathlib import Path
-import tkinter as tk
-from tkinter import font as tkfont, messagebox
+
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont, messagebox
+except ImportError:
+    tk = None
+    tkfont = None
+    messagebox = None
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -24,10 +31,15 @@ DATA_DIR = APP_DIR / ".data"
 TOOLS_DIR = APP_DIR / ".tools"
 LOG_PATH = DATA_DIR / "desktop.log"
 INSTANCE_LOCK_PATH = DATA_DIR / "desktop.lock"
+RUNTIME_CONFIG_PATH = DATA_DIR / "runtime.json"
 TUNNEL_URL_PATTERN = re.compile(
     r"https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com",
     re.IGNORECASE,
 )
+CLOUDFLARED_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+CLOUDFLARED_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024
+CLOUDFLARED_DOWNLOAD_READ_TIMEOUT = 30
+CLOUDFLARED_DOWNLOAD_TOTAL_TIMEOUT = 10 * 60
 
 
 def enable_windows_dpi_awareness(system_name: str | None = None) -> bool:
@@ -176,14 +188,33 @@ def hidden_process_options() -> dict:
     return {"start_new_session": True}
 
 
+def cloudflared_is_usable(path: str | Path) -> bool:
+    try:
+        subprocess.run(
+            [str(path), "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+            **hidden_process_options(),
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def ensure_cloudflared(status_callback) -> str:
     installed = shutil.which("cloudflared")
-    if installed:
+    if installed and cloudflared_is_usable(installed):
         return installed
 
     target = local_cloudflared_path()
-    if target.is_file():
+    target_is_file = _is_accessible_file(target)
+    if target_is_file and cloudflared_is_usable(target):
         return str(target)
+    if target_is_file:
+        status_callback("本地公网组件不可用，正在重新准备")
+        target.unlink()
 
     status_callback("首次启动，正在准备公网组件")
     url, is_archive = cloudflared_download_spec()
@@ -191,9 +222,47 @@ def ensure_cloudflared(status_callback) -> str:
     download = target.with_suffix(target.suffix + ".download")
 
     request = urllib.request.Request(url, headers={"User-Agent": "Codex-Pocket/0.2"})
+    started_at = time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=90) as response, download.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        with urllib.request.urlopen(
+            request,
+            timeout=CLOUDFLARED_DOWNLOAD_READ_TIMEOUT,
+        ) as response, download.open("wb") as output:
+            content_length = response.headers.get("Content-Length")
+            try:
+                total_bytes = int(content_length) if content_length else None
+            except (TypeError, ValueError):
+                total_bytes = None
+            if total_bytes is not None and total_bytes > CLOUDFLARED_DOWNLOAD_MAX_BYTES:
+                raise RuntimeError("公网组件下载内容过大")
+
+            downloaded_bytes = 0
+            while True:
+                if time.monotonic() - started_at >= CLOUDFLARED_DOWNLOAD_TOTAL_TIMEOUT:
+                    raise TimeoutError("下载公网组件超过 10 分钟")
+
+                chunk = response.read(CLOUDFLARED_DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                downloaded_bytes += len(chunk)
+                if downloaded_bytes > CLOUDFLARED_DOWNLOAD_MAX_BYTES:
+                    raise RuntimeError("公网组件下载内容过大")
+                output.write(chunk)
+                downloaded_mb = downloaded_bytes / (1024 * 1024)
+                if total_bytes:
+                    total_mb = total_bytes / (1024 * 1024)
+                    percent = min(100, downloaded_bytes * 100 / total_bytes)
+                    status_callback(
+                        f"正在下载公网组件：{downloaded_mb:.1f}/{total_mb:.1f} MB ({percent:.0f}%)"
+                    )
+                else:
+                    status_callback(f"正在下载公网组件：{downloaded_mb:.1f} MB")
+
+                if time.monotonic() - started_at >= CLOUDFLARED_DOWNLOAD_TOTAL_TIMEOUT:
+                    raise TimeoutError("下载公网组件超过 10 分钟")
+
+        status_callback("公网组件下载完成，正在校验")
 
         if is_archive:
             with tarfile.open(download, "r:gz") as archive:
@@ -217,14 +286,8 @@ def ensure_cloudflared(status_callback) -> str:
 
         if os.name != "nt":
             target.chmod(0o755)
-        subprocess.run(
-            [str(target), "--version"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            **hidden_process_options(),
-        )
+        if not cloudflared_is_usable(target):
+            raise RuntimeError("下载的公网组件无法运行")
         return str(target)
     except Exception as error:
         target.unlink(missing_ok=True)
@@ -233,10 +296,30 @@ def ensure_cloudflared(status_callback) -> str:
         download.unlink(missing_ok=True)
 
 
-def find_node() -> str:
-    configured = os.environ.get("NODE_BIN")
-    if configured and Path(configured).is_file():
+def _is_accessible_file(value: str | Path | None) -> bool:
+    if not value:
+        return False
+    try:
+        return Path(value).is_file()
+    except OSError:
+        return False
+
+
+def runtime_configured_path(component: str) -> str | None:
+    try:
+        payload = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+        configured = payload.get(component, {}).get("Path")
+    except (OSError, TypeError, ValueError, AttributeError):
+        return None
+    if isinstance(configured, str) and _is_accessible_file(configured):
         return configured
+    return None
+
+
+def find_node() -> str:
+    for configured in (os.environ.get("NODE_BIN"), runtime_configured_path("Node")):
+        if _is_accessible_file(configured):
+            return configured
     found = shutil.which("node")
     if found:
         return found
@@ -244,8 +327,14 @@ def find_node() -> str:
 
 
 def find_codex() -> str:
-    configured = os.environ.get("CODEX_BIN")
-    if configured and Path(configured).is_file():
+    for configured in (os.environ.get("CODEX_BIN"), runtime_configured_path("Codex")):
+        if not _is_accessible_file(configured):
+            continue
+        configured_path = Path(configured)
+        if configured_path.suffix.lower() == ".ps1":
+            command_wrapper = configured_path.with_suffix(".cmd")
+            if _is_accessible_file(command_wrapper):
+                return str(command_wrapper)
         return configured
     found = shutil.which("codex")
     if found:
@@ -275,24 +364,46 @@ def terminate_process_tree(process: subprocess.Popen | None) -> None:
         return
 
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+
+        if result is not None and result.returncode == 0:
+            try:
+                process.wait(timeout=5)
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         return
 
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         process.wait(timeout=5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+        return
+    except ProcessLookupError:
+        return
+    except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            return
+    try:
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 class SingleInstanceLock:
@@ -367,6 +478,7 @@ class ServiceManager:
         self._connected_event = threading.Event()
         self._lock = threading.RLock()
         self._last_tunnel_lines: list[str] = []
+        self._log_lock = threading.Lock()
         self._run: ServiceManager._Run | None = None
         self._starting_run: ServiceManager._Run | None = None
         self._cleaning_run: ServiceManager._Run | None = None
@@ -382,17 +494,17 @@ class ServiceManager:
         )
 
     def _log(self, source: str, message: str) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with LOG_PATH.open("a", encoding="utf-8") as log:
-            log.write(f"[{timestamp}] [{source}] {message.rstrip()}\n")
+        with self._log_lock:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with LOG_PATH.open("a", encoding="utf-8") as log:
+                log.write(f"[{timestamp}] [{source}] {message.rstrip()}\n")
 
     def _read_stream(self, source: str, stream, run: _Run) -> None:
         try:
             for line in iter(stream.readline, ""):
                 if not line:
                     break
-                self._log(source, line)
                 if source == "tunnel":
                     with self._lock:
                         if self._run is not run:
@@ -405,6 +517,11 @@ class ServiceManager:
                             self._url_event.set()
                         if "registered tunnel connection" in line.lower():
                             self._connected_event.set()
+                try:
+                    self._log(source, line)
+                except OSError:
+                    # Logging must not prevent URL detection or stream draining.
+                    pass
         finally:
             stream.close()
 
@@ -791,7 +908,10 @@ def draw_rounded_rectangle(
     )
 
 
-class IconButton(tk.Canvas):
+TkCanvasBase = tk.Canvas if tk is not None else object
+
+
+class IconButton(TkCanvasBase):
     def __init__(
         self,
         parent,
@@ -945,7 +1065,7 @@ class IconButton(tk.Canvas):
             )
 
 
-class RoundedTextButton(tk.Canvas):
+class RoundedTextButton(TkCanvasBase):
     def __init__(
         self,
         parent,
@@ -1680,43 +1800,93 @@ class PocketWindow:
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
 
-def main() -> None:
+def run_headless(
+    manager_factory=ServiceManager,
+    *,
+    install_signal_handlers: bool = True,
+) -> int:
+    stopped = threading.Event()
+    failures: list[str] = []
+
+    def on_failure(message: str) -> None:
+        failures.append(message)
+        print(f"ERROR {message}", flush=True)
+        stopped.set()
+
+    manager = manager_factory(
+        on_status=lambda value: print(f"STATUS {value}", flush=True),
+        on_ready=lambda url, key: print(f"READY {url} {key}", flush=True),
+        on_failure=on_failure,
+    )
+    previous_handlers = {}
+
+    def request_stop(_signum, _frame) -> None:
+        manager.request_shutdown()
+        stopped.set()
+
+    if install_signal_handlers:
+        for signal_name in ("SIGINT", "SIGTERM"):
+            signal_value = getattr(signal, signal_name, None)
+            if signal_value is None:
+                continue
+            try:
+                previous_handlers[signal_value] = signal.signal(signal_value, request_stop)
+            except (OSError, ValueError):
+                pass
+
+    try:
+        try:
+            manager.start()
+        except Exception as error:
+            print(f"ERROR {error}", flush=True)
+            return 1
+        stopped.wait()
+        return 1 if failures else 0
+    finally:
+        manager.request_shutdown()
+        manager.stop()
+        for signal_value, handler in previous_handlers.items():
+            try:
+                signal.signal(signal_value, handler)
+            except (OSError, ValueError):
+                pass
+
+
+def main() -> int:
     instance_lock = SingleInstanceLock(INSTANCE_LOCK_PATH)
     if not instance_lock.acquire():
         if "--headless" in sys.argv:
             print("ERROR Codex Pocket 已经在运行", flush=True)
+        elif tk is None:
+            print("Codex Pocket 已经在运行。", file=sys.stderr, flush=True)
         else:
             enable_windows_dpi_awareness()
             notice = tk.Tk()
             notice.withdraw()
             messagebox.showinfo("Codex Pocket", "Codex Pocket 已经在运行。")
             notice.destroy()
-        return
+        return 0
 
     try:
         if "--headless" in sys.argv:
-            manager = ServiceManager(
-                on_status=lambda value: print(f"STATUS {value}", flush=True),
-                on_ready=lambda url, key: print(f"READY {url} {key}", flush=True),
-                on_failure=lambda message: print(f"ERROR {message}", flush=True),
+            return run_headless()
+
+        if tk is None:
+            print(
+                "ERROR 当前 Python 没有 Tk 图形支持，请运行系统对应的 Codex Pocket 安装器。",
+                file=sys.stderr,
+                flush=True,
             )
-            try:
-                manager.start()
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                manager.stop()
-            return
+            return 1
 
         enable_windows_dpi_awareness()
         root = tk.Tk()
         PocketWindow(root)
         root.mainloop()
+        return 0
     finally:
         instance_lock.release()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

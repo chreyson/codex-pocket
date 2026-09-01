@@ -16,6 +16,8 @@ const copyToastText = document.querySelector("#copy-toast-text");
 
 let bridge = null;
 let refreshTimer = null;
+let refreshInFlight = false;
+let serviceActionInFlight = false;
 let copyToastTimer = null;
 const copyButtonTimers = new WeakMap();
 let currentState = {
@@ -63,7 +65,8 @@ function render(state) {
 }
 
 async function refresh() {
-  if (!bridge) return;
+  if (!bridge || refreshInFlight || serviceActionInFlight) return;
+  refreshInFlight = true;
   try {
     render(await bridge.get_state());
   } catch {
@@ -73,6 +76,8 @@ async function refresh() {
       busy: false,
       error: "无法连接桌面控制服务，请重新打开 Codex Pocket。",
     });
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -86,12 +91,24 @@ async function connectBridge() {
 }
 
 serviceButton.addEventListener("click", async () => {
-  if (!bridge) return;
+  if (!bridge || serviceActionInFlight) return;
+  serviceActionInFlight = true;
   serviceButton.disabled = true;
-  if (currentState.phase === "running" || currentState.phase === "starting") {
-    render(await bridge.stop_service());
-  } else {
-    render(await bridge.start_service());
+  try {
+    if (currentState.phase === "running" || currentState.phase === "starting") {
+      render(await bridge.stop_service());
+    } else {
+      render(await bridge.start_service());
+    }
+  } catch {
+    render({
+      phase: "error",
+      status: "桌面服务调用失败",
+      busy: false,
+      error: "无法控制本地服务，请重新打开 Codex Pocket。",
+    });
+  } finally {
+    serviceActionInFlight = false;
   }
 });
 

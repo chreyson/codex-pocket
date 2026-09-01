@@ -28,7 +28,21 @@ const ELEMENT_IDS = [
   "message-list",
   "approval-tray",
   "composer",
+  "composer-menu",
+  "mode-control",
+  "skill-control",
+  "skill-label",
+  "skill-count",
+  "selected-skills",
+  "goal-banner",
+  "goal-objective",
+  "goal-complete",
+  "goal-clear",
   "message-input",
+  "model-control",
+  "model-label",
+  "effort-control",
+  "effort-label",
   "composer-status",
   "send-button",
   "back-button",
@@ -182,6 +196,43 @@ function threadDetail(id, text) {
   };
 }
 
+function composerOptions({ goal = null } = {}) {
+  return {
+    models: [
+      {
+        id: "gpt-sol",
+        name: "GPT Sol",
+        description: "Deep coding work",
+        specialty: "Quality",
+        isDefault: true,
+        defaultEffort: "low",
+        efforts: [
+          { id: "low", description: "Fast" },
+          { id: "high", description: "Deep" },
+        ],
+      },
+      {
+        id: "gpt-terra",
+        name: "GPT Terra",
+        description: "Balanced work",
+        specialty: "Balanced",
+        isDefault: false,
+        defaultEffort: "medium",
+        efforts: [{ id: "medium", description: "Balanced" }],
+      },
+    ],
+    skills: [
+      { name: "docs", description: "Read docs", scope: "system", enabled: true },
+      { name: "disabled", description: "Unavailable", scope: "system", enabled: false },
+    ],
+    modes: ["default", "plan"],
+    defaultModel: "gpt-sol",
+    defaultEffort: "low",
+    goal,
+    features: { plan: true, goal: true, skills: true },
+  };
+}
+
 async function eventually(predicate) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (predicate()) return;
@@ -190,7 +241,7 @@ async function eventually(predicate) {
   throw new Error("Timed out waiting for app state");
 }
 
-async function createHarness(fetchImpl) {
+async function createHarness(fetchImpl, { storedSelection } = {}) {
   FakeEventSource.instances = [];
   const animationFrames = new Map();
   let nextAnimationFrameId = 1;
@@ -215,6 +266,16 @@ async function createHarness(fetchImpl) {
   elements["message-list"].hidden = true;
   elements["approval-tray"].hidden = true;
   elements.composer.hidden = true;
+  elements["composer-menu"].hidden = true;
+  elements["selected-skills"].hidden = true;
+  elements["goal-banner"].hidden = true;
+  elements["skill-count"].hidden = true;
+  for (const mode of ["default", "plan", "goal"]) {
+    const button = new FakeElement("button");
+    button.dataset.mode = mode;
+    button.setAttribute("aria-checked", String(mode === "default"));
+    elements["mode-control"].append(button);
+  }
 
   const document = {
     querySelector(selector) {
@@ -228,6 +289,7 @@ async function createHarness(fetchImpl) {
     },
   };
   const context = vm.createContext({
+    AbortController,
     document,
     EventSource: FakeEventSource,
     fetch: fetchImpl,
@@ -236,19 +298,34 @@ async function createHarness(fetchImpl) {
     URLSearchParams,
     requestAnimationFrame,
     cancelAnimationFrame,
+    clearTimeout,
+    setTimeout,
     setImmediate,
+    ...(storedSelection === undefined ? {} : {
+      localStorage: {
+        getItem: () => storedSelection,
+        setItem() {},
+      },
+    }),
   });
   const source = await fs.readFile(APP_SOURCE_URL, "utf8");
   const hooks = `\n;globalThis.__appTest = {
     selectThread,
     sendMessage,
+    interruptTurn,
     connectEvents,
+    fetchJsonWithTimeout,
+    showAuth,
     getState: () => ({
       threads,
       selectedThreadId,
       currentThread,
       pendingMessage,
       sendingThreads: [...sendingThreads],
+      interruptingThreads: [...interruptingThreads],
+      interruptRequestThreads: [...interruptRequestThreads],
+      resolvingRequests: [...resolvingRequests],
+      goalUpdating,
       eventSource,
       selectionEpoch,
       liveMessages: [...liveMessages.values()].map((live) => ({
@@ -257,6 +334,12 @@ async function createHarness(fetchImpl) {
         completed: live.completed,
       })),
       queuedDeltaCount: queuedMessageDeltas.size,
+      composerCatalog,
+      composerSelection: {
+        ...composerSelection,
+        skillNames: [...(composerSelection.skillNames || [])],
+      },
+      composerMenuKind,
     }),
   };`;
   vm.runInContext(`"use strict";\n${source}${hooks}`, context, { filename: "public/app.js" });
@@ -269,6 +352,48 @@ async function createHarness(fetchImpl) {
     pendingAnimationFrames: () => animationFrames.size,
   };
 }
+
+test("malformed persisted composer settings degrade to safe defaults", async () => {
+  const harness = await createHarness(async () => jsonResponse(200, {
+    status: { state: "ready" },
+    threads: [],
+  }), {
+    storedSelection: JSON.stringify({
+      model: { unexpected: true },
+      effort: 42,
+      mode: "unsupported",
+      skillNames: { not: "iterable" },
+    }),
+  });
+
+  const selection = harness.hooks.getState().composerSelection;
+  assert.equal(selection.model, "");
+  assert.equal(selection.effort, "");
+  assert.equal(selection.mode, "default");
+  assert.equal(selection.skillNames.length, 0);
+});
+
+test("request timeouts remain active while a JSON response body is stalled", async () => {
+  const harness = await createHarness(async (url, options) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [] });
+    }
+    return {
+      status: 200,
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }, { once: true });
+      }),
+    };
+  });
+
+  await assert.rejects(
+    harness.hooks.fetchJsonWithTimeout("/stalled", {}, 5),
+    /请求超时/,
+  );
+});
 
 function emitSse(source, event, value) {
   source.listeners.get(event)({ data: JSON.stringify(value) });
@@ -339,6 +464,322 @@ test("consecutive tool activity renders as one compact group and merges duplicat
   assert.match(rendered[1].textContent, /运行 rg -n renderThread public\/app\.js/);
   assert.match(rendered[1].textContent, /×2/);
   assert.match(rendered[1].textContent, /读取 app\.js/);
+});
+
+test("composer controls send the selected model effort mode and skills", async () => {
+  let sentBody;
+  const detail = {
+    ...threadDetail("A", "ready"),
+    composerOptions: composerOptions(),
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/messages") {
+      sentBody = JSON.parse(options.body);
+      return jsonResponse(202, { delivery: "app-server", control: { busy: true } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.elements["model-label"].textContent, "GPT Sol");
+  assert.equal(harness.elements["effort-label"].textContent, "低");
+
+  harness.elements["model-control"].listeners.get("click")[0]();
+  const modelList = harness.elements["composer-menu"].children[1];
+  modelList.children[1].listeners.get("click")[0]();
+  assert.equal(harness.elements["model-label"].textContent, "GPT Terra");
+  assert.equal(harness.elements["effort-label"].textContent, "中");
+
+  harness.elements["skill-control"].listeners.get("click")[0]();
+  const skillList = harness.elements["composer-menu"].children[2];
+  skillList.children[0].listeners.get("click")[0]();
+  assert.equal(harness.elements["skill-count"].textContent, "1");
+  assert.match(harness.elements["selected-skills"].textContent, /\$docs/);
+
+  await harness.elements["mode-control"].children[1].listeners.get("click")[0]();
+  assert.equal(harness.hooks.getState().composerSelection.mode, "plan");
+
+  harness.elements["message-input"].value = "制定实现计划";
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  assert.deepEqual(sentBody, {
+    text: "制定实现计划",
+    model: "gpt-terra",
+    effort: "medium",
+    mode: "plan",
+    skillNames: ["docs"],
+  });
+});
+
+test("goal mode creates an active goal and can clear it from the composer", async () => {
+  const calls = [];
+  const detail = {
+    ...threadDetail("A", "ready"),
+    composerOptions: composerOptions(),
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/messages") {
+      return jsonResponse(202, {
+        delivery: "codex-app",
+        goal: { objective: "完成 Web 对齐", status: "active" },
+        control: { busy: true },
+      });
+    }
+    if (url === "/api/threads/A/goal" && options.method === "DELETE") {
+      return jsonResponse(200, { ok: true, cleared: true });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  await harness.elements["mode-control"].children[2].listeners.get("click")[0]();
+  harness.elements["message-input"].value = "完成 Web 对齐";
+  await harness.hooks.sendMessage({ preventDefault() {} });
+
+  const send = calls.find((call) => call.url === "/api/threads/A/messages");
+  assert.equal(JSON.parse(send.body).mode, "goal");
+  assert.equal(harness.elements["goal-banner"].hidden, false);
+  assert.equal(harness.elements["goal-objective"].textContent, "完成 Web 对齐");
+
+  harness.hooks.getState().currentThread.control.busy = false;
+  await harness.elements["goal-clear"].listeners.get("click")[0]();
+  assert.equal(harness.elements["goal-banner"].hidden, true);
+  assert.equal(harness.hooks.getState().composerSelection.mode, "default");
+  assert.equal(calls.some((call) => call.url === "/api/threads/A/goal" && call.method === "DELETE"), true);
+});
+
+test("desktop snapshots render live thinking and tool state without replacing history", async () => {
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, threadDetail("A", "已有记录"));
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "desktopThread", {
+    ...threadSummary("A"),
+    partial: true,
+    messages: [
+      {
+        id: "reasoning-live",
+        role: "assistant",
+        kind: "reasoning",
+        text: "正在检查消息链路",
+        activityStatus: "inProgress",
+        timestamp: 2,
+      },
+      {
+        id: "command-live",
+        role: "system",
+        kind: "activity",
+        label: "终端",
+        activityType: "command",
+        activityStatus: "inProgress",
+        text: "正在运行 npm test",
+        timestamp: 2,
+      },
+    ],
+    control: { busy: true, phase: "running" },
+  });
+
+  assert.match(harness.elements["message-list"].textContent, /已有记录/);
+  assert.match(harness.elements["message-list"].textContent, /思考中/);
+  assert.match(harness.elements["message-list"].textContent, /正在检查消息链路/);
+  assert.match(harness.elements["message-list"].textContent, /正在运行 npm test/);
+  assert.match(harness.elements["message-list"].textContent, /进行中/);
+  assert.equal(harness.hooks.getState().currentThread.control.busy, true);
+
+  emitSse(source, "desktopThread", {
+    ...threadSummary("A"),
+    partial: true,
+    messages: [
+      {
+        id: "reasoning-live",
+        role: "assistant",
+        kind: "reasoning",
+        text: "消息链路检查完成",
+        activityStatus: "completed",
+        timestamp: 2,
+      },
+      {
+        id: "command-live",
+        role: "system",
+        kind: "activity",
+        label: "终端",
+        activityType: "command",
+        activityStatus: "completed",
+        text: "运行 npm test",
+        timestamp: 2,
+      },
+    ],
+    control: { busy: false, phase: "idle" },
+  });
+
+  assert.match(harness.elements["message-list"].textContent, /已思考/);
+  assert.match(harness.elements["message-list"].textContent, /消息链路检查完成/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /进行中/);
+  assert.equal(harness.hooks.getState().currentThread.control.busy, false);
+});
+
+test("optimistic messages show sending and delivered receipts", async () => {
+  const sendResult = deferred();
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, threadDetail("A", "已有消息"));
+    if (url === "/api/threads/A/messages") return sendResult.promise;
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "马上开始";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
+  let userMessage = harness.elements["message-list"].children.at(-1);
+  assert.equal(userMessage.children[2].textContent, "发送中");
+
+  sendResult.resolve(jsonResponse(202, {
+    delivery: "codex-app",
+    control: { busy: true, phase: "starting" },
+  }));
+  await sending;
+  userMessage = harness.elements["message-list"].children.at(-1);
+  assert.equal(userMessage.children[2].textContent, "已送达");
+  assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "sent");
+});
+
+test("a rejected desktop-owned send restores the draft instead of showing delivered", async () => {
+  const errorMessage = "这个任务正由 Codex Desktop 占用，Web 端无法可靠写入";
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, threadDetail("A", "已有消息"));
+    if (url === "/api/threads/A/messages") {
+      return jsonResponse(409, { error: errorMessage });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "继续执行";
+  await harness.hooks.sendMessage({ preventDefault() {} });
+
+  assert.equal(harness.hooks.getState().pendingMessage, null);
+  assert.equal(harness.elements["message-input"].value, "继续执行");
+  assert.equal(harness.elements["composer-status"].textContent, errorMessage);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /继续执行|已送达/);
+});
+
+test("a running turn exposes stop, waits for idle, and then accepts a follow-up", async () => {
+  const interruptResult = deferred();
+  const calls = [];
+  const detail = {
+    ...threadDetail("A", "正在执行"),
+    status: "active",
+    control: {
+      busy: true,
+      phase: "running",
+      turnId: "turn-1",
+      requests: [],
+    },
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/interrupt") return interruptResult.promise;
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.elements["message-input"].disabled, true);
+  assert.equal(harness.elements["send-button"].disabled, false);
+  assert.equal(harness.elements["send-button"].dataset.action, "interrupt");
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "中断任务");
+
+  const interrupting = harness.hooks.interruptTurn({ preventDefault() {} });
+  await eventually(() => harness.hooks.getState().interruptRequestThreads.includes("A"));
+  assert.equal(harness.elements["composer-status"].textContent, "正在中断");
+  assert.equal(harness.elements["send-button"].disabled, true);
+  assert.deepEqual(
+    calls.filter((call) => call.method === "POST").map((call) => call.url),
+    ["/api/threads/A/interrupt"],
+  );
+
+  interruptResult.resolve(jsonResponse(202, {
+    interruption: "hard",
+    control: { busy: true, phase: "interrupting", turnId: "turn-1" },
+  }));
+  await interrupting;
+  assert.equal(harness.elements["composer-status"].textContent, "正在中断");
+  assert.equal(harness.hooks.getState().interruptingThreads.includes("A"), true);
+
+  emitSse(harness.eventSources.at(-1), "thread", {
+    ...detail,
+    status: "idle",
+    control: { busy: false, phase: "idle", turnId: null, requests: [] },
+  });
+  assert.equal(harness.hooks.getState().interruptingThreads.includes("A"), false);
+  assert.equal(harness.elements["message-input"].disabled, false);
+  assert.equal(harness.elements["send-button"].dataset.action, "send");
+  assert.equal(harness.elements["composer-status"].textContent, "");
+
+  harness.elements["message-input"].value = "继续处理下一步";
+  harness.elements["message-input"].listeners.get("input")[0]();
+  assert.equal(harness.elements["send-button"].disabled, false);
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "发送消息");
+});
+
+test("returning to authentication clears in-flight composer state", async () => {
+  const sendResult = deferred();
+  const detail = {
+    ...threadDetail("A", "ready"),
+    composerOptions: composerOptions(),
+  };
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/bootstrap") {
+      return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    }
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    if (url === "/api/threads/A/messages" && options.method === "POST") {
+      return sendResult.promise;
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "pending";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
+
+  harness.hooks.showAuth("expired");
+
+  const state = harness.hooks.getState();
+  assert.equal(state.sendingThreads.length, 0);
+  assert.equal(state.interruptingThreads.length, 0);
+  assert.equal(state.interruptRequestThreads.length, 0);
+  assert.equal(state.resolvingRequests.length, 0);
+  assert.equal(state.goalUpdating, false);
+  assert.equal(state.pendingMessage, null);
+  assert.equal(harness.elements["auth-screen"].hidden, false);
+
+  sendResult.resolve(jsonResponse(202, { control: { busy: true } }));
+  await sending;
 });
 
 test("a send completing after navigation cannot pollute the current thread", async () => {

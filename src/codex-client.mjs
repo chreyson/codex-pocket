@@ -3,16 +3,42 @@ import { EventEmitter } from "node:events";
 import readline from "node:readline";
 
 const MAX_LIVE_MESSAGE_LENGTH = 80_000;
+export const MAX_LIVE_MESSAGE_COUNT = 128;
 
 function clipLiveMessageText(value) {
   return String(value ?? "").slice(0, MAX_LIVE_MESSAGE_LENGTH);
 }
 
+export function appServerLaunchSpec(command, {
+  platform = process.platform,
+  comspec = process.env.ComSpec || "cmd.exe",
+} = {}) {
+  const value = String(command || "").trim();
+  if (!value) throw new Error("Codex executable is not configured");
+  const args = ["app-server", "--stdio"];
+  if (platform !== "win32" || /\.(?:exe|com)$/i.test(value)) {
+    return { command: value, args, shell: false };
+  }
+  if (/["\r\n%!]/.test(value)) {
+    throw new Error("Codex executable path contains unsupported characters");
+  }
+  return {
+    command: `"${value}" app-server --stdio`,
+    args: [],
+    shell: comspec,
+  };
+}
+
 export class CodexAppServer extends EventEmitter {
-  constructor({ command = process.env.CODEX_BIN || "codex", requestTimeoutMs = 20_000 } = {}) {
+  constructor({
+    command = process.env.CODEX_BIN || "codex",
+    requestTimeoutMs = 20_000,
+    experimentalApi = true,
+  } = {}) {
     super();
     this.command = command;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.experimentalApi = experimentalApi;
     this.proc = null;
     this.startPromise = null;
     this.pending = new Map();
@@ -21,28 +47,64 @@ export class CodexAppServer extends EventEmitter {
     this.loadedThreads = new Set();
     this.activeTurns = new Map();
     this.startingThreads = new Set();
+    this.interruptingThreads = new Set();
     this.liveAgentMessages = new Map();
+    this.threadSettings = new Map();
     this.serverRequests = new Map();
     this.serverRequestTokensById = new Map();
     this.nextServerRequestToken = 1;
   }
 
+  _clearRuntimeState(error) {
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    this.pending.clear();
+    this.loadedThreads.clear();
+    this.activeTurns.clear();
+    this.startingThreads.clear();
+    this.interruptingThreads.clear();
+    this.liveAgentMessages.clear();
+    this.threadSettings.clear();
+    this.serverRequests.clear();
+    this.serverRequestTokensById.clear();
+  }
+
+  _handleProcessExit(proc, code, signal) {
+    if (this.proc !== proc) return false;
+    this.proc = null;
+    const error = new Error(`Codex App Server exited (${signal ?? code ?? "unknown"})`);
+    this.lastError = error;
+    this._clearRuntimeState(error);
+    this.emit("exit", { code, signal });
+    return true;
+  }
+
   async start() {
-    if (this.proc && !this.proc.killed) return;
     if (this.startPromise) return this.startPromise;
+    if (this.proc && !this.proc.killed) return;
 
     this.startPromise = this._startProcess();
     try {
       await this.startPromise;
+    } catch (error) {
+      try {
+        this.stop();
+      } catch {
+        // Preserve the startup failure; process cleanup is best-effort here.
+      }
+      throw error;
     } finally {
       this.startPromise = null;
     }
   }
 
   async _startProcess() {
-    const proc = spawn(this.command, ["app-server", "--stdio"], {
+    const launch = appServerLaunchSpec(this.command);
+    const proc = spawn(launch.command, launch.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32",
+      shell: launch.shell,
       windowsHide: true,
       env: process.env,
     });
@@ -51,34 +113,27 @@ export class CodexAppServer extends EventEmitter {
     this.lastError = null;
 
     const lines = readline.createInterface({ input: proc.stdout });
-    lines.on("line", (line) => this._handleLine(line));
+    lines.on("line", (line) => {
+      if (this.proc === proc) this._handleLine(line);
+    });
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk) => {
+      if (this.proc !== proc) return;
       const message = String(chunk).trim();
       if (message) this.emit("diagnostic", message);
     });
+    proc.stdin.on("error", (error) => {
+      if (this.proc === proc) this.emit("diagnostic", error.message);
+    });
 
     proc.on("error", (error) => {
+      if (this.proc !== proc) return;
       this.lastError = error;
       this.emit("diagnostic", error.message);
     });
 
     proc.on("exit", (code, signal) => {
-      if (this.proc === proc) this.proc = null;
-      const error = new Error(`Codex App Server exited (${signal ?? code ?? "unknown"})`);
-      this.lastError = error;
-      for (const { reject, timer } of this.pending.values()) {
-        clearTimeout(timer);
-        reject(error);
-      }
-      this.pending.clear();
-      this.loadedThreads.clear();
-      this.activeTurns.clear();
-      this.startingThreads.clear();
-      this.liveAgentMessages.clear();
-      this.serverRequests.clear();
-      this.serverRequestTokensById.clear();
-      this.emit("exit", { code, signal });
+      this._handleProcessExit(proc, code, signal);
     });
 
     await new Promise((resolve, reject) => {
@@ -93,7 +148,7 @@ export class CodexAppServer extends EventEmitter {
         version: "0.2.0",
       },
       capabilities: {
-        experimentalApi: false,
+        experimentalApi: this.experimentalApi,
       },
     });
     this.notify("initialized", {});
@@ -106,6 +161,10 @@ export class CodexAppServer extends EventEmitter {
       message = JSON.parse(line);
     } catch {
       this.emit("diagnostic", `Ignored non-JSON App Server output: ${line}`);
+      return;
+    }
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      this.emit("diagnostic", "Ignored malformed App Server message");
       return;
     }
 
@@ -142,10 +201,18 @@ export class CodexAppServer extends EventEmitter {
     return `${typeof id}:${String(id)}`;
   }
 
-  _captureThreadState(thread) {
+  _captureThreadState(thread, { authoritative = true } = {}) {
     if (!thread?.id) return;
-    const activeTurn = [...(thread.turns || [])].reverse().find((turn) => turn.status === "inProgress");
-    if (activeTurn?.id) this.activeTurns.set(thread.id, activeTurn.id);
+    const turns = Array.isArray(thread.turns) ? thread.turns : [];
+    const activeTurn = [...turns].reverse().find(
+      (turn) => ["inProgress", "running"].includes(turn?.status),
+    );
+    if (activeTurn?.id) {
+      this.activeTurns.set(thread.id, activeTurn.id);
+    } else if (authoritative) {
+      this.activeTurns.delete(thread.id);
+      this.interruptingThreads.delete(thread.id);
+    }
   }
 
   _removeRequestsForThread(threadId) {
@@ -158,6 +225,23 @@ export class CodexAppServer extends EventEmitter {
 
   _liveAgentMessageKey(threadId, turnId, itemId) {
     return `${threadId}\u0000${turnId}\u0000${itemId}`;
+  }
+
+  _storeLiveAgentMessage(key, record) {
+    this.liveAgentMessages.set(key, record);
+    while (this.liveAgentMessages.size > MAX_LIVE_MESSAGE_COUNT) {
+      let removableKey = null;
+      for (const [candidateKey, candidate] of this.liveAgentMessages) {
+        if (candidate.done) {
+          removableKey = candidateKey;
+          break;
+        }
+        if (removableKey === null) removableKey = candidateKey;
+      }
+      if (removableKey === null) break;
+      this.liveAgentMessages.delete(removableKey);
+    }
+    return record;
   }
 
   _messageTimestamp(message, params) {
@@ -190,7 +274,7 @@ export class CodexAppServer extends EventEmitter {
       timestamp: this._messageTimestamp(message, params),
       done: false,
     };
-    this.liveAgentMessages.set(key, record);
+    this._storeLiveAgentMessage(key, record);
     this.emit("messageStart", this._publicLiveAgentMessage(record));
     return record;
   }
@@ -211,7 +295,7 @@ export class CodexAppServer extends EventEmitter {
         timestamp: this._messageTimestamp(message, params),
         done: false,
       };
-      this.liveAgentMessages.set(key, record);
+      this._storeLiveAgentMessage(key, record);
       this.emit("messageStart", this._publicLiveAgentMessage(record));
     }
     if (record.done) return record;
@@ -241,7 +325,7 @@ export class CodexAppServer extends EventEmitter {
         timestamp: this._messageTimestamp(message, params),
         done: false,
       };
-      this.liveAgentMessages.set(key, record);
+      this._storeLiveAgentMessage(key, record);
       this.emit("messageStart", this._publicLiveAgentMessage(record));
     }
 
@@ -257,6 +341,10 @@ export class CodexAppServer extends EventEmitter {
     const threadId = params.threadId || "";
     let controlChanged = false;
 
+    if (method === "thread/settings/updated" && threadId && params.threadSettings) {
+      this.threadSettings.set(threadId, params.threadSettings);
+    }
+
     if (method === "item/started") {
       this._startLiveAgentMessage(message, params);
     } else if (method === "item/agentMessage/delta") {
@@ -267,13 +355,16 @@ export class CodexAppServer extends EventEmitter {
 
     if (method === "turn/started" && threadId && params.turn?.id) {
       this.activeTurns.set(threadId, params.turn.id);
+      this.interruptingThreads.delete(threadId);
       controlChanged = true;
     } else if (method === "turn/completed" && threadId) {
       this.activeTurns.delete(threadId);
+      this.interruptingThreads.delete(threadId);
       this._removeRequestsForThread(threadId);
       controlChanged = true;
     } else if (method === "thread/status/changed" && threadId && params.status?.type !== "active") {
       this.activeTurns.delete(threadId);
+      this.interruptingThreads.delete(threadId);
       controlChanged = true;
     } else if (method === "serverRequest/resolved") {
       const token = this.serverRequestTokensById.get(this._serverRequestIdKey(params.requestId));
@@ -327,24 +418,125 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  async readThread(threadId) {
+  async readThread(threadId, { includeTurns = true } = {}) {
     await this.start();
-    return this.request("thread/read", {
+    const result = await this.request("thread/read", {
       threadId,
-      includeTurns: true,
+      includeTurns,
     });
+    if (includeTurns) this._captureThreadState(result.thread);
+    return result;
+  }
+
+  async listModels({ includeHidden = false } = {}) {
+    await this.start();
+    const models = [];
+    const seenCursors = new Set();
+    const seenModels = new Set();
+    let cursor = null;
+    do {
+      const result = await this.request("model/list", {
+        cursor,
+        limit: 100,
+        includeHidden,
+      });
+      const page = Array.isArray(result?.data) ? result.data : [];
+      for (const model of page) {
+        const modelId = typeof model?.model === "string"
+          ? model.model
+          : typeof model?.id === "string" ? model.id : "";
+        if (modelId && seenModels.has(modelId)) continue;
+        if (modelId) seenModels.add(modelId);
+        models.push(model);
+      }
+      const nextCursor = typeof result?.nextCursor === "string"
+        ? result.nextCursor
+        : null;
+      if (!nextCursor || seenCursors.has(nextCursor)) {
+        cursor = null;
+      } else {
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+    } while (cursor && models.length < 500);
+    return models;
+  }
+
+  async listSkills(cwd, { forceReload = false } = {}) {
+    await this.start();
+    const result = await this.request("skills/list", {
+      cwds: cwd ? [cwd] : [],
+      forceReload,
+    });
+    return Array.isArray(result?.data) ? result.data : [];
+  }
+
+  async listCollaborationModes() {
+    await this.start();
+    const result = await this.request("collaborationMode/list", {});
+    return Array.isArray(result?.data) ? result.data : [];
+  }
+
+  async getGoal(threadId) {
+    await this.start();
+    return (await this.request("thread/goal/get", { threadId })).goal || null;
+  }
+
+  async setGoal(threadId, value) {
+    await this.start();
+    return (await this.request("thread/goal/set", { threadId, ...value })).goal;
+  }
+
+  async clearGoal(threadId) {
+    await this.start();
+    return this.request("thread/goal/clear", { threadId });
+  }
+
+  async composerCatalog(threadId, { thread: suppliedThread = null } = {}) {
+    const threadResult = suppliedThread
+      ? Promise.resolve(suppliedThread).then((thread) => ({ thread }))
+      : this.readThread(threadId, { includeTurns: false });
+    const [{ thread }, models] = await Promise.all([
+      threadResult,
+      this.listModels(),
+    ]);
+    const cwd = String(thread?.cwd || process.cwd());
+    const [skillEntries, modeResult, goalResult] = await Promise.all([
+      this.listSkills(cwd),
+      this.listCollaborationModes()
+        .then((modes) => ({ supported: true, modes }))
+        .catch(() => ({ supported: false, modes: [] })),
+      this.getGoal(threadId)
+        .then((goal) => ({ supported: true, goal }))
+        .catch(() => ({ supported: false, goal: null })),
+    ]);
+    return {
+      models,
+      skillEntries,
+      modes: modeResult.modes,
+      modeListSupported: modeResult.supported,
+      goal: goalResult.goal,
+      goalSupported: goalResult.supported,
+      current: this.threadSettings.get(threadId) || null,
+    };
   }
 
   async resumeThread(threadId) {
     await this.start();
-    if (this.loadedThreads.has(threadId)) return null;
+    if (this.loadedThreads.has(threadId)) return this.threadSettings.get(threadId) || null;
     const result = await this.request("thread/resume", { threadId });
     this.loadedThreads.add(threadId);
     this._captureThreadState(result.thread);
+    this.threadSettings.set(threadId, {
+      model: result.model || "",
+      effort: result.reasoningEffort || null,
+      serviceTier: result.serviceTier || null,
+      collaborationMode: null,
+    });
     return result;
   }
 
-  async startTurn(threadId, text) {
+  async startTurn(threadId, text, options = {}) {
     if (this.isThreadBusy(threadId)) {
       const error = new Error("This Codex conversation already has an active turn");
       error.code = "TURN_ACTIVE";
@@ -361,15 +553,64 @@ export class CodexAppServer extends EventEmitter {
         throw error;
       }
 
-      const result = await this.request("turn/start", {
+      const input = (options.skills || []).map((skill) => ({
+        type: "skill",
+        name: skill.name,
+        path: skill.path,
+      }));
+      input.push({ type: "text", text, text_elements: [] });
+      const params = {
         threadId,
-        input: [{ type: "text", text }],
-      });
+        input,
+      };
+      if (options.model) params.model = options.model;
+      if (options.effort) params.effort = options.effort;
+      if (["default", "plan"].includes(options.mode) && options.model) {
+        params.collaborationMode = {
+          mode: options.mode,
+          settings: {
+            model: options.model,
+            reasoning_effort: options.effort || null,
+            developer_instructions: null,
+          },
+        };
+      }
+
+      const result = await this.request("turn/start", params);
       if (result.turn?.id) this.activeTurns.set(threadId, result.turn.id);
+      if (options.model || options.effort || options.mode) {
+        const previous = this.threadSettings.get(threadId) || {};
+        this.threadSettings.set(threadId, {
+          ...previous,
+          model: options.model || previous.model || "",
+          effort: options.effort || previous.effort || null,
+          collaborationMode: options.mode || null,
+        });
+      }
       return result;
     } finally {
       this.startingThreads.delete(threadId);
       this.emit("control", { threadId });
+    }
+  }
+
+  async interruptTurn(threadId, turnId = this.activeTurns.get(threadId)) {
+    await this.start();
+    if (!turnId) {
+      const error = new Error("This Codex conversation has no active turn");
+      error.code = "NO_ACTIVE_TURN";
+      throw error;
+    }
+
+    this.interruptingThreads.add(threadId);
+    this.emit("control", { threadId });
+    try {
+      const result = await this.request("turn/interrupt", { threadId, turnId });
+      return { ...result, turnId };
+    } catch (error) {
+      this.interruptingThreads.delete(threadId);
+      this.emit("control", { threadId });
+      throw error;
     }
   }
 
@@ -382,6 +623,7 @@ export class CodexAppServer extends EventEmitter {
       busy: this.isThreadBusy(threadId),
       phase: this.startingThreads.has(threadId)
         ? "starting"
+        : this.interruptingThreads.has(threadId) ? "interrupting"
         : this.activeTurns.has(threadId) ? "running" : "idle",
       turnId: this.activeTurns.get(threadId) || null,
     };
@@ -446,6 +688,7 @@ export class CodexAppServer extends EventEmitter {
     if (!this.proc) return;
     const proc = this.proc;
     this.proc = null;
+    this._clearRuntimeState(new Error("Codex App Server stopped"));
     if (process.platform === "win32" && proc.pid) {
       const result = spawnSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], {
         stdio: "ignore",

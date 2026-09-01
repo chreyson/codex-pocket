@@ -2,42 +2,18 @@
 setlocal
 cd /d "%~dp0"
 
-set "POCKET_PYTHON=python"
-set "POCKET_PYTHONW="
-where py >nul 2>nul
-if not errorlevel 1 (
-  set "POCKET_PYTHON=py -3"
-  where pyw >nul 2>nul
-  if not errorlevel 1 set "POCKET_PYTHONW=pyw -3"
-) else (
-  where python >nul 2>nul
-  if errorlevel 1 goto :missing_python
-  where pythonw >nul 2>nul
-  if not errorlevel 1 set "POCKET_PYTHONW=pythonw"
+set "POCKET_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%POCKET_POWERSHELL%" (
+  echo Windows PowerShell was not found.
+  if not defined CODEX_POCKET_NO_PAUSE pause
+  exit /b 1
 )
 
-%POCKET_PYTHON% -c "import webview" >nul 2>nul
-if errorlevel 1 (
-  echo Codex Pocket is preparing the WebView2 desktop interface...
-  %POCKET_PYTHON% -m pip install --disable-pip-version-check -r requirements-desktop.txt
-  if errorlevel 1 (
-    echo.
-    echo Unable to install the WebView2 desktop dependency.
-    echo Run: %POCKET_PYTHON% -m pip install -r requirements-desktop.txt
-    pause
-    exit /b 1
-  )
-)
+"%POCKET_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Start-CodexPocket.ps1" %*
+set "POCKET_EXIT_CODE=%errorlevel%"
+if "%POCKET_EXIT_CODE%"=="0" exit /b 0
 
-if defined POCKET_PYTHONW (
-  start "" %POCKET_PYTHONW% "%~dp0desktop_host.py"
-  exit /b 0
-)
-
-%POCKET_PYTHON% "%~dp0desktop_host.py"
-exit /b %errorlevel%
-
-:missing_python
-echo Python 3 is required.
-pause
-exit /b 1
+echo.
+echo Codex Pocket failed to start. Run Setup-CodexPocket.ps1 again for diagnostics.
+if not defined CODEX_POCKET_NO_PAUSE pause
+exit /b %POCKET_EXIT_CODE%

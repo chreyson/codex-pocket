@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import {
   CodexDesktopBridge,
   discoverCodexAppPipePaths,
   encodeNativeFrame,
+  requestNativePipe,
 } from "../src/codex-desktop-bridge.mjs";
 
 
@@ -32,40 +34,135 @@ test("native frames use the Codex App four-byte length prefix", () => {
   assert.deepEqual(JSON.parse(frame.subarray(4).toString("utf8")), message);
 });
 
-test("desktop sending probes pipes and calls the App-owned thread tool", async () => {
-  const calls = [];
+test("native pipe calls reject valid JSON that is not an RPC response", async () => {
+  const socket = new EventEmitter();
+  socket.destroyed = false;
+  socket.destroy = () => {
+    socket.destroyed = true;
+  };
+  socket.write = () => {
+    const payload = Buffer.from("null", "utf8");
+    const frame = Buffer.alloc(payload.length + 4);
+    frame.writeUInt32LE(payload.length, 0);
+    payload.copy(frame, 4);
+    queueMicrotask(() => socket.emit("data", frame));
+  };
+
+  await assert.rejects(
+    requestNativePipe("test-pipe", "tools/list", {}, {
+      timeoutMs: 100,
+      createConnection: () => {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    }),
+    (error) => error.code === "DESKTOP_BRIDGE_PROTOCOL",
+  );
+});
+
+test("read-only desktop calls reconnect once after a timeout", async () => {
+  let toolCalls = 0;
+  let discoveries = 0;
+  const payload = {
+    schemaVersion: 1,
+    thread: { id: "thread-1", status: { type: "idle" } },
+    turns: [],
+  };
   const bridge = new CodexDesktopBridge({
-    discover: async () => ["bad-pipe", "desktop-pipe"],
-    request: async (pipePath, method, params) => {
-      calls.push({ pipePath, method, params });
-      if (pipePath === "bad-pipe") throw Object.assign(new Error("closed"), { code: "ENOENT" });
+    discover: async () => {
+      discoveries += 1;
+      return ["desktop-pipe"];
+    },
+    request: async (_pipePath, method) => {
       if (method === "tools/list") {
-        return { tools: [{ name: "send_message_to_thread", namespace: "codex_app" }] };
+        return {
+          tools: [
+            { name: "read_thread", namespace: "codex_app" },
+          ],
+        };
       }
-      return { success: true, contentItems: [{ type: "inputText", text: "sent" }] };
+      toolCalls += 1;
+      if (toolCalls === 1) {
+        throw Object.assign(new Error("stale pipe"), {
+          code: "DESKTOP_BRIDGE_TIMEOUT",
+        });
+      }
+      return {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify(payload) }],
+      };
     },
   });
 
-  const result = await bridge.sendMessage("thread-1", "继续执行");
-
-  assert.equal(result.delivery, "codex-app");
-  const toolCall = calls.find((call) => call.method === "tools/call");
-  assert.equal(toolCall.pipePath, "desktop-pipe");
-  assert.equal(toolCall.params.tool, "send_message_to_thread");
-  assert.equal(toolCall.params.threadId, "thread-1");
-  assert.deepEqual(toolCall.params.arguments, { threadId: "thread-1", prompt: "继续执行" });
+  assert.deepEqual(await bridge.readThread("thread-1"), payload);
+  assert.equal(toolCalls, 2);
+  assert.equal(discoveries, 2);
 });
 
-test("desktop tool failures remain failures instead of falling back to a second writer", async () => {
+test("desktop thread reads use the App-owned read tool and parse its JSON payload", async () => {
+  const calls = [];
+  const payload = {
+    schemaVersion: 1,
+    thread: { id: "thread-1", status: { type: "active" } },
+    turns: [{ id: "turn-1", status: "inProgress", items: [] }],
+  };
   const bridge = new CodexDesktopBridge({
     discover: async () => ["desktop-pipe"],
-    request: async (_pipePath, method) => method === "tools/list"
-      ? { tools: [{ name: "send_message_to_thread", namespace: "codex_app" }] }
-      : { success: false, contentItems: [{ type: "inputText", text: "thread is busy" }] },
+    request: async (_pipePath, method, params) => {
+      calls.push({ method, params });
+      if (method === "tools/list") {
+        return {
+          tools: [
+            { name: "read_thread", namespace: "codex_app" },
+          ],
+        };
+      }
+      return {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify(payload) }],
+      };
+    },
   });
 
-  await assert.rejects(
-    bridge.sendMessage("thread-1", "继续执行"),
-    (error) => error.code === "DESKTOP_SEND_FAILED" && error.message === "thread is busy",
+  assert.deepEqual(await bridge.readThread("thread-1"), payload);
+  const toolCall = calls.find((call) => call.method === "tools/call");
+  assert.equal(toolCall.params.tool, "read_thread");
+  assert.deepEqual(toolCall.params.arguments, {
+    threadId: "thread-1",
+    turnLimit: 2,
+    includeOutputs: false,
+    maxOutputCharsPerItem: 20_000,
+  });
+});
+
+test("desktop discovery selects an endpoint that supports the requested tool", async () => {
+  const calls = [];
+  const payload = {
+    schemaVersion: 1,
+    thread: { id: "thread-1", status: { type: "idle" } },
+    turns: [],
+  };
+  const bridge = new CodexDesktopBridge({
+    discover: async () => ["list-only", "read-capable"],
+    request: async (pipePath, method) => {
+      calls.push({ pipePath, method });
+      if (method === "tools/list") {
+        return {
+          tools: pipePath === "list-only"
+            ? [{ name: "list_threads", namespace: "codex_app" }]
+            : [{ name: "read_thread", namespace: "codex_app" }],
+        };
+      }
+      return {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify(payload) }],
+      };
+    },
+  });
+
+  assert.deepEqual(await bridge.readThread("thread-1"), payload);
+  assert.equal(
+    calls.find((call) => call.method === "tools/call").pipePath,
+    "read-capable",
   );
 });

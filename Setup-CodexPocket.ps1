@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [switch]$Start,
-    [switch]$SkipFirewall
+    [switch]$SkipFirewall,
+    [string]$PythonPath,
+    [string]$NodePath,
+    [string]$CodexPath
 )
 
 Set-StrictMode -Version 2.0
@@ -12,7 +15,11 @@ $dataDirectory = Join-Path $projectRoot '.data'
 $resultPath = Join-Path $dataDirectory 'setup-result.json'
 $requirementsPath = Join-Path $projectRoot 'requirements-desktop.txt'
 $launcherPath = Join-Path $projectRoot 'CodexPocket.cmd'
+$startScriptPath = Join-Path $projectRoot 'Start-CodexPocket.ps1'
+$runtimeHelpersPath = Join-Path $projectRoot 'CodexPocket.Runtime.ps1'
+$runtimeConfigPath = Join-Path $dataDirectory 'runtime.json'
 
+Set-Location -LiteralPath $projectRoot
 New-Item -ItemType Directory -Force -Path $dataDirectory | Out-Null
 
 $setupResult = [ordered]@{
@@ -46,58 +53,6 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Resolve-Python {
-    $candidates = @()
-    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($launcher) {
-        $candidates += [pscustomobject]@{
-            Command = $launcher.Source
-            Prefix = @('-3')
-            Display = 'py -3'
-        }
-    }
-
-    $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($python) {
-        $candidates += [pscustomobject]@{
-            Command = $python.Source
-            Prefix = @()
-            Display = $python.Source
-        }
-    }
-
-    foreach ($candidate in $candidates) {
-        $command = $candidate.Command
-        $arguments = @($candidate.Prefix) + @(
-            '-c',
-            'import sys; print("%d.%d.%d" % sys.version_info[:3])'
-        )
-        $versionText = & $command @arguments 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $versionText) {
-            continue
-        }
-
-        try {
-            $version = [Version]([string]$versionText).Trim()
-        } catch {
-            continue
-        }
-
-        if ($version -lt [Version]'3.8') {
-            continue
-        }
-
-        return [pscustomobject]@{
-            Command = $candidate.Command
-            Prefix = @($candidate.Prefix)
-            Display = $candidate.Display
-            Version = $version.ToString()
-        }
-    }
-
-    throw 'Python 3.8 or newer was not found. Install Python, then run this script again.'
-}
-
 function Invoke-PocketPython {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -107,50 +62,6 @@ function Invoke-PocketPython {
     if ($LASTEXITCODE -ne 0) {
         throw "Python command failed with exit code $LASTEXITCODE."
     }
-}
-
-function Resolve-Node {
-    $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
-    if (-not $nodeCommand) {
-        throw 'Node.js 20 or newer was not found.'
-    }
-
-    $versionText = [string](& $nodeCommand.Source --version)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Unable to read the Node.js version.'
-    }
-
-    $version = [Version]$versionText.Trim().TrimStart('v')
-    if ($version.Major -lt 20) {
-        throw "Node.js 20 or newer is required; found $versionText."
-    }
-
-    return [pscustomobject]@{
-        Path = $nodeCommand.Source
-        Version = $version.ToString()
-    }
-}
-
-function Resolve-Codex {
-    $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
-    if ($codexCommand) {
-        return $codexCommand.Source
-    }
-
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-    if ($localAppData) {
-        $codexDirectory = Join-Path $localAppData 'OpenAI\Codex\bin'
-        if (Test-Path -LiteralPath $codexDirectory -PathType Container) {
-            $bundled = Get-ChildItem -LiteralPath $codexDirectory -Filter codex.exe -File -Recurse |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 1
-            if ($bundled) {
-                return $bundled.FullName
-            }
-        }
-    }
-
-    throw 'Codex CLI or the Codex App runtime was not found. Install or open Codex once, then retry.'
 }
 
 function Find-WebView2Runtime {
@@ -243,11 +154,32 @@ try {
     if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
         throw "Missing launcher: $launcherPath"
     }
+    if (-not (Test-Path -LiteralPath $startScriptPath -PathType Leaf)) {
+        throw "Missing launcher script: $startScriptPath"
+    }
+    if (-not (Test-Path -LiteralPath $runtimeHelpersPath -PathType Leaf)) {
+        throw "Missing runtime helper: $runtimeHelpersPath"
+    }
+
+    . $runtimeHelpersPath
+    $runtimeConfig = Read-PocketRuntimeConfig $runtimeConfigPath
+    $configuredPython = $PythonPath
+    if ([string]::IsNullOrWhiteSpace($configuredPython)) {
+        $configuredPython = Get-PocketRuntimePath $runtimeConfig 'Python'
+    }
+    $configuredNode = $NodePath
+    if ([string]::IsNullOrWhiteSpace($configuredNode)) {
+        $configuredNode = Get-PocketRuntimePath $runtimeConfig 'Node'
+    }
+    $configuredCodex = $CodexPath
+    if ([string]::IsNullOrWhiteSpace($configuredCodex)) {
+        $configuredCodex = Get-PocketRuntimePath $runtimeConfig 'Codex'
+    }
 
     Write-Host 'Checking Python, Node.js, Codex, and WebView2...'
-    $script:pocketPython = Resolve-Python
-    $node = Resolve-Node
-    $codexPath = Resolve-Codex
+    $script:pocketPython = Resolve-PocketPython $configuredPython
+    $node = Resolve-PocketNode $configuredNode
+    $codexPath = Resolve-PocketCodex $configuredCodex
     $webView2Path = Find-WebView2Runtime
     if (-not $webView2Path) {
         throw 'Microsoft Edge WebView2 Runtime was not found. Install the Evergreen Runtime, then retry.'
@@ -255,6 +187,7 @@ try {
 
     $setupResult.Python = [ordered]@{
         Command = $script:pocketPython.Display
+        Path = $script:pocketPython.Command
         Version = $script:pocketPython.Version
     }
     $setupResult.Node = [ordered]@{
@@ -279,8 +212,14 @@ try {
     )
 
     Write-Host 'Preparing cloudflared...'
-    $cloudflaredCode = 'from codex_pocket import ensure_cloudflared; print(ensure_cloudflared(lambda message: print(message)))'
-    $cloudflaredOutput = @(Invoke-PocketPython -Arguments @('-c', $cloudflaredCode))
+    $cloudflaredCode = 'from codex_pocket import ensure_cloudflared; print(ensure_cloudflared(lambda message: print(message, flush=True)))'
+    $cloudflaredOutput = @(
+        Invoke-PocketPython -Arguments @('-c', $cloudflaredCode) |
+            ForEach-Object {
+                Write-Host $_
+                $_
+            }
+    )
     $cloudflaredPath = [string]($cloudflaredOutput |
         Where-Object { [string]$_ -and ([string]$_).Trim() } |
         Select-Object -Last 1)
@@ -304,6 +243,12 @@ try {
     } else {
         Write-Host 'Skipping firewall changes because -SkipFirewall was supplied.'
     }
+
+    Write-PocketRuntimeConfig `
+        -Path $runtimeConfigPath `
+        -Python $script:pocketPython `
+        -Node $node `
+        -Codex $codexPath
 
     if ($Start) {
         Write-Host 'Starting Codex Pocket...'

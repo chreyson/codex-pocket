@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -14,14 +15,270 @@ from codex_pocket import (
     constrain_tooltip_position,
     dpi_scale,
     enable_windows_dpi_awareness,
+    ensure_cloudflared,
+    find_codex,
+    find_node,
     hidden_process_options,
     monitor_work_area_for_point,
     parse_tunnel_url,
+    runtime_configured_path,
+    run_headless,
+    terminate_process_tree,
     window_position,
 )
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_headless_mode_exits_and_cleans_up_after_service_failure(self):
+        instances = []
+
+        class FakeManager:
+            def __init__(self, on_status, on_ready, on_failure):
+                self.on_status = on_status
+                self.on_ready = on_ready
+                self.on_failure = on_failure
+                self.shutdown_requested = False
+                self.stopped = False
+                instances.append(self)
+
+            def start(self):
+                self.on_failure("tunnel exited")
+
+            def request_shutdown(self):
+                self.shutdown_requested = True
+
+            def stop(self):
+                self.stopped = True
+
+        with patch("builtins.print"):
+            self.assertEqual(
+                run_headless(FakeManager, install_signal_handlers=False),
+                1,
+            )
+        self.assertTrue(instances[0].shutdown_requested)
+        self.assertTrue(instances[0].stopped)
+
+    def test_tunnel_state_updates_even_when_log_writes_fail(self):
+        manager = ServiceManager(lambda _value: None, lambda _url, _key: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        stream = io.StringIO(
+            "https://mobile-test.trycloudflare.com\nRegistered tunnel connection\n"
+        )
+
+        with patch.object(manager, "_log", side_effect=OSError("disk full")):
+            manager._read_stream("tunnel", stream, run)
+
+        self.assertEqual(manager.public_url, "https://mobile-test.trycloudflare.com")
+        self.assertTrue(manager._url_event.is_set())
+        self.assertTrue(manager._connected_event.is_set())
+
+    def test_inaccessible_runtime_path_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.json"
+            runtime.write_text(
+                json.dumps({"Codex": {"Path": "C:\\locked\\codex.exe"}}),
+                encoding="utf-8",
+            )
+            with (
+                patch("codex_pocket.RUNTIME_CONFIG_PATH", runtime),
+                patch("codex_pocket.Path.is_file", side_effect=PermissionError("denied")),
+            ):
+                self.assertIsNone(runtime_configured_path("Codex"))
+
+    def test_runtime_config_supplies_node_and_codex_outside_shell_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node = root / "node.exe"
+            codex_ps1 = root / "codex.ps1"
+            codex_cmd = root / "codex.cmd"
+            runtime = root / "runtime.json"
+            node.touch()
+            codex_ps1.touch()
+            codex_cmd.touch()
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "Node": {"Path": str(node)},
+                        "Codex": {"Path": str(codex_ps1)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("codex_pocket.RUNTIME_CONFIG_PATH", runtime),
+                patch.dict(os.environ, {"NODE_BIN": "", "CODEX_BIN": ""}),
+                patch("codex_pocket.shutil.which", return_value=None),
+            ):
+                self.assertEqual(find_node(), str(node))
+                self.assertEqual(find_codex(), str(codex_cmd))
+
+    def test_stale_runtime_config_falls_back_to_current_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime.json"
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "Node": {"Path": str(Path(directory) / "missing-node.exe")},
+                        "Codex": {"Path": str(Path(directory) / "missing-codex.exe")},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def which(name):
+                return {"node": "node-from-path", "codex": "codex-from-path"}.get(name)
+
+            with (
+                patch("codex_pocket.RUNTIME_CONFIG_PATH", runtime),
+                patch.dict(os.environ, {"NODE_BIN": "", "CODEX_BIN": ""}),
+                patch("codex_pocket.shutil.which", side_effect=which),
+            ):
+                self.assertEqual(find_node(), "node-from-path")
+                self.assertEqual(find_codex(), "codex-from-path")
+
+    def test_downloads_cloudflared_with_progress_and_verifies_it(self):
+        class FakeResponse:
+            headers = {"Content-Length": str(2 * 1024 * 1024)}
+
+            def __init__(self):
+                self.chunks = [b"a" * 1024 * 1024, b"b" * 1024 * 1024, b""]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cloudflared.exe"
+            statuses = []
+            with (
+                patch("codex_pocket.shutil.which", return_value=None),
+                patch("codex_pocket.local_cloudflared_path", return_value=target),
+                patch(
+                    "codex_pocket.cloudflared_download_spec",
+                    return_value=("https://example.test/cloudflared.exe", False),
+                ),
+                patch("codex_pocket.urllib.request.urlopen", return_value=FakeResponse()),
+                patch("codex_pocket.subprocess.run") as verify,
+            ):
+                result = ensure_cloudflared(statuses.append)
+
+            self.assertEqual(result, str(target))
+            self.assertEqual(target.stat().st_size, 2 * 1024 * 1024)
+            self.assertTrue(any("50%" in status for status in statuses))
+            self.assertTrue(any("100%" in status for status in statuses))
+            self.assertEqual(statuses[-1], "公网组件下载完成，正在校验")
+            verify.assert_called_once()
+
+    def test_cloudflared_download_timeout_removes_partial_file(self):
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                raise AssertionError("deadline should be checked before reading")
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cloudflared.exe"
+            download = target.with_suffix(".exe.download")
+            with (
+                patch("codex_pocket.shutil.which", return_value=None),
+                patch("codex_pocket.local_cloudflared_path", return_value=target),
+                patch(
+                    "codex_pocket.cloudflared_download_spec",
+                    return_value=("https://example.test/cloudflared.exe", False),
+                ),
+                patch("codex_pocket.urllib.request.urlopen", return_value=FakeResponse()),
+                patch("codex_pocket.time.monotonic", side_effect=[0, 601]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "超过 10 分钟"):
+                    ensure_cloudflared(lambda _message: None)
+
+            self.assertFalse(target.exists())
+            self.assertFalse(download.exists())
+
+    def test_oversized_cloudflared_download_is_rejected_before_writing(self):
+        class FakeResponse:
+            headers = {"Content-Length": str(512 * 1024 * 1024)}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                raise AssertionError("oversized content should not be read")
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cloudflared.exe"
+            with (
+                patch("codex_pocket.shutil.which", return_value=None),
+                patch("codex_pocket.local_cloudflared_path", return_value=target),
+                patch(
+                    "codex_pocket.cloudflared_download_spec",
+                    return_value=("https://example.test/cloudflared.exe", False),
+                ),
+                patch("codex_pocket.urllib.request.urlopen", return_value=FakeResponse()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "内容过大"):
+                    ensure_cloudflared(lambda _message: None)
+
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_suffix(".exe.download").exists())
+
+    def test_invalid_cached_cloudflared_is_replaced(self):
+        class FakeResponse:
+            headers = {"Content-Length": "5"}
+
+            def __init__(self):
+                self.chunks = [b"valid", b""]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cloudflared.exe"
+            target.write_bytes(b"invalid")
+            statuses = []
+            verification_error = subprocess.CalledProcessError(1, [str(target), "--version"])
+            with (
+                patch("codex_pocket.shutil.which", return_value=None),
+                patch("codex_pocket.local_cloudflared_path", return_value=target),
+                patch(
+                    "codex_pocket.cloudflared_download_spec",
+                    return_value=("https://example.test/cloudflared.exe", False),
+                ),
+                patch("codex_pocket.urllib.request.urlopen", return_value=FakeResponse()),
+                patch(
+                    "codex_pocket.subprocess.run",
+                    side_effect=[verification_error, None],
+                ) as verify,
+            ):
+                result = ensure_cloudflared(statuses.append)
+
+            self.assertEqual(result, str(target))
+            self.assertEqual(target.read_bytes(), b"valid")
+            self.assertIn("本地公网组件不可用，正在重新准备", statuses)
+            self.assertEqual(verify.call_count, 2)
+
     def test_single_instance_lock_rejects_a_second_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "desktop.lock"
@@ -33,6 +290,33 @@ class DesktopControllerTests(unittest.TestCase):
             first.release()
             self.assertTrue(second.acquire())
             second.release()
+
+    @unittest.skipUnless(os.name == "nt", "Windows-specific process cleanup")
+    def test_failed_taskkill_falls_back_to_direct_process_termination(self):
+        class FakeProcess:
+            pid = 24680
+
+            def __init__(self):
+                self.killed = False
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout):
+                self.assert_timeout = timeout
+                self.waited = True
+
+        process = FakeProcess()
+        failed = subprocess.CompletedProcess(["taskkill"], returncode=1)
+        with patch("codex_pocket.subprocess.run", return_value=failed):
+            terminate_process_tree(process)
+
+        self.assertTrue(process.killed)
+        self.assertTrue(process.waited)
 
     def test_parses_quick_tunnel_url(self):
         line = "INF Your quick Tunnel has been created! https://plain-field-9.trycloudflare.com"
