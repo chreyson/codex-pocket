@@ -3022,8 +3022,17 @@ textarea:focus-visible {
   gap: 6px;
   border-radius: 999px;
   padding: 0 12px;
-  background: var(--surface-soft);
+  background: transparent;
   color: var(--subtle);
+}
+
+.composer-settings .model-effort-control:not([aria-expanded="true"]) {
+  background: transparent;
+}
+
+.composer-settings .model-effort-control[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--ink);
 }
 
 .model-effort-control #effort-label { flex-shrink: 0; }
