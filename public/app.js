@@ -1,3 +1,5 @@
+import { renderMarkdown } from "./markdown.js";
+
 const bootScreen = document.querySelector("#boot-screen");
 const authScreen = document.querySelector("#auth-screen");
 const authForm = document.querySelector("#auth-form");
@@ -11,10 +13,30 @@ const threadEmptyTitle = document.querySelector("#thread-empty-title");
 const threadEmptyDetail = document.querySelector("#thread-empty-detail");
 const threadActionStatus = document.querySelector("#thread-action-status");
 const threadSearch = document.querySelector("#thread-search");
+const sidebarMenu = document.querySelector("#sidebar-menu");
+const managementDialog = document.querySelector("#management-dialog");
+const managementForm = document.querySelector("#management-form");
+const managementNameInput = document.querySelector("#management-name");
+const managementPathInput = document.querySelector("#management-path");
+const managementError = document.querySelector("#management-error");
+const managementSubmit = document.querySelector("#management-submit");
+const archivedButton = document.querySelector("#archived-button");
+const archivedMore = document.querySelector("#archived-more");
+let projectCatalog = [];
+let projectsSupported = false;
+let viewingArchived = false;
+let archivedThreads = [];
+let archivedCursor = null;
+let archivedLoading = false;
+let selectedArchived = false;
+let managementAction = null;
+let managementPending = false;
+let sidebarMenuTrigger = null;
 const connectionState = document.querySelector("#connection-state");
 const connectionLabel = document.querySelector("#connection-label");
 const conversationTitle = document.querySelector("#conversation-title");
 const conversationMeta = document.querySelector("#conversation-meta");
+const conversationActions = document.querySelector("#conversation-actions");
 const conversationPlaceholder = document.querySelector("#conversation-placeholder");
 const placeholderTitle = document.querySelector("#placeholder-title");
 const placeholderDetail = document.querySelector("#placeholder-detail");
@@ -22,6 +44,9 @@ const messageList = document.querySelector("#message-list");
 const approvalTray = document.querySelector("#approval-tray");
 const composer = document.querySelector("#composer");
 const composerMenu = document.querySelector("#composer-menu");
+const composerExtras = document.querySelector("#composer-extras");
+const extrasSkills = document.querySelector("#extras-skills");
+const extrasButton = document.querySelector("#extras-button");
 const modeControl = document.querySelector("#mode-control");
 const skillControl = document.querySelector("#skill-control");
 const skillLabel = document.querySelector("#skill-label");
@@ -37,7 +62,9 @@ const imageUploadButton = document.querySelector("#image-upload-button");
 const messageInput = document.querySelector("#message-input");
 const modelControl = document.querySelector("#model-control");
 const modelLabel = document.querySelector("#model-label");
-const effortControl = document.querySelector("#effort-control");
+const permissionControl = document.querySelector("#permission-control");
+const permissionLabel = document.querySelector("#permission-label");
+const permissionUpdatingThreads = new Set();
 const effortLabelNode = document.querySelector("#effort-label");
 const composerStatus = document.querySelector("#composer-status");
 const deliveryControl = document.querySelector("#delivery-control");
@@ -45,6 +72,11 @@ const interruptButton = document.querySelector("#interrupt-button");
 const sendButton = document.querySelector("#send-button");
 const backButton = document.querySelector("#back-button");
 const refreshButton = document.querySelector("#refresh-button");
+const networkBanner = document.querySelector("#network-banner");
+const networkMessage = document.querySelector("#network-message");
+const reconnectButton = document.querySelector("#reconnect-button");
+const latestButton = document.querySelector("#latest-button");
+const draftStatus = document.querySelector("#draft-status");
 const imageViewer = document.querySelector("#image-viewer");
 const imageViewerImage = document.querySelector("#image-viewer-image");
 const imageViewerCaption = document.querySelector("#image-viewer-caption");
@@ -56,6 +88,8 @@ let threads = [];
 let selectedThreadId = "";
 let currentThread = null;
 let eventSource = null;
+let supportsPolling = false;
+let usePolling = false;
 let selectionEpoch = 0;
 let pendingMessage = null;
 const sendingThreads = new Set();
@@ -64,6 +98,9 @@ const interruptRequestThreads = new Set();
 const deliveredMessageIds = new Set();
 let composerError = "";
 const collapsedProjects = new Set();
+const openedProjects = new Set();
+const expandedProjectLists = new Set();
+const PROJECT_THREAD_PREVIEW_COUNT = 5;
 const creatingProjects = new Set();
 const expandedTurns = new Set();
 const resolvingRequests = new Set();
@@ -74,12 +111,86 @@ let deltaFrameId = null;
 let desktopThreadSnapshot = null;
 let composerCatalog = null;
 let composerMenuKind = "";
+let extrasSkillsExpanded = false;
 let goalUpdating = false;
 let pendingImages = [];
 let nextPendingImageId = 1;
 let viewerImages = [];
 let viewerImageIndex = 0;
 let runningMessageAction = "queue";
+let transportState = "connecting";
+let lastEventAt = Date.now();
+let syncEpoch = 0;
+let initialLoadEpoch = null;
+let draftTimer = null;
+let sidebarSignature = "";
+let approvalSignature = "";
+const historyNodes = new Map();
+const DRAFT_STORAGE_KEY = "codex-pocket-drafts-v1";
+const LAST_THREAD_KEY = "codex-pocket-last-thread-v1";
+const DRAFT_TTL = 7 * 24 * 60 * 60 * 1000;
+const drafts = readDrafts();
+
+function readDrafts() {
+  try {
+    const values = JSON.parse(globalThis.localStorage?.getItem(DRAFT_STORAGE_KEY) || "[]");
+    return new Map((Array.isArray(values) ? values : []).filter((entry) =>
+      Array.isArray(entry) && typeof entry[0] === "string"
+      && typeof entry[1]?.text === "string" && entry[1].text.length <= 12000
+      && Number.isFinite(entry[1].updatedAt) && Date.now() - entry[1].updatedAt < DRAFT_TTL
+    ).slice(-30));
+  } catch {
+    return new Map();
+  }
+}
+
+function writeDraft(threadId, text) {
+  if (!threadId) return;
+  drafts.delete(threadId);
+  if (text) drafts.set(threadId, { text: text.slice(0, 12000), updatedAt: Date.now() });
+  while (drafts.size > 30) drafts.delete(drafts.keys().next().value);
+  try {
+    globalThis.localStorage?.setItem(DRAFT_STORAGE_KEY, JSON.stringify([...drafts]));
+    if (draftStatus && selectedThreadId === threadId) {
+      draftStatus.textContent = globalThis.localStorage ? "草稿已保存" : "草稿暂存于当前页面";
+      draftStatus.hidden = !text;
+    }
+  } catch {
+    if (draftStatus && selectedThreadId === threadId) {
+      draftStatus.textContent = "草稿仅保留在当前页面";
+      draftStatus.hidden = !text;
+    }
+  }
+}
+
+function saveDraft() {
+  globalThis.clearTimeout?.(draftTimer);
+  draftTimer = null;
+  // Keep the submitted draft until the server acknowledges it.
+  if (!sendingThreads.has(selectedThreadId)) writeDraft(selectedThreadId, messageInput.value);
+}
+
+function rememberThread(threadId) {
+  try { globalThis.localStorage?.setItem(LAST_THREAD_KEY, threadId); } catch { /* Storage can be unavailable. */ }
+}
+
+function rememberedThread() {
+  try { return globalThis.localStorage?.getItem(LAST_THREAD_KEY) || ""; } catch { return ""; }
+}
+
+function networkOffline() {
+  return globalThis.navigator?.onLine === false;
+}
+
+function updateLatestButton() {
+  if (latestButton) latestButton.hidden = !currentThread || messageList.hidden
+    || !approvalTray.hidden || isFollowingOutput();
+}
+
+function scrollToLatest() {
+  messageList.scrollTop = messageList.scrollHeight;
+  updateLatestButton();
+}
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const MAX_LIVE_MESSAGE_LENGTH = 80_000;
@@ -150,8 +261,11 @@ function createIcon(paths) {
 }
 
 function createSidebarIcon(name) {
-  const paths = name === "folder"
-    ? ["M3 6.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z", "M3 10h18"]
+  const paths = name === "folder-open"
+    ? ["m6 14 1.5-2.9a2 2 0 0 1 1.8-1.1H20a2 2 0 0 1 1.8 2.8l-2.6 6a2 2 0 0 1-1.8 1.2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v2"]
+    : name === "folder"
+    ? ["M20 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4l2 3h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2Z", "M2 10h20"]
+    : name === "compose" ? ["M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7", "m16 3 5 5-9 9-5 1 1-5Z"]
     : name === "plus" ? ["M12 5v14", "M5 12h14"] : [];
   return createIcon(paths);
 }
@@ -162,22 +276,18 @@ function fragmentToken() {
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const AbortControllerType = globalThis.AbortController;
   const readResponse = async (signal) => {
-    const response = await fetch(url, signal ? { ...options, signal } : options);
+    const response = await fetch(url, { ...options, signal });
     let body = {};
     try {
       body = (await response.json()) ?? {};
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError") throw error;
+      if (response.ok) throw new Error("服务返回了无效数据，请刷新后重试");
     }
     return { response, body };
   };
-  if (typeof AbortControllerType !== "function" || typeof globalThis.setTimeout !== "function") {
-    return readResponse();
-  }
-
-  const controller = new AbortControllerType();
+  const controller = new AbortController();
   const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await readResponse(controller.signal);
@@ -187,7 +297,7 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEO
     }
     throw error;
   } finally {
-    globalThis.clearTimeout?.(timer);
+    clearTimeout(timer);
   }
 }
 
@@ -232,8 +342,10 @@ function resetLiveRendering() {
   cancelQueuedMessageDeltas();
   liveMessages.clear();
   messageNodes.clear();
+  historyNodes.clear();
   deliveredMessageIds.clear();
   desktopThreadSnapshot = null;
+  approvalSignature = "";
 }
 
 function resetTransientOperations() {
@@ -247,6 +359,13 @@ function resetTransientOperations() {
 }
 
 function showAuth(message = "") {
+  selectedArchived = false;
+  viewingArchived = false;
+  archivedThreads = [];
+  projectCatalog = [];
+  if (sidebarMenu) closeSidebarMenu();
+  if (managementDialog?.open) managementDialog.close();
+  saveDraft();
   closeEvents();
   closeComposerMenu();
   closeImageViewer();
@@ -265,8 +384,10 @@ function showAuth(message = "") {
   approvalTray.replaceChildren();
   approvalTray.hidden = true;
   conversationTitle.textContent = "选择一个会话";
+  conversationTitle.title = "";
+  conversationActions.open = false;
   conversationMeta.textContent = "连接到电脑上的 Codex";
-  setConversationPlaceholder("从左侧选择一个会话", "消息和任务状态会自动更新。");
+  setConversationPlaceholder("继续工作", "Codex Pocket");
   updateComposer();
   bootScreen.hidden = true;
   app.hidden = true;
@@ -303,10 +424,27 @@ function setConnection(status = {}) {
     starting: "启动中",
     connecting: "连接中",
     disconnected: "已断开",
+    offline: "离线",
     error: "异常",
   };
   connectionLabel.textContent = labels[state] || state;
   connectionState.title = status.error || labels[state] || state;
+  transportState = state;
+  if (networkBanner) {
+    networkBanner.hidden = state === "ready";
+    networkBanner.dataset.state = state;
+    const messages = {
+      offline: "网络已断开，文字草稿保留在本机",
+      disconnected: "连接中断，正在重连",
+      connecting: "正在同步电脑端状态…",
+      starting: "电脑端正在启动…",
+      error: "电脑端连接异常，请重试",
+    };
+    networkMessage.textContent = messages[state] || "正在连接…";
+    reconnectButton.hidden = state === "starting" || state === "connecting";
+    reconnectButton.disabled = networkOffline();
+  }
+  updateComposer();
 }
 
 function formatTime(timestamp) {
@@ -335,13 +473,14 @@ function setThreadActionStatus(message = "", state = "") {
   threadActionStatus.dataset.state = state;
 }
 
-async function createProjectThread(projectName, projectThreadId) {
-  if (!projectThreadId || creatingProjects.has(projectThreadId)) return;
-  creatingProjects.add(projectThreadId);
+async function createProjectThread(projectName, projectThreadId, projectId) {
+  const key = projectId || projectThreadId;
+  if (!key || creatingProjects.has(key)) return;
+  creatingProjects.add(key);
   setThreadActionStatus(`正在为 ${projectName} 新建会话`, "loading");
   renderThreads();
   try {
-    const result = await postJson("/api/threads", { projectThreadId });
+    const result = await postJson("/api/threads", projectId ? { projectId } : { projectThreadId });
     if (!result.thread?.id) throw new Error("新会话响应无效");
     threads = [result.thread, ...threads.filter((thread) => thread.id !== result.thread.id)];
     setThreadActionStatus();
@@ -351,17 +490,166 @@ async function createProjectThread(projectName, projectThreadId) {
     if (handleUnauthorized(error)) return;
     setThreadActionStatus(error.message, "error");
   } finally {
-    creatingProjects.delete(projectThreadId);
+    creatingProjects.delete(key);
     renderThreads();
   }
 }
 
+function closeSidebarMenu(restoreFocus = false) {
+  sidebarMenu.hidden = true;
+  sidebarMenuTrigger?.setAttribute("aria-expanded", "false");
+  if (restoreFocus) sidebarMenuTrigger?.focus();
+}
+
+function openManagementDialog(kind, target = {}) {
+  closeSidebarMenu();
+  managementAction = { kind, target, idempotencyKey: createClientMessageId() };
+  document.querySelector("#management-title").textContent = kind === "create-project" ? "新建项目" : kind === "rename-project" ? "重命名项目" : "重命名会话";
+  managementNameInput.value = target.name || target.title || "";
+  managementPathInput.value = "";
+  managementPathInput.required = kind === "create-project";
+  document.querySelector("#management-path-field").hidden = kind !== "create-project";
+  managementSubmit.textContent = kind === "create-project" ? "创建" : "保存";
+  managementError.textContent = "";
+  managementDialog.showModal();
+  managementNameInput.focus();
+  managementNameInput.select();
+}
+
+async function loadArchived(append = false) {
+  if (archivedLoading) return;
+  archivedLoading = true;
+  archivedMore.disabled = true;
+  setThreadActionStatus("正在读取已归档会话", "loading");
+  try {
+    const result = await requestJson(`/api/threads?archived=true${append && archivedCursor ? `&cursor=${encodeURIComponent(archivedCursor)}` : ""}`);
+    const entries = (result.threads || []).map((thread) => ({ ...thread, archived: true }));
+    archivedThreads = [...new Map([...(append ? archivedThreads : []), ...entries].map((thread) => [thread.id, thread])).values()];
+    archivedCursor = result.nextCursor;
+    setThreadActionStatus();
+  } catch (error) {
+    if (!handleUnauthorized(error)) setThreadActionStatus(error.message, "error");
+  } finally {
+    archivedLoading = false;
+    archivedMore.disabled = false;
+    renderThreads();
+  }
+}
+
+async function manageItem(kind, target, value = {}) {
+  if (managementPending) return;
+  managementPending = true;
+  managementSubmit.disabled = true;
+  managementError.textContent = "";
+  closeSidebarMenu();
+  const [action, type] = kind.split("-");
+  try {
+    const endpoint = kind === "create-project" ? "/api/projects" : `/api/${type === "project" ? "projects" : "threads"}/${encodeURIComponent(target.id)}/${action}`;
+    const result = await postJson(endpoint, value);
+    if (type === "project") {
+      projectCatalog = projectCatalog.some((project) => project.id === result.project.id)
+        ? projectCatalog.map((project) => project.id === result.project.id ? result.project : project)
+        : [...projectCatalog, result.project];
+      if (kind === "create-project") {
+        viewingArchived = false;
+        openedProjects.add(result.project.id);
+      }
+    } else {
+      if (action === "rename") {
+        const rename = (thread) => thread.id === target.id ? { ...thread, title: value.name.trim() } : thread;
+        threads = threads.map(rename);
+        archivedThreads = archivedThreads.map(rename);
+        if (currentThread?.id === target.id) renderThread(rename(currentThread), { authoritativeSnapshot: false });
+      } else if (action === "archive") {
+        threads = threads.filter((thread) => thread.id !== target.id);
+        archivedThreads = [{ ...target, archived: true }, ...archivedThreads.filter((thread) => thread.id !== target.id)];
+        if (selectedThreadId === target.id) { saveDraft(); selectedArchived = true; updateComposer(); }
+      } else {
+        archivedThreads = archivedThreads.filter((thread) => thread.id !== target.id);
+        threads = [{ ...target, archived: false }, ...threads.filter((thread) => thread.id !== target.id)];
+        if (selectedThreadId === target.id) { selectedArchived = false; updateComposer(); }
+      }
+    }
+    if (managementDialog.open) managementDialog.close();
+    setThreadActionStatus(action === "archive" ? "已归档，可在已归档列表恢复" : action === "restore" ? "已恢复" : "");
+    renderThreads();
+  } catch (error) {
+    if (handleUnauthorized(error)) return;
+    if (managementDialog.open) managementError.textContent = error.message;
+    else setThreadActionStatus(error.message, "error");
+  } finally {
+    managementPending = false;
+    managementSubmit.disabled = false;
+  }
+}
+
+function sidebarMenuButton(type, target) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "project-create sidebar-more";
+  button.append(createIcon(["M5 12h.01M12 12h.01M19 12h.01"]));
+  button.setAttribute("aria-label", `${type === "project" ? "项目" : "会话"}操作：${target.name || target.title}`);
+  button.title = button.getAttribute("aria-label");
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", () => {
+    if (!sidebarMenu.hidden && sidebarMenuTrigger === button) return closeSidebarMenu(true);
+    closeSidebarMenu();
+    sidebarMenuTrigger = button;
+    button.setAttribute("aria-expanded", "true");
+    sidebarMenu.replaceChildren();
+    const heading = document.createElement("div");
+    heading.className = "sidebar-menu-info";
+    heading.textContent = target.name || target.title;
+    if (type === "project" && target.roots?.length) {
+      const roots = document.createElement("span");
+      roots.textContent = target.roots.join("\n");
+      heading.append(roots);
+    }
+    sidebarMenu.append(heading);
+    const add = (label, handler, disabled = false) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.setAttribute("role", "menuitem");
+      item.textContent = label;
+      item.disabled = disabled;
+      item.addEventListener("click", handler);
+      sidebarMenu.append(item);
+    };
+    if (type === "project" && !target.archived) add("新建会话", () => { closeSidebarMenu(); void createProjectThread(target.name, null, target.id); });
+    add("重命名", () => openManagementDialog(`rename-${type}`, target));
+    add(target.archived ? "恢复" : type === "project" ? "在 Pocket 中归档" : "归档", () => void manageItem(`${target.archived ? "restore" : "archive"}-${type}`, target), type === "thread" && !target.archived && (target.status === "active" || sendingThreads.has(target.id)));
+    sidebarMenu.hidden = false;
+    const bounds = button.getBoundingClientRect();
+    const menuBounds = sidebarMenu.getBoundingClientRect();
+    sidebarMenu.style.left = `${Math.max(8, Math.min(bounds.right, innerWidth - menuBounds.width - 8))}px`;
+    sidebarMenu.style.top = `${Math.max(8, Math.min(bounds.top, innerHeight - menuBounds.height - 8))}px`;
+    sidebarMenu.querySelector("button:not(:disabled)")?.focus();
+  });
+  return button;
+}
+
 function renderThreads() {
   const query = threadSearch.value.trim().toLocaleLowerCase();
-  const visible = threads.filter((thread) => {
+  const signature = JSON.stringify([threads, query, selectedThreadId, [...creatingProjects],
+    [...collapsedProjects], [...openedProjects], [...expandedProjectLists], projectCatalog, viewingArchived, archivedThreads]);
+  if (sidebarSignature === signature) return;
+  sidebarSignature = signature;
+  const scrollTop = threadList.scrollTop;
+  const catalog = new Map(projectCatalog.map((project) => [project.id, project]));
+  const sourceThreads = viewingArchived
+    ? [...archivedThreads, ...threads.filter((thread) => catalog.get(thread.projectId)?.archived)]
+    : threads.filter((thread) => !catalog.get(thread.projectId)?.archived);
+  const visible = sourceThreads.map((thread) => ({ ...thread, project: catalog.get(thread.projectId)?.name || thread.project })).filter((thread) => {
     if (!query) return true;
     return `${thread.title} ${thread.preview} ${thread.project}`.toLocaleLowerCase().includes(query);
   });
+  archivedButton?.setAttribute("aria-pressed", String(viewingArchived));
+  const sectionTitle = document.querySelector("#sidebar-section-title");
+  if (sectionTitle) sectionTitle.textContent = viewingArchived ? "已归档" : "项目";
+  const newProjectButton = document.querySelector("#new-project-button");
+  if (newProjectButton) newProjectButton.disabled = !projectsSupported;
+  if (archivedMore) archivedMore.hidden = !viewingArchived || !archivedCursor;
 
   threadList.replaceChildren();
   threadList.hidden = visible.length === 0;
@@ -371,14 +659,26 @@ function renderThreads() {
     ? "换一个关键词再试。"
     : "在电脑上打开 Codex 并开始对话。";
   const projects = new Map();
-  for (const thread of visible) {
-    const projectName = thread.project?.trim() || "其他项目";
-    const projectThreads = projects.get(projectName) || [];
-    projectThreads.push(thread);
-    projects.set(projectName, projectThreads);
+  for (const project of projectCatalog) {
+    if (project.archived === viewingArchived && (!query || project.name.toLocaleLowerCase().includes(query))) projects.set(project.id, []);
   }
+  for (const thread of visible) {
+    const projectKey = thread.projectId || thread.project?.trim() || "其他项目";
+    const projectThreads = projects.get(projectKey) || [];
+    projectThreads.push(thread);
+    projects.set(projectKey, projectThreads);
+  }
+  threadList.hidden = projects.size === 0;
+  threadEmpty.hidden = projects.size > 0;
+  if (viewingArchived && !query) threadEmptyTitle.textContent = "暂无已归档内容";
 
-  for (const [projectName, projectThreads] of projects) {
+  for (const [projectKey, projectThreads] of projects) {
+    const project = catalog.get(projectKey);
+    const projectName = project?.name || projectThreads[0]?.project || projectKey;
+    const currentProject = projectThreads.some((thread) => thread.id === selectedThreadId);
+    const defaultOpen = currentProject || (!selectedThreadId && projectKey === projects.keys().next().value);
+    const collapsed = !query && (collapsedProjects.has(projectKey)
+      || (!defaultOpen && !openedProjects.has(projectKey)));
     const group = document.createElement("section");
     group.className = "project-group";
     group.setAttribute("aria-label", projectName);
@@ -390,7 +690,7 @@ function renderThreads() {
     toggle.type = "button";
     toggle.className = "project-toggle";
 
-    const folder = createSidebarIcon("folder");
+    const folder = createSidebarIcon(collapsed ? "folder" : "folder-open");
     folder.classList.add("project-folder-icon");
     const name = document.createElement("span");
     name.className = "project-name";
@@ -400,19 +700,22 @@ function renderThreads() {
     const createButton = document.createElement("button");
     createButton.type = "button";
     createButton.className = "project-create";
-    createButton.append(createSidebarIcon("plus"));
+    createButton.append(createSidebarIcon("compose"));
     createButton.setAttribute("aria-label", `在 ${projectName} 中新建会话`);
     createButton.title = `在 ${projectName} 中新建会话`;
-    createButton.disabled = creatingProjects.has(projectThreads[0]?.id);
+    createButton.disabled = Boolean(project?.archived) || creatingProjects.has(project?.id || projectThreads[0]?.id);
     createButton.setAttribute("aria-busy", String(createButton.disabled));
     createButton.addEventListener("click", () => {
-      void createProjectThread(projectName, projectThreads[0]?.id);
+      void createProjectThread(projectName, projectThreads[0]?.id, project?.id);
     });
     header.append(toggle, createButton);
+    if (project) {
+      header.classList.add("has-project-menu");
+      header.append(sidebarMenuButton("project", project));
+    }
 
     const items = document.createElement("div");
     items.className = "project-threads";
-    const collapsed = !query && collapsedProjects.has(projectName);
     toggle.setAttribute("aria-expanded", String(!collapsed));
     toggle.title = collapsed ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
     items.hidden = collapsed;
@@ -423,11 +726,25 @@ function renderThreads() {
       toggle.setAttribute("aria-expanded", String(!expanded));
       toggle.title = expanded ? `展开项目：${projectName}` : `折叠项目：${projectName}`;
       items.hidden = expanded;
-      if (expanded) collapsedProjects.add(projectName);
-      else collapsedProjects.delete(projectName);
+      const nextFolder = createSidebarIcon(expanded ? "folder" : "folder-open");
+      nextFolder.classList.add("project-folder-icon");
+      toggle.replaceChildren(nextFolder, name);
+      if (expanded) {
+        collapsedProjects.add(projectKey);
+        openedProjects.delete(projectKey);
+      } else {
+        collapsedProjects.delete(projectKey);
+        openedProjects.add(projectKey);
+      }
     });
 
-    for (const thread of projectThreads) {
+    const showAll = Boolean(query) || expandedProjectLists.has(projectKey);
+    let displayedThreads = showAll ? projectThreads : projectThreads.slice(0, PROJECT_THREAD_PREVIEW_COUNT);
+    const selected = projectThreads.find((thread) => thread.id === selectedThreadId);
+    if (!showAll && selected && !displayedThreads.includes(selected)) {
+      displayedThreads = [...displayedThreads.slice(0, PROJECT_THREAD_PREVIEW_COUNT - 1), selected];
+    }
+    for (const thread of displayedThreads) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "thread-row";
@@ -447,13 +764,35 @@ function renderThreads() {
       button.title = [thread.title, thread.preview].filter(Boolean).join("\n");
 
       button.append(title, state);
-      button.addEventListener("click", () => selectThread(thread.id));
-      items.append(button);
+      button.addEventListener("click", () => { selectedArchived = Boolean(thread.archived); return selectThread(thread.id); });
+      const row = document.createElement("div");
+      row.className = "thread-entry";
+      row.append(button, sidebarMenuButton("thread", thread));
+      items.append(row);
+    }
+
+    if (!query && projectThreads.length > PROJECT_THREAD_PREVIEW_COUNT) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "project-show-more";
+      more.textContent = showAll ? "收起显示" : "展开显示";
+      more.setAttribute("aria-expanded", String(showAll));
+      more.setAttribute("aria-label", `${more.textContent}：${projectName}`);
+      more.addEventListener("click", () => {
+        if (showAll) expandedProjectLists.delete(projectKey);
+        else expandedProjectLists.add(projectKey);
+        renderThreads();
+        const updated = [...threadList.children].find((item) => item.getAttribute("aria-label") === projectName);
+        const updatedItems = updated?.children[1];
+        if (updatedItems) [...updatedItems.children].at(-1)?.focus({ preventScroll: true });
+      });
+      items.append(more);
     }
 
     group.append(header, items);
     threadList.append(group);
   }
+  threadList.scrollTop = scrollTop;
 }
 
 function messageLabel(message) {
@@ -534,11 +873,29 @@ function activityStatusLabel(status) {
   }[status] || "";
 }
 
-function renderActivityGroup(message) {
+function renderActivityGroup(message, expanded = false) {
   const article = document.createElement("article");
   article.className = "message";
   article.dataset.role = "system";
   article.dataset.kind = "activityGroup";
+  const details = document.createElement("details");
+  details.className = "activity-disclosure";
+  details.open = expanded;
+  const summary = document.createElement("summary");
+  summary.className = "activity-summary";
+  const running = message.activities.some((activity) =>
+    ["inProgress", "running"].includes(activity.activityStatus));
+  const icon = document.createElement("span");
+  icon.className = "activity-summary-icon";
+  icon.append(createActivityIcon(running ? "context" : "command"));
+  const label = document.createElement("span");
+  label.className = "activity-summary-label";
+  label.textContent = `${running ? "正在处理" : "已处理"} ${message.activities.length} 项操作`;
+  const chevron = document.createElement("span");
+  chevron.className = "reasoning-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  summary.append(icon, label, chevron);
+  details.append(summary);
   const list = document.createElement("div");
   list.className = "activity-list";
   list.setAttribute("role", "list");
@@ -579,7 +936,8 @@ function renderActivityGroup(message) {
     }
     list.append(row);
   }
-  article.append(list);
+  details.append(list);
+  article.append(details);
   return article;
 }
 
@@ -770,6 +1128,11 @@ function effortLabel(value) {
   return EFFORT_LABELS[value] || value || "强度";
 }
 
+function modelDisplayName(model) {
+  const name = model?.name || "模型";
+  return /^GPT[- ]\d/i.test(name) ? name.replace(/^GPT[- ]/i, "").replaceAll("-", " ") : name;
+}
+
 function activeGoal() {
   const goal = composerCatalog?.goal;
   return goal && !["complete"].includes(goal.status) ? goal : null;
@@ -808,6 +1171,7 @@ function applyComposerCatalog(value) {
 
 function controlIsBusy() {
   return goalUpdating
+    || permissionUpdatingThreads.has(selectedThreadId)
     || sendingThreads.has(selectedThreadId)
     || interruptingThreads.has(selectedThreadId);
 }
@@ -818,8 +1182,10 @@ function updateComposerControlAvailability() {
   const hasModels = Boolean(composerCatalog?.models?.length);
   const ready = currentThread?.id === selectedThreadId;
   modelControl.disabled = busy || running || !hasModels;
-  effortControl.disabled = busy || running || !selectedModel()?.efforts?.length;
+  permissionControl.disabled = busy || running || Boolean(currentThread?.control?.queued)
+    || !ready || !composerCatalog?.permissions?.supported;
   skillControl.disabled = busy || !composerCatalog?.features?.skills;
+  for (const button of extrasSkills?.children || []) button.disabled = skillControl.disabled;
   imageUploadButton.disabled = busy
     || !ready
     || !selectedModelSupportsImages()
@@ -833,6 +1199,15 @@ function updateComposerControlAvailability() {
   }
   goalComplete.disabled = busy || running || !activeGoal();
   goalClear.disabled = busy || running || !activeGoal();
+  if (["settings", "model"].includes(composerMenuKind)) {
+    for (const button of composerMenu.querySelectorAll?.(".model-picker-summary, .composer-menu-item") || []) {
+      button.disabled = modelControl.disabled;
+    }
+    const slider = composerMenu.querySelector?.(".effort-slider");
+    const reset = composerMenu.querySelector?.(".model-picker-reset");
+    if (slider) slider.disabled = modelControl.disabled || selectedModel().efforts.length < 2;
+    if (reset) reset.disabled = modelControl.disabled || !selectedModel().efforts.length;
+  }
 }
 
 function renderSelectedSkills() {
@@ -859,15 +1234,21 @@ function renderSelectedSkills() {
 
 function renderComposerControls() {
   const model = selectedModel();
-  modelLabel.textContent = model?.name || "模型";
-  modelControl.title = model?.description || "选择模型";
+  modelLabel.textContent = modelDisplayName(model);
+  modelControl.title = "模型与思考强度";
+  modelControl.setAttribute("aria-label", `模型与思考强度：${model?.name || "模型"}，${effortLabel(composerSelection.effort)}`);
+  const permissions = composerCatalog?.permissions;
+  const permission = permissions?.options?.find((item) => item.id === permissions.current);
+  permissionLabel.textContent = permission?.shortName || (permissions?.supported ? "自定义" : "权限");
+  permissionControl.title = permissions?.supported ? "更改权限" : "当前 Codex 未提供权限切换";
+  permissionControl.dataset.mode = permissions?.current || "custom";
   effortLabelNode.textContent = effortLabel(composerSelection.effort);
-  effortControl.title = "选择推理强度";
 
   for (const button of modeControl.children) {
     const selected = button.dataset.mode === composerSelection.mode;
     button.setAttribute("aria-checked", String(selected));
     button.dataset.selected = String(selected);
+    button.hidden = button.dataset.mode === "default" && composerSelection.mode === "default";
   }
 
   const goal = activeGoal();
@@ -876,17 +1257,18 @@ function renderComposerControls() {
   goalBanner.dataset.status = goal?.status || "";
 
   const skillTotal = composerSelection.skillNames?.length || 0;
-  skillLabel.textContent = "Skills";
+  skillLabel.textContent = extrasSkillsExpanded ? "收起技能" : "全部技能";
   skillCount.hidden = skillTotal === 0;
   skillCount.textContent = skillTotal ? String(skillTotal) : "";
   renderSelectedSkills();
   renderPendingImages();
+  if (composerExtras?.hidden === false) renderExtrasSkills();
 
   messageInput.placeholder = composerSelection.mode === "plan"
     ? "描述要规划的任务"
     : composerSelection.mode === "goal"
       ? (goal ? "继续推进这个目标" : "描述要持续推进的目标")
-      : "给 Codex 发送消息";
+      : "随心输入";
   updateComposerControlAvailability();
   if (composerMenuKind) renderComposerMenu(composerMenuKind);
 }
@@ -896,11 +1278,14 @@ function setControlExpanded(control, expanded) {
 }
 
 function closeComposerMenu() {
+  extrasSkillsExpanded = false;
+  if (composerExtras) composerExtras.hidden = true;
+  extrasButton?.setAttribute("aria-expanded", "false");
   composerMenuKind = "";
   composerMenu.hidden = true;
   composerMenu.replaceChildren();
   setControlExpanded(modelControl, false);
-  setControlExpanded(effortControl, false);
+  setControlExpanded(permissionControl, false);
   setControlExpanded(skillControl, false);
 }
 
@@ -944,16 +1329,26 @@ function choiceRow(title, description, selected) {
 }
 
 function renderModelMenu() {
-  composerMenu.append(menuHeader("模型"));
+  const header = document.createElement("div");
+  header.className = "model-menu-heading";
+  header.textContent = "Select model";
+  composerMenu.append(header);
   const list = document.createElement("div");
   list.className = "composer-menu-list";
   for (const model of composerCatalog?.models || []) {
     const row = choiceRow(
-      model.name,
-      model.specialty || model.description,
+      modelDisplayName(model),
+      "",
       model.id === composerSelection.model,
     );
-    row.addEventListener("click", () => {
+    const check = row.children[1];
+    check.replaceChildren();
+    if (model.id === composerSelection.model) check.append(createIcon(["M20 6 9 17l-5-5"]));
+    row.disabled = modelControl.disabled;
+    row.setAttribute("role", "radio");
+    row.setAttribute("aria-checked", String(model.id === composerSelection.model));
+    row.addEventListener("click", (event) => {
+      if (modelControl.disabled) return;
       composerSelection.model = model.id;
       if (!model.efforts.some((effort) => effort.id === composerSelection.effort)) {
         composerSelection.effort = model.defaultEffort || model.efforts[0]?.id || "";
@@ -964,33 +1359,170 @@ function renderModelMenu() {
         composerError = "";
       }
       persistComposerSelection();
-      closeComposerMenu();
+      composerMenuKind = "settings";
       renderComposerControls();
       updateComposer();
+      if (event?.detail === 0) composerMenu.querySelector?.(".model-picker-summary")?.focus();
     });
     list.append(row);
   }
+  list.setAttribute("role", "radiogroup");
+  list.setAttribute("aria-label", "模型");
   composerMenu.append(list);
 }
 
-function renderEffortMenu() {
-  composerMenu.append(menuHeader("推理强度"));
-  const list = document.createElement("div");
-  list.className = "composer-menu-list";
-  for (const effort of selectedModel()?.efforts || []) {
-    const row = choiceRow(
-      effortLabel(effort.id),
-      effort.description,
-      effort.id === composerSelection.effort,
-    );
-    row.addEventListener("click", () => {
+function renderModelSettings() {
+  const model = selectedModel();
+  const efforts = model?.efforts || [];
+  const panel = document.createElement("div");
+  panel.className = "model-settings-panel";
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "model-picker-summary";
+  summary.title = "切换模型";
+  summary.setAttribute("aria-label", "切换模型");
+  summary.disabled = modelControl.disabled;
+  const strength = document.createElement("span");
+  strength.className = "model-picker-strength";
+  const name = document.createElement("span");
+  name.className = "model-picker-name";
+  name.textContent = modelDisplayName(model);
+  summary.append(strength, name);
+  summary.addEventListener("click", () => toggleComposerMenu("model"));
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "model-picker-reset";
+  reset.title = "恢复默认思考强度";
+  reset.setAttribute("aria-label", "恢复默认思考强度");
+  reset.disabled = modelControl.disabled || !efforts.length;
+  // Lucide rotate-ccw icon, matching the existing inline icon convention.
+  reset.append(createIcon(["M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8", "M3 3v5h5"]));
+  const track = document.createElement("div");
+  track.className = "effort-slider-track";
+  const shimmer = document.createElement("div");
+  shimmer.className = "effort-slider-shimmer";
+  shimmer.setAttribute("aria-hidden", "true");
+  for (const [x, y] of [[7, 42], [9, 30], [14, 57], [19, 35], [31, 42], [44, 52], [52, 28], [52, 61], [60, 37], [64, 45], [77, 39], [88, 64]]) {
+    const spark = document.createElement("span");
+    spark.style.setProperty("--spark-x", `${x}%`);
+    spark.style.setProperty("--spark-y", `${y}%`);
+    spark.style.setProperty("--spark-delay", `${-x / 20}s`);
+    shimmer.append(spark);
+  }
+  const thumb = document.createElement("span");
+  thumb.className = "effort-slider-thumb";
+  thumb.setAttribute("aria-hidden", "true");
+  const dots = document.createElement("div");
+  dots.className = "effort-slider-dots";
+  dots.setAttribute("aria-hidden", "true");
+  for (const effort of efforts) {
+    const dot = document.createElement("span");
+    dot.title = effortLabel(effort.id);
+    dots.append(dot);
+  }
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.className = "effort-slider";
+  slider.min = "0";
+  slider.max = String(Math.max(0, efforts.length - 1));
+  slider.step = "0.001";
+  slider.disabled = modelControl.disabled || efforts.length < 2;
+  slider.setAttribute("aria-label", "思考强度");
+  function sync(position) {
+    const index = Math.max(0, efforts.findIndex((effort) => effort.id === composerSelection.effort));
+    const label = effortLabel(composerSelection.effort);
+    slider.value = String(position ?? index);
+    slider.setAttribute("aria-valuetext", label);
+    slider.title = efforts[index]?.description || label;
+    track.style.setProperty("--effort-progress", String(efforts.length > 1 ? (position ?? index) / (efforts.length - 1) : 0));
+    panel.dataset.effort = composerSelection.effort;
+    strength.textContent = label;
+    effortLabelNode.textContent = label;
+    modelControl.setAttribute("aria-label", `模型与思考强度：${model?.name || "模型"}，${label}`);
+  }
+  function selectPosition(position) {
+    const effort = efforts[Math.round(position)];
+    if (modelControl.disabled || slider.disabled || !effort) return;
+    if (composerSelection.effort !== effort.id) {
       composerSelection.effort = effort.id;
       persistComposerSelection();
-      closeComposerMenu();
+    }
+    sync(position);
+  }
+  slider.addEventListener("pointerdown", () => { track.dataset.dragging = "true"; });
+  slider.addEventListener("input", () => {
+    selectPosition(Number(slider.value));
+  });
+  function settle() {
+    track.dataset.dragging = "false";
+    sync();
+  }
+  slider.addEventListener("change", settle);
+  slider.addEventListener("pointerup", settle);
+  slider.addEventListener("pointercancel", settle);
+  slider.addEventListener("blur", settle);
+  slider.addEventListener("keydown", (event) => {
+    const index = Math.round(Number(slider.value));
+    const positions = { ArrowRight: index + 1, ArrowUp: index + 1, ArrowLeft: index - 1, ArrowDown: index - 1, Home: 0, End: efforts.length - 1, PageUp: index + 2, PageDown: index - 2 };
+    if (!(event.key in positions) || slider.disabled) return;
+    event.preventDefault();
+    selectPosition(Math.max(0, Math.min(efforts.length - 1, positions[event.key])));
+  });
+  reset.addEventListener("click", () => {
+    if (modelControl.disabled || !efforts.length) return;
+    composerSelection.effort = model.defaultEffort || efforts[0].id;
+    persistComposerSelection();
+    sync();
+  });
+  sync();
+  track.append(shimmer, dots, thumb, slider);
+  panel.append(summary, reset, track);
+  composerMenu.append(panel);
+}
+
+async function changePermissions(mode) {
+  if (permissionControl.disabled) return;
+  const threadId = selectedThreadId;
+  permissionUpdatingThreads.add(threadId);
+  closeComposerMenu();
+  updateComposer();
+  try {
+    const result = await postJson(`/api/threads/${encodeURIComponent(threadId)}/permissions`, { mode });
+    if (selectedThreadId === threadId && composerCatalog) {
+      composerCatalog.permissions = result.permissions;
+      composerError = "";
+    }
+  } catch (error) {
+    if (handleUnauthorized(error)) return;
+    if (selectedThreadId === threadId) composerError = error.message;
+  } finally {
+    permissionUpdatingThreads.delete(threadId);
+    if (selectedThreadId === threadId) {
       renderComposerControls();
-    });
+      updateComposer();
+    }
+  }
+}
+
+function renderPermissionMenu() {
+  composerMenu.append(menuHeader("应如何批准 Codex 操作？"));
+  const list = document.createElement("div");
+  list.className = "composer-menu-list";
+  const permissions = composerCatalog?.permissions;
+  if (permissions?.current === "custom") {
+    const row = choiceRow("自定义 (config.toml)", "使用根据你的配置解析出的权限", true);
+    row.disabled = true;
     list.append(row);
   }
+  for (const option of permissions?.options || []) {
+    const row = choiceRow(option.name, option.allowed ? option.description : "权限模式不可用", option.id === permissions.current);
+    row.disabled = !option.allowed;
+    row.setAttribute("role", "menuitemradio");
+    row.setAttribute("aria-checked", String(option.id === permissions.current));
+    row.addEventListener("click", () => changePermissions(option.id));
+    list.append(row);
+  }
+  list.setAttribute("role", "menu");
   composerMenu.append(list);
 }
 
@@ -1035,17 +1567,88 @@ function renderSkillMenu() {
 
 function renderComposerMenu(kind) {
   composerMenu.replaceChildren();
+  composerMenu.dataset.kind = kind;
+  composerMenu.setAttribute("aria-label", kind === "settings" ? "模型与思考强度" : kind === "model" ? "模型" : kind === "skills" ? "Skills" : "权限");
   if (kind === "model") renderModelMenu();
-  else if (kind === "effort") renderEffortMenu();
+  else if (kind === "settings") renderModelSettings();
   else if (kind === "skills") renderSkillMenu();
+  else if (kind === "permissions") renderPermissionMenu();
   composerMenu.hidden = false;
+  positionModelMenu();
+}
+
+function positionModelMenu() {
+  positionExtrasMenu();
+  if (!["settings", "model"].includes(composerMenuKind)) return;
+  const shell = composer.getBoundingClientRect?.();
+  const button = modelControl.getBoundingClientRect?.();
+  if (!shell || !button) return;
+  const width = Math.min(300, shell.width - 20);
+  const right = Math.max(10, Math.min(shell.right - button.right, shell.width - width - 10));
+  composerMenu.style.setProperty("--picker-right", `${right}px`);
+  composerMenu.style.setProperty("--picker-bottom", `${shell.bottom - button.top + 4}px`);
+}
+
+function positionExtrasMenu() {
+  if (!composerExtras || composerExtras.hidden) return;
+  const box = document.querySelector(".composer-box")?.getBoundingClientRect?.();
+  const shell = composer.getBoundingClientRect?.();
+  if (!box || !shell) return;
+  composerExtras.style.setProperty("--extras-left", `${box.left - shell.left}px`);
+  composerExtras.style.setProperty("--extras-width", `${box.width}px`);
+  composerExtras.style.setProperty("--extras-bottom", `${shell.bottom - box.top + 4}px`);
+}
+
+function renderExtrasSkills() {
+  if (!extrasSkills) return;
+  extrasSkills.replaceChildren();
+  const skills = (composerCatalog?.skills || []).filter((item) => item.enabled);
+  skillControl.hidden = skills.length <= 6;
+  skillLabel.textContent = extrasSkillsExpanded ? "收起技能" : "全部技能";
+  setControlExpanded(skillControl, extrasSkillsExpanded);
+  const presentation = {
+    documents: ["Documents", "blue"], pdf: ["PDF", "red"],
+    spreadsheets: ["Spreadsheets", "green"], presentations: ["Presentations", "amber"],
+  };
+  for (const skill of extrasSkillsExpanded ? skills : skills.slice(0, 6)) {
+    const key = skill.name.split(":").pop().toLowerCase();
+    const [label, tone] = presentation[key] || [skill.name, "neutral"];
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "extras-menu-row extras-skill-row";
+    row.dataset.tone = tone;
+    row.disabled = skillControl.disabled;
+    row.setAttribute("role", "checkbox");
+    row.setAttribute("aria-checked", String(composerSelection.skillNames.includes(skill.name)));
+    row.title = skill.description || skill.name;
+    const icon = createIcon(["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z", "M14 2v6h6", "M8 13h8M8 17h6"]);
+    icon.classList.add("extras-skill-icon");
+    const name = document.createElement("span");
+    name.className = "extras-skill-name";
+    name.textContent = label;
+    row.append(icon, name);
+    if (composerSelection.skillNames.includes(skill.name)) {
+      const check = createIcon(["M20 6 9 17l-5-5"]);
+      check.classList.add("extras-row-check");
+      row.append(check);
+    }
+    row.addEventListener("click", () => {
+      if (skillControl.disabled) return;
+      toggleSkill(skill.name);
+      closeComposerMenu();
+      messageInput.focus();
+    });
+    extrasSkills.append(row);
+  }
 }
 
 function toggleComposerMenu(kind) {
+  if (composerExtras) composerExtras.hidden = true;
+  extrasButton?.setAttribute("aria-expanded", "false");
   if (composerMenuKind === kind) return closeComposerMenu();
   composerMenuKind = kind;
-  setControlExpanded(modelControl, kind === "model");
-  setControlExpanded(effortControl, kind === "effort");
+  setControlExpanded(modelControl, kind === "model" || kind === "settings");
+  setControlExpanded(permissionControl, kind === "permissions");
   setControlExpanded(skillControl, kind === "skills");
   renderComposerMenu(kind);
 }
@@ -1148,7 +1751,7 @@ function updateComposer() {
     && composerSelection.mode === "goal"
     && !messageInput.value.trim();
   const action = running ? runningMessageAction : "start";
-  composer.hidden = !selectedThreadId;
+  composer.hidden = !selectedThreadId || selectedArchived;
   messageInput.disabled = !selectedThreadId || !ready || sending || interrupting || goalUpdating;
   deliveryControl.hidden = !running;
   for (const button of deliveryControl.children) {
@@ -1168,7 +1771,10 @@ function updateComposer() {
     : action === "steer" ? "Steer 当前任务" : "发送消息";
   sendButton.setAttribute("aria-label", sendLabel);
   sendButton.title = sendLabel;
-  sendButton.disabled = !selectedThreadId
+  sendButton.disabled = !selectedThreadId || selectedArchived
+    || permissionUpdatingThreads.has(selectedThreadId)
+    || networkOffline()
+    || ["offline", "disconnected", "error"].includes(transportState)
     || !ready
     || sending
     || interrupting
@@ -1187,6 +1793,9 @@ function updateComposer() {
   } else if (goalUpdating) {
     state = "sending";
     composerStatus.textContent = "正在更新目标";
+  } else if (permissionUpdatingThreads.has(selectedThreadId)) {
+    state = "sending";
+    composerStatus.textContent = "正在更改权限";
   } else if (uploadingImages) {
     state = "sending";
     composerStatus.textContent = "正在上传图片";
@@ -1220,6 +1829,9 @@ function updateComposer() {
 }
 
 function renderApprovals(requests = []) {
+  const signature = JSON.stringify([requests, [...resolvingRequests]]);
+  if (approvalSignature === signature) return;
+  approvalSignature = signature;
   approvalTray.replaceChildren();
   approvalTray.hidden = requests.length === 0;
 
@@ -1312,6 +1924,7 @@ function renderImageViewer() {
   imageViewerImage.alt = image.alt;
   imageViewerCaption.textContent = image.alt;
   const multiple = viewerImages.length > 1;
+  imageViewer.dataset.multiple = String(multiple);
   imageViewerPrev.hidden = !multiple;
   imageViewerNext.hidden = !multiple;
 }
@@ -1411,6 +2024,19 @@ function createMessageNode(message) {
   return record;
 }
 
+function updateMessageBody(record, message) {
+  const text = message.text || "";
+  const format = message.role === "assistant" || message.kind === "reasoning" ? "markdown" : "plain";
+  if (record.bodySource !== text || record.bodyFormat !== format) {
+    record.body.dataset.format = format;
+    if (format === "markdown") renderMarkdown(record.body, text);
+    else record.body.textContent = text;
+    record.bodySource = text;
+    record.bodyFormat = format;
+  }
+  record.body.hidden = !text;
+}
+
 function updateMessageNode(record, message) {
   record.article.dataset.role = message.role;
   record.article.dataset.kind = message.kind;
@@ -1426,8 +2052,7 @@ function updateMessageNode(record, message) {
   const time = formatTime(message.timestamp);
   if (record.author.textContent !== author) record.author.textContent = author;
   if (record.time.textContent !== time) record.time.textContent = time;
-  if (record.body.textContent !== message.text) record.body.textContent = message.text;
-  record.body.hidden = !message.text;
+  updateMessageBody(record, message);
   updateMessageImages(record, message.images);
 
   const receipt = message.role === "user"
@@ -1479,16 +2104,13 @@ function createReasoningNode(message) {
 function updateReasoningNode(record, message) {
   const status = message.activityStatus || "completed";
   const running = ["inProgress", "running"].includes(status);
-  const statusChanged = record.status !== status;
   record.article.dataset.role = "assistant";
   record.article.dataset.kind = "reasoning";
   record.article.dataset.status = status;
   record.spinner.hidden = !running;
   record.label.textContent = running ? "思考中" : "已思考";
-  record.body.hidden = !message.text;
-  if (record.body.textContent !== message.text) record.body.textContent = message.text;
-  if (statusChanged && running) record.details.open = true;
-  if (statusChanged && record.status && !running) record.details.open = false;
+  updateMessageBody(record, message);
+  // Thinking stays collapsed until the reader explicitly opens it.
   record.status = status;
 }
 
@@ -1514,51 +2136,78 @@ function messagesByCommand(messages) {
   return turns;
 }
 
-function historyTurnSummary(turn, index) {
-  const userMessage = turn.userMessage
-    || turn.messages.find((message) => message.role === "user");
-  const text = String(userMessage?.text || "").replace(/\s+/g, " ").trim();
-  if (text) return text;
-  if (userMessage?.images?.length) return "图片消息";
-  return `历史回合 ${index + 1}`;
+function processLabel(turn) {
+  const timings = (currentThread?.turns || []).filter((item) => turn.sourceTurnIds.has(item.id));
+  if (!timings.length || timings.some((item) => !Number.isFinite(item.durationMs) || item.durationMs < 0)) return "执行过程";
+  const seconds = Math.round(timings.reduce((total, item) => total + item.durationMs, 0) / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return `用时 ${minutes ? `${minutes}分` : ""}${seconds % 60}秒`;
 }
 
-function historyTurnNode(turn, index, articles, { context = false } = {}) {
+function processNode(turn, articles) {
+  const cached = historyNodes.get(turn.id);
+  if (cached) {
+    cached.title.textContent = processLabel(turn);
+    reconcileChildren(cached.content, articles);
+    return cached.details;
+  }
   const details = document.createElement("details");
-  details.className = context ? "history-turn history-context" : "history-turn";
-  details.dataset.commandId = context ? "" : turn.id;
+  details.className = "turn-process";
+  details.dataset.commandId = turn.id;
   details.dataset.turnId = [...turn.sourceTurnIds][0] || "";
   const expansionKey = `${selectedThreadId}\u0000${turn.id}`;
   details.open = expandedTurns.has(expansionKey);
 
   const summary = document.createElement("summary");
-  summary.className = "history-turn-summary";
+  summary.className = "turn-process-summary";
   const title = document.createElement("span");
-  title.className = "history-turn-title";
-  title.textContent = context ? "早期上下文" : historyTurnSummary(turn, index);
-  const meta = document.createElement("span");
-  meta.className = "history-turn-meta";
-  const time = formatTime(turn.userMessage?.timestamp || turn.messages[0]?.timestamp);
-  meta.textContent = [time || "历史", `${turn.messages.length} 条记录`].join(" · ");
-  summary.append(title, meta);
+  title.textContent = processLabel(turn);
+  const chevron = document.createElement("span");
+  chevron.className = "reasoning-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  summary.append(title, chevron);
 
   const content = document.createElement("div");
-  content.className = "history-turn-content";
+  content.className = "turn-process-content";
   content.append(...articles);
   details.append(summary, content);
   details.addEventListener("toggle", () => {
     if (details.open) expandedTurns.add(expansionKey);
     else expandedTurns.delete(expansionKey);
   });
+  historyNodes.set(turn.id, { details, title, content });
   return details;
+}
+
+function reconcileChildren(parent, children) {
+  if (typeof parent.insertBefore !== "function") {
+    parent.replaceChildren(...children);
+    return;
+  }
+  // Retain DOM identity so live snapshots do not interrupt selection or scrolling.
+  for (const [index, child] of children.entries()) {
+    if (parent.children[index] !== child) parent.insertBefore(child, parent.children[index] || null);
+  }
+  while (parent.children.length > children.length) parent.lastElementChild.remove();
 }
 
 function messageRecord(message) {
   let record = messageNodes.get(message.id);
   if (message.kind === "activityGroup") {
+    const signature = JSON.stringify(message);
+    if (record?.signature === signature) return record;
+    if (record?.kind === "activityGroup") {
+      const details = record.article.children[0];
+      const updated = renderActivityGroup(message).children[0];
+      reconcileChildren(details.children[0], [...updated.children[0].children]);
+      reconcileChildren(details.children[1], [...updated.children[1].children]);
+      record.signature = signature;
+      return record;
+    }
     record = {
       article: renderActivityGroup(message),
       kind: "activityGroup",
+      signature,
     };
     messageNodes.set(message.id, record);
   } else if (message.kind === "reasoning") {
@@ -1589,17 +2238,36 @@ function reconcileMessageNodes(messages) {
       return messageRecord(message).article;
     });
     const latest = index === turns.length - 1;
-    const active = activeTurnId && turn.sourceTurnIds.has(activeTurnId);
-    if (latest || active) ordered.push(...articles);
-    else ordered.push(historyTurnNode(turn, index, articles, {
-      context: !turn.userMessage,
-    }));
+    const active = currentThread?.control?.busy && (activeTurnId ? turn.sourceTurnIds.has(activeTurnId) : latest);
+    const hasResult = turn.messages.some((message) =>
+      (message.role === "assistant" && ["message", "image"].includes(message.kind)) || message.kind === "error");
+    const isProcess = (message) => ["commentary", "reasoning", "activityGroup", "plan"].includes(message.kind)
+      || (message.role === "system" && message.kind === "image");
+    const processArticles = articles.filter((_, i) => isProcess(turn.messages[i]));
+    if (active || !hasResult || !processArticles.length) {
+      ordered.push(...articles);
+      if (active && historyNodes.has(turn.id)) {
+        historyNodes.get(turn.id).details.open = false;
+        expandedTurns.delete(`${selectedThreadId}\u0000${turn.id}`);
+      }
+      continue;
+    }
+    // Move existing process nodes into one disclosure, retaining the answer's DOM.
+    let insertedProcess = false;
+    articles.forEach((article, i) => {
+      if (isProcess(turn.messages[i])) {
+        if (!insertedProcess) ordered.push(processNode(turn, processArticles));
+        insertedProcess = true;
+      } else ordered.push(article);
+    });
   }
 
   for (const id of messageNodes.keys()) {
     if (!visibleIds.has(id)) messageNodes.delete(id);
   }
-  messageList.replaceChildren(...ordered);
+  const visibleTurns = new Set(turns.map((turn) => turn.id));
+  for (const id of historyNodes.keys()) if (!visibleTurns.has(id)) historyNodes.delete(id);
+  reconcileChildren(messageList, ordered);
 }
 
 function mergeCumulativeText(currentText, incomingText) {
@@ -1628,6 +2296,12 @@ function mergeThreadWithDesktopSnapshot(thread) {
   const snapshot = desktopThreadSnapshot;
   if (!snapshot || snapshot.id !== thread.id) return thread;
 
+  const timings = new Map((thread.turns || []).map((turn) => [turn.id, turn]));
+  for (const turn of snapshot.turns || []) {
+    if (!timings.has(turn.id) || (Number.isFinite(turn.durationMs) && turn.durationMs >= 0)) {
+      timings.set(turn.id, turn);
+    }
+  }
   const messages = [...(thread.messages || [])];
   const indexes = new Map(messages.map((message, index) => [message.id, index]));
   for (const incoming of snapshot.messages || []) {
@@ -1659,6 +2333,7 @@ function mergeThreadWithDesktopSnapshot(thread) {
     project: snapshot.project || thread.project,
     status: snapshot.status || thread.status,
     updatedAt: Math.max(thread.updatedAt || 0, snapshot.updatedAt || 0),
+    turns: [...timings.values()],
     messages,
     control: {
       ...(thread.control || {}),
@@ -1828,9 +2503,7 @@ function flushMessageDeltas(epoch, threadId) {
 
     const record = messageNodes.get(itemId);
     if (record?.kind === "message") {
-      if (record.body.textContent !== message.text) {
-        record.body.textContent = message.text;
-      }
+      updateMessageBody(record, message);
     } else {
       needsReconcile = true;
     }
@@ -1851,7 +2524,7 @@ function flushMessageDeltas(epoch, threadId) {
       ? "运行中"
       : statusLabel(currentThread.status);
     conversationMeta.textContent =
-      `${currentThread.project} · ${state} · ${currentThread.messages.length} 条记录`;
+      `${currentThread.project} · ${state}`;
     updateComposer();
   }
 
@@ -1859,6 +2532,7 @@ function flushMessageDeltas(epoch, threadId) {
     messageList.scrollTop = messageList.scrollHeight;
     messageList.dataset.rendered = "true";
   }
+  updateLatestButton();
 }
 
 function queueMessageDelta(value) {
@@ -1979,8 +2653,9 @@ function renderThread(
     ? "运行中"
     : statusLabel(currentThread.status);
   conversationTitle.textContent = currentThread.title;
+  conversationTitle.title = currentThread.title;
   conversationMeta.textContent =
-    `${currentThread.project} · ${state} · ${currentThread.messages.length} 条记录`;
+    `${currentThread.project} · ${state}`;
 
   if (hasMessages) {
     setConversationPlaceholder("", "", false);
@@ -1991,20 +2666,25 @@ function renderThread(
   renderApprovals(currentThread.control?.requests || []);
   updateComposer();
   reconcileMessageNodes(displayMessages);
+  updateLatestButton();
 
   if (autoScroll && hasMessages && followOutput) {
     const initialRender = !messageList.dataset.rendered;
     if (initialRender) {
       messageList.scrollTop = messageList.scrollHeight;
       messageList.dataset.rendered = "true";
+      updateLatestButton();
       return;
     }
     const epoch = selectionEpoch;
     const threadId = currentThread.id;
+    const scrollTop = messageList.scrollTop;
     requestAnimationFrame(() => {
       if (selectionEpoch !== epoch || selectedThreadId !== threadId) return;
+      if (messageList.scrollTop < scrollTop - 1) return;
       messageList.scrollTop = messageList.scrollHeight;
       messageList.dataset.rendered = "true";
+      updateLatestButton();
     });
   }
 }
@@ -2012,6 +2692,57 @@ function renderThread(
 function closeEvents() {
   eventSource?.close();
   eventSource = null;
+}
+
+class PollingEventSource extends EventTarget {
+  constructor(url) {
+    super();
+    this.url = url.replace("/api/events", "/api/sync");
+    this.closed = false;
+    this.opened = false;
+    this.failures = 0;
+    this.lastQueueEvent = 0;
+    this.timer = null;
+    this.firstPoll = Promise.resolve().then(() => this.poll());
+  }
+
+  close() {
+    this.closed = true;
+    clearTimeout(this.timer);
+  }
+
+  async poll() {
+    if (this.closed) return;
+    try {
+      if (document.visibilityState === "hidden") return;
+      const result = await requestJson(this.url);
+      if (this.closed) return;
+      if (!Array.isArray(result.events)) throw new Error("同步数据无效");
+      this.failures = 0;
+      if (!this.opened) {
+        this.opened = true;
+        this.onopen?.();
+      }
+      for (const { event, value } of result.events) {
+        if (this.closed) return;
+        if (event === "queueStarted" || event === "queueFailed") {
+          if (value.eventId === this.lastQueueEvent) continue;
+          this.lastQueueEvent = value.eventId;
+        }
+        this.dispatchEvent(new MessageEvent(event, { data: JSON.stringify(value) }));
+      }
+    } catch (error) {
+      if (this.closed || handleUnauthorized(error)) return;
+      this.failures += 1;
+      this.onerror?.();
+    } finally {
+      if (!this.closed) {
+        const delay = this.failures ? Math.min(10_000, 1000 * 2 ** Math.min(this.failures, 4))
+          : document.visibilityState === "hidden" ? 5000 : currentThread?.control?.busy ? 500 : 1500;
+        this.timer = setTimeout(() => this.poll(), delay);
+      }
+    }
+  }
 }
 
 function eventValue(event) {
@@ -2030,26 +2761,53 @@ function validLiveEvent(value, subscriptionThreadId) {
 }
 
 function connectEvents(subscriptionEpoch = selectionEpoch) {
+  if (queuedMessageDeltas.size) flushMessageDeltas(selectionEpoch, selectedThreadId);
   cancelQueuedMessageDeltas();
   closeEvents();
+  if (networkOffline()) {
+    setConnection({ state: "offline" });
+    return;
+  }
   const subscriptionThreadId = selectedThreadId;
   const query = subscriptionThreadId
     ? `?threadId=${encodeURIComponent(subscriptionThreadId)}`
     : "";
-  const source = new EventSource(`/api/events${query}`);
+  const source = usePolling
+    ? new PollingEventSource(`/api/events${query}`)
+    : new EventSource(`/api/events${query}`);
   eventSource = source;
   setConnection({ state: "connecting" });
+  lastEventAt = Date.now();
 
-  const isCurrentSubscription = () =>
-    eventSource === source
+  const isCurrentSubscription = () => {
+    const current = eventSource === source
     && selectedThreadId === subscriptionThreadId
     && selectionEpoch === subscriptionEpoch;
+    if (current) lastEventAt = Date.now();
+    return current;
+  };
+  source.addEventListener("heartbeat", () => { isCurrentSubscription(); });
+  source.onopen = () => {
+    if (!isCurrentSubscription()) return;
+    if (initialLoadEpoch !== selectionEpoch) void syncSelectedThread();
+  };
 
   source.addEventListener("threads", (event) => {
     if (!isCurrentSubscription()) return;
     const value = eventValue(event);
     if (!Array.isArray(value)) return;
     threads = value;
+    renderThreads();
+    const lastThread = rememberedThread();
+    if (!selectedThreadId && threads.some((thread) => thread.id === lastThread)) {
+      void selectThread(lastThread);
+    }
+  });
+  source.addEventListener("projects", (event) => {
+    if (!isCurrentSubscription()) return;
+    const value = eventValue(event);
+    if (!Array.isArray(value)) return;
+    projectCatalog = value;
     renderThreads();
   });
   source.addEventListener("thread", (event) => {
@@ -2061,6 +2819,10 @@ function connectEvents(subscriptionEpoch = selectionEpoch) {
   source.addEventListener("desktopThread", (event) => {
     if (!isCurrentSubscription()) return;
     const value = eventValue(event);
+    if (value === null) {
+      desktopThreadSnapshot = null;
+      return;
+    }
     if (!value || value.id !== subscriptionThreadId) return;
     desktopThreadSnapshot = value;
     if (!ensureCurrentThreadForLive(value.id)) return;
@@ -2128,6 +2890,7 @@ function connectEvents(subscriptionEpoch = selectionEpoch) {
       pendingMessage = null;
       if (!messageInput.value && failedPending.text) messageInput.value = failedPending.text;
       resizeComposer();
+      saveDraft();
     }
     if (currentThread?.id === value.threadId) {
       currentThread = {
@@ -2151,26 +2914,68 @@ function connectEvents(subscriptionEpoch = selectionEpoch) {
     if (!isCurrentSubscription()) return;
     const value = eventValue(event);
     conversationMeta.textContent = value?.message || "读取会话失败";
+    conversationActions.open = true;
   });
-  let probingSession = false;
   source.onerror = async () => {
     if (!isCurrentSubscription()) return;
-    setConnection({ state: "disconnected" });
-    if (probingSession) return;
-    probingSession = true;
-    try {
-      const data = await requestJson("/api/bootstrap");
-      if (isCurrentSubscription()) setConnection(data.status);
-    } catch (error) {
-      if (isCurrentSubscription()) handleUnauthorized(error);
-    } finally {
-      probingSession = false;
+    setConnection({ state: networkOffline() ? "offline" : "disconnected" });
+    if (networkOffline() || source instanceof PollingEventSource) return;
+    if (!supportsPolling) {
+      try {
+        await requestJson("/api/bootstrap");
+      } catch (error) {
+        if (isCurrentSubscription()) handleUnauthorized(error);
+      }
+      return;
     }
+    usePolling = true;
+    return connectEvents(subscriptionEpoch);
   };
+  return source.firstPoll;
+}
+
+async function syncSelectedThread() {
+  const threadId = selectedThreadId;
+  if (!threadId || app.hidden || networkOffline()) return;
+  const epoch = selectionEpoch;
+  const sync = ++syncEpoch;
+  refreshButton.disabled = true;
+  refreshButton.setAttribute("aria-busy", "true");
+  try {
+    const loaded = await requestJson(`/api/threads/${encodeURIComponent(threadId)}`);
+    if (epoch !== selectionEpoch || sync !== syncEpoch) return;
+    applyComposerCatalog(loaded.composerOptions);
+    renderThread(loaded);
+  } catch (error) {
+    if (epoch !== selectionEpoch || sync !== syncEpoch) return;
+    if (!handleUnauthorized(error)) {
+      setConnection({ state: networkOffline() ? "offline" : "disconnected" });
+    }
+  } finally {
+    if (sync === syncEpoch) {
+      refreshButton.disabled = false;
+      refreshButton.setAttribute("aria-busy", "false");
+    }
+  }
+}
+
+function reconnect() {
+  if (app.hidden) return;
+  saveDraft();
+  connectEvents();
 }
 
 async function selectThread(threadId) {
+  selectedArchived = archivedThreads.some((thread) => thread.id === threadId && thread.archived);
+  if (sidebarMenu) closeSidebarMenu();
+  conversationActions.open = false;
+  if (threadId === selectedThreadId && currentThread) {
+    app.classList.add("conversation-open");
+    return;
+  }
+  saveDraft();
   const epoch = ++selectionEpoch;
+  initialLoadEpoch = epoch;
   closeComposerMenu();
   closeImageViewer();
   discardPendingImages();
@@ -2181,7 +2986,12 @@ async function selectThread(threadId) {
   composerCatalog = null;
   composerError = "";
   runningMessageAction = "queue";
-  messageInput.value = "";
+  messageInput.value = sendingThreads.has(threadId) ? "" : drafts.get(threadId)?.text || "";
+  if (draftStatus) {
+    draftStatus.hidden = !messageInput.value;
+    draftStatus.textContent = "已恢复文字草稿";
+  }
+  rememberThread(threadId);
   resizeComposer();
   messageList.replaceChildren();
   messageList.hidden = true;
@@ -2190,8 +3000,9 @@ async function selectThread(threadId) {
   approvalTray.hidden = true;
   app.classList.add("conversation-open");
   renderThreads();
-  const thread = threads.find((item) => item.id === threadId);
+  const thread = [...threads, ...archivedThreads].find((item) => item.id === threadId);
   conversationTitle.textContent = thread?.title || "加载会话";
+  conversationTitle.title = thread?.title || "";
   conversationMeta.textContent = thread ? `${thread.project} · 正在同步` : "正在同步";
   setConversationPlaceholder("正在同步会话");
   renderComposerControls();
@@ -2208,7 +3019,10 @@ async function selectThread(threadId) {
     if (handleUnauthorized(error)) return;
     if (selectionEpoch !== epoch || selectedThreadId !== threadId) return;
     conversationMeta.textContent = error.message;
+    conversationActions.open = true;
     setConversationPlaceholder("无法加载会话", error.message);
+  } finally {
+    if (initialLoadEpoch === epoch) initialLoadEpoch = null;
   }
 }
 
@@ -2230,14 +3044,19 @@ async function sendMessage(event) {
   const readyImages = pendingImages.filter((image) => image.status === "ready");
   if (
     (!text && !readyImages.length)
+    || selectedArchived
+    || networkOffline()
+    || ["offline", "disconnected", "error"].includes(transportState)
     || !threadId
     || sendingThreads.has(threadId)
+    || permissionUpdatingThreads.has(threadId)
     || interruptingThreads.has(threadId)
     || control.queued
     || (action === "steer" && !control.turnId)
     || pendingImages.some((image) => image.status !== "ready")
     || (!running && composerSelection.mode === "goal" && !text)
   ) return;
+  saveDraft();
 
   const selection = {
     model: composerSelection.model,
@@ -2294,6 +3113,7 @@ async function sendMessage(event) {
       `/api/threads/${encodeURIComponent(threadId)}/messages`,
       payload,
     );
+    if (drafts.get(threadId)?.text?.trim() === text) writeDraft(threadId, "");
     if (selectedThreadId !== threadId || currentThread?.id !== threadId) return;
     if (composerCatalog && result.goal !== undefined) {
       composerCatalog.goal = result.goal;
@@ -2336,6 +3156,10 @@ async function sendMessage(event) {
   } catch (error) {
     if (handleUnauthorized(error)) return;
     if (selectedThreadId === threadId) {
+      if (!messageInput.value) {
+        messageInput.value = text;
+        resizeComposer();
+      }
       if (pendingMessage?.id === optimisticMessage.id) {
         pendingMessage = null;
         if (!messageInput.value) {
@@ -2352,10 +3176,12 @@ async function sendMessage(event) {
       }
       composerError = error.message;
     } else {
+      if (!drafts.get(threadId)?.text) writeDraft(threadId, text);
       for (const image of readyImages) void deleteUploadedImage(image.id);
     }
   } finally {
     sendingThreads.delete(threadId);
+    if (selectedThreadId === threadId) saveDraft();
     updateComposer();
   }
 }
@@ -2445,14 +3271,26 @@ async function bootstrap() {
 
   try {
     const data = await requestJson("/api/bootstrap");
+    supportsPolling = data.transports?.includes("poll") || false;
+    usePolling = supportsPolling && (location.hostname?.endsWith(".trycloudflare.com") || false);
     threads = data.threads || [];
+    projectCatalog = data.projects || [];
+    projectsSupported = data.projectsSupported === true;
     setConnection(data.status);
     showApp();
     renderThreads();
-    connectEvents();
+    const lastThread = rememberedThread();
+    if (!selectedThreadId && threads.some((thread) => thread.id === lastThread)) {
+      await selectThread(lastThread);
+    } else {
+      connectEvents();
+    }
   } catch (error) {
     if (error.message === "UNAUTHORIZED") return showAuth();
-    showAuth(error.message);
+    showApp();
+    renderThreads();
+    connectEvents();
+    if (!networkOffline()) setConnection({ state: "disconnected" });
   }
 }
 
@@ -2474,35 +3312,103 @@ authForm.addEventListener("submit", async (event) => {
 });
 
 threadSearch.addEventListener("input", renderThreads);
+document.querySelector("#new-project-button")?.addEventListener("click", () => openManagementDialog("create-project"));
+archivedButton?.addEventListener("click", () => {
+  viewingArchived = !viewingArchived;
+  renderThreads();
+  if (viewingArchived) void loadArchived();
+});
+archivedMore?.addEventListener("click", () => void loadArchived(true));
+document.querySelector("#management-cancel")?.addEventListener("click", () => {
+  if (!managementPending) managementDialog.close();
+});
+managementDialog?.addEventListener("cancel", (event) => {
+  if (managementPending) event.preventDefault();
+});
+managementForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const { kind, target, idempotencyKey } = managementAction;
+  void manageItem(kind, target, { name: managementNameInput.value, ...(kind === "create-project" ? { path: managementPathInput.value, idempotencyKey } : {}) });
+});
+sidebarMenu?.addEventListener("keydown", (event) => {
+  const options = [...sidebarMenu.querySelectorAll("button:not(:disabled)")];
+  const index = options.indexOf(document.activeElement);
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    options[(index + (event.key === "ArrowDown" ? 1 : options.length - 1)) % options.length]?.focus();
+  }
+  if (event.key === "Escape") { event.preventDefault(); closeSidebarMenu(true); }
+  if (event.key === "Tab") closeSidebarMenu();
+});
+threadList.addEventListener("scroll", () => closeSidebarMenu(), { passive: true });
+document.addEventListener?.("pointerdown", (event) => {
+  if (sidebarMenu && !sidebarMenu.hidden && !sidebarMenu.contains(event.target) && !sidebarMenuTrigger?.contains(event.target)) closeSidebarMenu();
+});
 composer.addEventListener("submit", sendMessage);
 interruptButton.addEventListener("click", interruptTurn);
 for (const button of deliveryControl.children) {
   button.addEventListener("click", () => chooseRunningMessageAction(button.dataset.action));
 }
-imageUploadButton.addEventListener("click", () => imageInput.click?.());
+imageUploadButton.addEventListener("click", () => {
+  closeComposerMenu();
+  imageInput.click?.();
+});
+extrasButton?.addEventListener("click", () => {
+  const opening = composerExtras.hidden;
+  closeComposerMenu();
+  composerExtras.hidden = !opening;
+  extrasButton.setAttribute("aria-expanded", String(opening));
+  if (opening) {
+    renderExtrasSkills();
+    positionExtrasMenu();
+  }
+});
+composerExtras?.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") { closeComposerMenu(); extrasButton.focus(); }
+});
 imageInput.addEventListener("change", () => {
   const files = imageInput.files;
   imageInput.value = "";
   void addPendingImages(files);
 });
-modelControl.addEventListener("click", () => toggleComposerMenu("model"));
-effortControl.addEventListener("click", () => toggleComposerMenu("effort"));
-skillControl.addEventListener("click", () => toggleComposerMenu("skills"));
+modelControl.addEventListener("click", (event) => {
+  if (["model", "settings"].includes(composerMenuKind)) return closeComposerMenu();
+  toggleComposerMenu("settings");
+  if (event?.detail === 0) composerMenu.querySelector?.(".effort-slider:not(:disabled), .model-picker-summary")?.focus();
+});
+permissionControl.addEventListener("click", () => toggleComposerMenu("permissions"));
+skillControl.addEventListener("click", () => {
+  if (skillControl.disabled || !composerExtras || composerExtras.hidden) return;
+  const scrollTop = composerExtras.scrollTop;
+  extrasSkillsExpanded = !extrasSkillsExpanded;
+  renderExtrasSkills();
+  positionExtrasMenu();
+  composerExtras.scrollTop = scrollTop;
+});
 for (const button of modeControl.children) {
   button.addEventListener("click", () => chooseComposerMode(button.dataset.mode));
 }
 goalComplete.addEventListener("click", completeActiveGoal);
 goalClear.addEventListener("click", () => clearActiveGoal());
 composerMenu.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeComposerMenu();
+  if (event.key === "Escape") {
+    const modelMenu = ["model", "settings"].includes(composerMenuKind);
+    closeComposerMenu();
+    if (modelMenu) modelControl.focus();
+  }
 });
 document.addEventListener?.("pointerdown", (event) => {
-  if (composerMenu.hidden) return;
+  if (conversationActions.open && !conversationActions.contains(event.target)) {
+    conversationActions.open = false;
+  }
+  if (composerMenu.hidden && composerExtras?.hidden !== false) return;
   const target = event.target;
   if (
     composerMenu.contains?.(target)
+    || composerExtras?.contains?.(target)
+    || extrasButton?.contains?.(target)
     || modelControl.contains?.(target)
-    || effortControl.contains?.(target)
+    || permissionControl.contains?.(target)
     || skillControl.contains?.(target)
   ) return;
   closeComposerMenu();
@@ -2511,6 +3417,8 @@ messageInput.addEventListener("input", () => {
   composerError = "";
   resizeComposer();
   updateComposer();
+  globalThis.clearTimeout?.(draftTimer);
+  draftTimer = globalThis.setTimeout(saveDraft, 250);
 });
 messageInput.addEventListener("paste", (event) => {
   const images = [...(event.clipboardData?.files || [])]
@@ -2520,7 +3428,9 @@ messageInput.addEventListener("paste", (event) => {
   void addPendingImages(images);
 });
 messageInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+  const touchKeyboard = globalThis.matchMedia?.("(pointer: coarse)").matches;
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing
+    && (!touchKeyboard || event.metaKey || event.ctrlKey)) {
     event.preventDefault();
     composer.requestSubmit();
   }
@@ -2546,16 +3456,72 @@ imageViewer.addEventListener("click", (event) => {
   if (event.target === imageViewer) closeImageViewer();
 });
 document.addEventListener?.("keydown", (event) => {
+  if (event.key === "Escape" && conversationActions.open) {
+    conversationActions.open = false;
+    conversationActions.querySelector("summary").focus();
+    event.preventDefault();
+  }
   if (imageViewer.hidden) return;
   if (event.key === "Escape") closeImageViewer();
   else if (event.key === "ArrowLeft") moveImageViewer(-1);
   else if (event.key === "ArrowRight") moveImageViewer(1);
 });
-backButton.addEventListener("click", () => app.classList.remove("conversation-open"));
-refreshButton.addEventListener("click", () => {
-  if (selectedThreadId) selectThread(selectedThreadId);
-  else bootstrap();
+backButton.addEventListener("click", () => {
+  conversationActions.open = false;
+  saveDraft();
+  closeComposerMenu();
+  messageInput.blur?.();
+  app.classList.remove("conversation-open");
 });
+refreshButton.addEventListener("click", () => {
+  conversationActions.open = false;
+  conversationActions.querySelector("summary").focus();
+  reconnect();
+});
+reconnectButton?.addEventListener("click", reconnect);
+latestButton?.addEventListener("click", scrollToLatest);
+messageList.addEventListener("scroll", updateLatestButton, { passive: true });
+messageList.addEventListener("load", () => {
+  if (latestButton?.hidden) scrollToLatest();
+}, true);
+
+globalThis.addEventListener?.("offline", () => {
+  saveDraft();
+  if (queuedMessageDeltas.size) flushMessageDeltas(selectionEpoch, selectedThreadId);
+  closeEvents();
+  setConnection({ state: "offline" });
+});
+globalThis.addEventListener?.("online", reconnect);
+globalThis.addEventListener?.("pagehide", () => { saveDraft(); closeEvents(); });
+globalThis.addEventListener?.("pageshow", (event) => { if (event.persisted) reconnect(); });
+document.addEventListener?.("visibilitychange", () => {
+  saveDraft();
+  if (document.visibilityState === "visible") reconnect();
+});
+globalThis.setInterval?.(() => {
+  if (!app.hidden && document.visibilityState === "visible" && !networkOffline()
+    && Date.now() - lastEventAt > 45000) {
+    usePolling = supportsPolling;
+    reconnect();
+  }
+}, 15000);
+
+function updateViewport() {
+  const viewport = globalThis.visualViewport;
+  if (!viewport || viewport.scale !== 1) return;
+  const follow = isFollowingOutput();
+  const scrollTop = messageList.scrollTop;
+  document.documentElement?.style.setProperty("--viewport-height", `${viewport.height}px`);
+  document.documentElement?.style.setProperty("--viewport-top", `${viewport.offsetTop}px`);
+  if (follow) requestAnimationFrame(() => {
+    if (messageList.scrollTop >= scrollTop - 1) scrollToLatest();
+  });
+}
+globalThis.visualViewport?.addEventListener("resize", updateViewport);
+globalThis.visualViewport?.addEventListener("scroll", updateViewport);
+globalThis.addEventListener?.("resize", positionModelMenu);
+if (globalThis.ResizeObserver) new ResizeObserver(positionModelMenu).observe(composer);
+updateViewport();
 
 renderComposerControls();
 bootstrap();

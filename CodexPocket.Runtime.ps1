@@ -48,7 +48,7 @@ function Resolve-PocketPython {
     param([string]$ConfiguredPath)
 
     $candidates = @()
-    foreach ($value in @($ConfiguredPath, $env:POCKET_PYTHON)) {
+    foreach ($value in @($env:POCKET_PYTHON, $ConfiguredPath)) {
         $path = Resolve-PocketCommandPath $value
         if ($path) {
             $candidates += [pscustomobject]@{ Command = $path; Prefix = @() }
@@ -142,7 +142,7 @@ function Resolve-PocketPython {
 function Resolve-PocketNode {
     param([string]$ConfiguredPath)
 
-    $candidateValues = @($ConfiguredPath, $env:NODE_BIN)
+    $candidateValues = @($env:NODE_BIN, $ConfiguredPath)
     $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($nodeCommand) {
         $candidateValues += $nodeCommand.Source
@@ -202,7 +202,7 @@ function Resolve-PocketNode {
 function Resolve-PocketCodex {
     param([string]$ConfiguredPath)
 
-    $candidateValues = @($ConfiguredPath, $env:CODEX_BIN)
+    $candidateValues = @($env:CODEX_BIN, $ConfiguredPath)
     foreach ($name in @('codex.cmd', 'codex.exe', 'codex')) {
         $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($command) {
@@ -246,7 +246,14 @@ function Resolve-PocketCodex {
         $key = $path.ToLowerInvariant()
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
-            return $path
+            try {
+                $version = & $path --version 2>$null
+                if ($LASTEXITCODE -eq 0 -and $version) {
+                    return $path
+                }
+            } catch {
+                continue
+            }
         }
     }
 

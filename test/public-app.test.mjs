@@ -23,6 +23,7 @@ const ELEMENT_IDS = [
   "connection-label",
   "conversation-title",
   "conversation-meta",
+  "conversation-actions",
   "conversation-placeholder",
   "placeholder-title",
   "placeholder-detail",
@@ -30,6 +31,9 @@ const ELEMENT_IDS = [
   "approval-tray",
   "composer",
   "composer-menu",
+  "composer-extras",
+  "extras-button",
+  "extras-skills",
   "mode-control",
   "skill-control",
   "skill-label",
@@ -45,7 +49,8 @@ const ELEMENT_IDS = [
   "message-input",
   "model-control",
   "model-label",
-  "effort-control",
+  "permission-control",
+  "permission-label",
   "effort-label",
   "composer-status",
   "delivery-control",
@@ -53,6 +58,11 @@ const ELEMENT_IDS = [
   "send-button",
   "back-button",
   "refresh-button",
+  "network-banner",
+  "network-message",
+  "reconnect-button",
+  "latest-button",
+  "draft-status",
   "image-viewer",
   "image-viewer-image",
   "image-viewer-caption",
@@ -85,7 +95,7 @@ class FakeElement {
     this.children = [];
     this.classList = new FakeClassList();
     this.dataset = {};
-    this.style = {};
+    this.style = { setProperty(name, value) { this[name] = value; } };
     this.listeners = new Map();
     this.attributes = new Map();
     this.hidden = false;
@@ -111,6 +121,10 @@ class FakeElement {
 
   append(...children) {
     this.children.push(...children);
+  }
+
+  prepend(...children) {
+    this.children.unshift(...children);
   }
 
   replaceChildren(...children) {
@@ -254,7 +268,7 @@ async function eventually(predicate) {
   throw new Error("Timed out waiting for app state");
 }
 
-async function createHarness(fetchImpl, { storedSelection } = {}) {
+async function createHarness(fetchImpl, { storedSelection, storage = new Map(), coarse = false } = {}) {
   FakeEventSource.instances = [];
   const animationFrames = new Map();
   let nextAnimationFrameId = 1;
@@ -288,6 +302,7 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
   elements["interrupt-button"].hidden = true;
   elements["interrupt-button"].setAttribute("aria-label", "中断任务");
   elements["skill-count"].hidden = true;
+  elements["composer-extras"].hidden = true;
   elements["image-viewer"].hidden = true;
   for (const mode of ["default", "plan", "goal"]) {
     const button = new FakeElement("button");
@@ -303,6 +318,7 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
   }
 
   const document = {
+    visibilityState: "visible",
     querySelector(selector) {
       return elements[selector.replace(/^#/, "")];
     },
@@ -313,10 +329,17 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
       return new FakeElement(tagName);
     },
   };
+  const browserListeners = new Map();
+  if (storedSelection !== undefined) storage.set("codex-pocket-composer-v1", storedSelection);
+  const navigator = { onLine: true };
   const context = vm.createContext({
+    // Rendering and sanitization run against a real DOM in the browser suite.
+    renderMarkdown: (element, text) => { element.textContent = text; },
     AbortController,
     document,
     EventSource: FakeEventSource,
+    EventTarget,
+    MessageEvent,
     fetch: fetchImpl,
     history: { replaceState() {} },
     location: { hash: "", pathname: "/", search: "" },
@@ -326,20 +349,25 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
     clearTimeout,
     setTimeout,
     setImmediate,
-    ...(storedSelection === undefined ? {} : {
-      localStorage: {
-        getItem: () => storedSelection,
-        setItem() {},
-      },
-    }),
+    navigator,
+    matchMedia: () => ({ matches: coarse }),
+    addEventListener: (type, handler) => browserListeners.set(type, handler),
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+    },
   });
-  const source = await fs.readFile(APP_SOURCE_URL, "utf8");
+  const source = (await fs.readFile(APP_SOURCE_URL, "utf8"))
+    .replace('import { renderMarkdown } from "./markdown.js";', "");
   const hooks = `\n;globalThis.__appTest = {
     selectThread,
     createProjectThread,
     sendMessage,
     interruptTurn,
     connectEvents,
+    syncSelectedThread,
+    reconnect,
+    saveDraft,
     fetchJsonWithTimeout,
     showAuth,
     addPendingImages,
@@ -390,10 +418,176 @@ async function createHarness(fetchImpl, { storedSelection } = {}) {
     elements,
     eventSources: FakeEventSource.instances,
     hooks: context.__appTest,
+    storage,
+    navigator,
+    browserListeners,
     flushAnimationFrames,
     pendingAnimationFrames: () => animationFrames.size,
   };
 }
+
+function mobileFetch(url) {
+  if (url === "/api/bootstrap") return jsonResponse(200, {
+    transports: ["sse", "poll"],
+    status: { state: "ready" }, threads: [threadSummary("A"), threadSummary("B")],
+  });
+  const id = url.split("/").at(-1);
+  return jsonResponse(200, threadDetail(id, `Conversation ${id}`));
+}
+
+test("a successful HTTP response with invalid JSON is not treated as a delivered message", async () => {
+  const harness = await createHarness((url) => url.endsWith("/messages")
+    ? { ok: true, status: 200, json: async () => { throw new SyntaxError("bad JSON"); } }
+    : mobileFetch(url));
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "preserve uncertain delivery";
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  assert.equal(harness.elements["message-input"].value, "preserve uncertain delivery");
+  assert.equal(harness.hooks.getState().pendingMessage, null);
+});
+
+test("text drafts survive A to B navigation and a page reload", async () => {
+  const storage = new Map();
+  const first = await createHarness(mobileFetch, { storage });
+  await first.hooks.selectThread("A");
+  first.elements["message-input"].value = "A 的未发送草稿\n第二行";
+  await first.hooks.selectThread("B");
+  assert.equal(first.elements["message-input"].value, "");
+  first.elements["message-input"].value = "B 的未发送草稿";
+  await first.hooks.selectThread("A");
+  assert.equal(first.elements["message-input"].value, "A 的未发送草稿\n第二行");
+  const reloaded = await createHarness(mobileFetch, { storage });
+  await eventually(() => reloaded.hooks.getState().currentThread?.id === "A");
+  assert.equal(reloaded.elements["message-input"].value, "A 的未发送草稿\n第二行");
+});
+
+test("expired and malformed drafts are not restored", async () => {
+  const storage = new Map([["codex-pocket-drafts-v1", JSON.stringify([
+    ["A", { text: "expired", updatedAt: Date.now() - 8 * 86400000 }],
+    ["B", { text: {}, updatedAt: Date.now() }],
+  ])]]);
+  const harness = await createHarness(mobileFetch, { storage });
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.elements["message-input"].value, "");
+  await harness.hooks.selectThread("B");
+  assert.equal(harness.elements["message-input"].value, "");
+});
+
+test("refresh synchronizes in place without discarding text or attachments", async () => {
+  const harness = await createHarness(async (url) => url === "/api/uploads"
+    ? jsonResponse(200, { image: { id: "image-1", src: "/api/images/image-1" } })
+    : mobileFetch(url));
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "keep this draft";
+  await harness.hooks.addPendingImages([{ name: "test.png", type: "image/png", size: 10 }]);
+  const epoch = harness.hooks.getState().selectionEpoch;
+  await harness.hooks.syncSelectedThread();
+  assert.equal(harness.elements["message-input"].value, "keep this draft");
+  assert.equal(harness.hooks.getState().pendingImages.length, 1);
+  assert.equal(harness.hooks.getState().selectionEpoch, epoch);
+});
+
+test("a successful HTTP probe cannot falsely mark a broken event stream as connected", async () => {
+  const harness = await createHarness(mobileFetch);
+  await harness.hooks.selectThread("A");
+  await harness.eventSources.at(-1).onerror();
+  assert.equal(harness.elements["connection-state"].dataset.state, "disconnected");
+  assert.equal(harness.elements["network-banner"].hidden, false);
+  harness.hooks.showAuth();
+});
+
+test("SSE failure switches to snapshot synchronization while preserving the draft", async (t) => {
+  const harness = await createHarness((url) => url.startsWith("/api/sync")
+    ? jsonResponse(200, { events: [
+      { event: "thread", value: threadDetail("A", "HTTPS recovered output") },
+      { event: "status", value: { state: "ready" } },
+    ] }) : mobileFetch(url));
+  t.after(() => harness.hooks.showAuth());
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "keep working draft";
+  await harness.eventSources.at(-1).onerror();
+  assert.equal(harness.elements["connection-state"].dataset.state, "ready");
+  assert.equal(harness.elements["message-input"].value, "keep working draft");
+  assert.equal(harness.hooks.getState().eventSource.url, "/api/sync?threadId=A");
+  assert.match(harness.elements["message-list"].textContent, /HTTPS recovered output/);
+});
+
+test("offline editing saves a draft, blocks sends and reconnects without replaying them", async () => {
+  let posts = 0;
+  const harness = await createHarness((url, options) => {
+    if (options?.method === "POST") posts++;
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "offline draft";
+  harness.navigator.onLine = false;
+  harness.browserListeners.get("offline")();
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  assert.equal(posts, 0);
+  assert.equal(harness.elements["send-button"].disabled, true);
+  assert.equal(harness.elements["message-input"].disabled, false);
+  harness.navigator.onLine = true;
+  harness.browserListeners.get("online")();
+  assert.equal(posts, 0);
+  assert.equal(harness.elements["message-input"].value, "offline draft");
+  assert.equal(harness.eventSources.at(-1).url, "/api/events?threadId=A");
+});
+
+test("mobile Return inserts a newline while desktop Return sends, and IME never submits", async () => {
+  for (const coarse of [true, false]) {
+    const harness = await createHarness(mobileFetch, { coarse });
+    let submits = 0;
+    harness.elements.composer.requestSubmit = () => submits++;
+    const handler = harness.elements["message-input"].listeners.get("keydown")[0];
+    handler({ key: "Enter", isComposing: true, preventDefault() {} });
+    assert.equal(submits, 0);
+    handler({ key: "Enter", preventDefault() {} });
+    assert.equal(submits, coarse ? 0 : 1);
+    handler({ key: "Enter", metaKey: true, preventDefault() {} });
+    assert.equal(submits, coarse ? 1 : 2);
+  }
+});
+
+test("a failed send retains its draft after navigating to another thread", async () => {
+  const response = deferred();
+  const harness = await createHarness((url) => url.endsWith("/messages") ? response.promise : mobileFetch(url));
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "do not lose this";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  await harness.hooks.selectThread("B");
+  response.resolve(jsonResponse(503, { error: "offline" }));
+  await sending;
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.elements["message-input"].value, "do not lose this");
+});
+
+test("returning to an in-flight send does not resurrect an acknowledged draft", async () => {
+  const response = deferred();
+  const harness = await createHarness((url) => url.endsWith("/messages") ? response.promise : mobileFetch(url));
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "send this once";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  await harness.hooks.selectThread("B");
+  await harness.hooks.selectThread("A");
+  response.resolve(jsonResponse(200, { turnId: "turn-1", control: { busy: true } }));
+  await sending;
+  assert.equal(harness.elements["message-input"].value, "");
+  assert.equal(JSON.parse(harness.storage.get("codex-pocket-drafts-v1")).length, 0);
+});
+
+test("stale refresh failures cannot mark a newly selected thread disconnected", async () => {
+  let defer = false;
+  const response = deferred();
+  const harness = await createHarness((url) => defer && url === "/api/threads/A" ? response.promise : mobileFetch(url));
+  await harness.hooks.selectThread("A");
+  defer = true;
+  const refreshing = harness.hooks.syncSelectedThread();
+  await harness.hooks.selectThread("B");
+  response.resolve(jsonResponse(500, { error: "stale error" }));
+  await refreshing;
+  assert.notEqual(harness.elements["connection-state"].dataset.state, "disconnected");
+  assert.equal(harness.hooks.getState().currentThread.id, "B");
+});
 
 test("malformed persisted composer settings degrade to safe defaults", async () => {
   const harness = await createHarness(async () => jsonResponse(200, {
@@ -538,21 +732,36 @@ test("consecutive tool activity renders as one compact group and merges duplicat
 
   await harness.hooks.selectThread("A");
   const rendered = harness.elements["message-list"].children;
-  assert.equal(rendered.length, 3);
-  assert.equal(rendered[1].dataset.kind, "activityGroup");
-  assert.match(rendered[1].textContent, /运行 rg -n renderThread public\/app\.js/);
-  assert.match(rendered[1].textContent, /×2/);
-  assert.match(rendered[1].textContent, /读取 app\.js/);
+  assert.equal(rendered.length, 2);
+  const activity = rendered[0].children[1].children[1];
+  assert.equal(activity.dataset.kind, "activityGroup");
+  const disclosure = activity.children[0];
+  assert.equal(disclosure.tagName, "DETAILS");
+  assert.equal(disclosure.open, false);
+  assert.match(disclosure.children[0].textContent, /已处理 3 项操作/);
+  assert.doesNotMatch(disclosure.children[0].textContent, /rg|app\.js/);
+  assert.match(activity.textContent, /运行 rg -n renderThread public\/app\.js/);
+  assert.match(activity.textContent, /×2/);
+  assert.match(activity.textContent, /读取 app\.js/);
+  disclosure.open = true;
+  emitSse(harness.eventSources.at(-1), "thread", {
+    ...detail,
+    messages: detail.messages.map((message) => message.id === "file-1"
+      ? { ...message, text: "读取 styles.css" } : message),
+  });
+  assert.equal(disclosure.open, true);
 });
 
-test("completed history turns collapse while the latest turn stays expanded", async () => {
+test("completed processes collapse while every request and conclusion stays visible", async () => {
   const summary = threadSummary("A");
   const detail = {
     ...summary,
     messages: [
       { id: "old-user", turnId: "turn-old", role: "user", kind: "message", text: "检查旧问题", timestamp: 1 },
+      { id: "old-progress", turnId: "turn-old", role: "assistant", kind: "commentary", text: "正在检查", timestamp: 1 },
       { id: "old-answer", turnId: "turn-old", role: "assistant", kind: "message", text: "旧问题已处理", timestamp: 1 },
       { id: "new-user", turnId: "turn-new", role: "user", kind: "message", text: "继续新任务", timestamp: 2 },
+      { id: "new-progress", turnId: "turn-new", role: "assistant", kind: "commentary", text: "正在读取", timestamp: 2 },
       { id: "new-answer", turnId: "turn-new", role: "assistant", kind: "message", text: "正在继续", timestamp: 2 },
     ],
     control: { busy: false, requests: [] },
@@ -567,14 +776,14 @@ test("completed history turns collapse while the latest turn stays expanded", as
 
   await harness.hooks.selectThread("A");
   let rendered = harness.elements["message-list"].children;
-  assert.equal(rendered.length, 3);
-  assert.equal(rendered[0].tagName, "DETAILS");
-  assert.equal(rendered[0].open, false);
-  assert.match(rendered[0].children[0].textContent, /检查旧问题/);
-  assert.deepEqual(rendered.slice(1).map((node) => node.dataset.role), ["user", "assistant"]);
+  assert.equal(rendered.length, 6);
+  assert.equal(rendered[1].tagName, "DETAILS");
+  assert.equal(rendered[1].open, false);
+  assert.match(rendered[1].children[0].textContent, /执行过程/);
+  assert.deepEqual([rendered[0], rendered[2], rendered[3], rendered[5]].map((node) => node.dataset.role), ["user", "assistant", "user", "assistant"]);
 
-  rendered[0].open = true;
-  rendered[0].listeners.get("toggle")[0]();
+  rendered[1].open = true;
+  rendered[1].listeners.get("toggle")[0]();
   emitSse(harness.eventSources.at(-1), "thread", {
     ...detail,
     messages: detail.messages.map((message) => message.id === "new-answer"
@@ -582,11 +791,46 @@ test("completed history turns collapse while the latest turn stays expanded", as
       : message),
   });
   rendered = harness.elements["message-list"].children;
-  assert.equal(rendered[0].open, true);
+  assert.equal(rendered[1].open, true);
   assert.match(rendered.at(-1).textContent, /新任务已更新/);
 });
 
-test("each user command starts a history turn even when raw turn ids disagree", async () => {
+test("desktop timing fills a completed process without losing older measured durations", async () => {
+  const detail = {
+    ...threadSummary("A"),
+    turns: [{ id: "older", durationMs: 30000 }, { id: "turn-1", durationMs: null }],
+    messages: [
+      { id: "user-1", turnId: "turn-1", role: "user", kind: "message", text: "检查任务" },
+      { id: "progress-1", turnId: "turn-1", role: "assistant", kind: "commentary", text: "正在检查" },
+      { id: "answer-1", turnId: "turn-1", role: "assistant", kind: "message", text: "已完成" },
+    ],
+    control: { busy: false, requests: [] },
+  };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
+    if (url === "/api/threads/A") return jsonResponse(200, detail);
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+  await harness.hooks.selectThread("A");
+  const process = harness.elements["message-list"].children[1];
+  assert.equal(process.children[0].textContent, "执行过程");
+  process.open = true;
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "desktopThread", {
+    id: "A", turns: [{ id: "turn-1", durationMs: 442502 }], messages: [],
+  });
+  assert.equal(process.children[0].textContent, "用时 7分23秒");
+  assert.equal(process.open, true);
+  emitSse(source, "desktopThread", {
+    id: "A", turns: [{ id: "turn-1", durationMs: null }], messages: [],
+  });
+  assert.equal(process.children[0].textContent, "用时 7分23秒");
+  const timings = harness.hooks.getState().currentThread.turns;
+  assert.equal(timings.find((turn) => turn.id === "older").durationMs, 30000);
+  assert.equal(timings.find((turn) => turn.id === "turn-1").durationMs, 442502);
+});
+
+test("each user command keeps its own process even when raw turn ids disagree", async () => {
   const summary = threadSummary("A");
   const firstCommand = "First command keeps its complete prompt in the history heading, including this tail marker";
   const detail = {
@@ -612,15 +856,15 @@ test("each user command starts a history turn even when raw turn ids disagree", 
 
   await harness.hooks.selectThread("A");
   const rendered = harness.elements["message-list"].children;
-  assert.equal(rendered.length, 4);
-  assert.deepEqual(rendered.slice(0, 2).map((node) => node.tagName), ["DETAILS", "DETAILS"]);
-  assert.equal(rendered[0].children[0].children[0].textContent, firstCommand);
-  assert.match(rendered[0].children[1].textContent, /First command.*First response/);
-  assert.match(rendered[1].children[1].textContent, /Steer command.*Tool output.*Second response/);
-  assert.deepEqual(rendered.slice(2).map((node) => node.dataset.role), ["user", "assistant"]);
+  assert.equal(rendered.length, 7);
+  assert.match(rendered[0].textContent, /tail marker/);
+  assert.equal(rendered[3].tagName, "DETAILS");
+  assert.match(rendered[3].children[1].textContent, /Tool output/);
+  assert.doesNotMatch(rendered[3].textContent, /Steer command|Second response/);
+  assert.deepEqual(rendered.slice(4).map((node) => node.dataset.role), ["assistant", "user", "assistant"]);
 });
 
-test("leading records without a user command share one context fold", async () => {
+test("errors and conclusions stay visible even without a preceding user command", async () => {
   const summary = threadSummary("A");
   const detail = {
     ...summary,
@@ -644,13 +888,10 @@ test("leading records without a user command share one context fold", async () =
 
   await harness.hooks.selectThread("A");
   const rendered = harness.elements["message-list"].children;
-  assert.equal(rendered.length, 4);
-  assert.equal(rendered[0].className, "history-turn history-context");
-  assert.match(rendered[0].children[0].textContent, /早期上下文/);
-  assert.match(rendered[0].children[1].textContent, /Earlier failure.*Earlier continuation/);
-  assert.equal(rendered[1].className, "history-turn");
-  assert.match(rendered[1].children[0].textContent, /Visible old command/);
-  assert.deepEqual(rendered.slice(2).map((node) => node.dataset.role), ["user", "assistant"]);
+  assert.equal(rendered.length, 6);
+  assert.match(rendered[0].textContent, /Earlier failure/);
+  assert.match(rendered[1].textContent, /Earlier continuation/);
+  assert.deepEqual(rendered.slice(2).map((node) => node.dataset.role), ["user", "assistant", "user", "assistant"]);
 });
 
 test("the first authoritative conversation snapshot lands at the bottom immediately", async () => {
@@ -668,6 +909,69 @@ test("the first authoritative conversation snapshot lands at the bottom immediat
   assert.equal(harness.elements["message-list"].scrollTop, 1_240);
   assert.equal(harness.elements["message-list"].dataset.rendered, "true");
   assert.equal(harness.pendingAnimationFrames(), 0);
+});
+
+test("effort slider follows fractional drags, snaps, and restores Ultra styling", async () => {
+  const catalog = composerOptions();
+  catalog.models[0].efforts = ["low", "medium", "high", "xhigh", "max", "ultra"].map((id) => ({ id }));
+  const detail = { ...threadDetail("A", "ready"), composerOptions: catalog };
+  const harness = await createHarness(async (url) => jsonResponse(200,
+    url === "/api/bootstrap" ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail));
+  await harness.hooks.selectThread("A");
+  harness.elements["model-control"].listeners.get("click")[0]();
+  const panel = harness.elements["composer-menu"].children[0];
+  const track = panel.children[2];
+  const slider = track.children[3];
+  slider.listeners.get("pointerdown")[0]();
+  slider.value = "3.65";
+  slider.listeners.get("input")[0]();
+  assert.equal(slider.value, "3.65");
+  assert.equal(track.style["--effort-progress"], "0.73");
+  assert.equal(harness.hooks.getState().composerSelection.effort, "max");
+  slider.listeners.get("change")[0]();
+  assert.equal(slider.value, "4");
+  assert.equal(track.dataset.dragging, "false");
+  slider.listeners.get("keydown")[0]({ key: "End", preventDefault() {} });
+  assert.equal(slider.value, "5");
+  assert.equal(panel.dataset.effort, "ultra");
+  assert.equal(slider.getAttribute("aria-valuetext"), "Ultra");
+  slider.listeners.get("keydown")[0]({ key: "ArrowLeft", preventDefault() {} });
+  assert.equal(slider.value, "4");
+  assert.equal(panel.dataset.effort, "max");
+  panel.children[1].listeners.get("click")[0]();
+  assert.equal(slider.value, "0");
+  assert.equal(panel.dataset.effort, "low");
+});
+
+test("all skills expand and collapse inside the existing extras menu", async () => {
+  const catalog = composerOptions();
+  catalog.skills = Array.from({ length: 9 }, (_, index) => ({ name: `skill-${index}`, enabled: index < 8 }));
+  const detail = { ...threadDetail("A", "ready"), composerOptions: catalog };
+  const harness = await createHarness(async (url) => jsonResponse(200,
+    url === "/api/bootstrap" ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail));
+  await harness.hooks.selectThread("A");
+  const { elements } = harness;
+  const open = () => elements["extras-button"].listeners.get("click")[0]();
+  const toggle = () => elements["skill-control"].listeners.get("click")[0]();
+  open();
+  assert.equal(elements["extras-skills"].children.length, 6);
+  elements["composer-extras"].scrollTop = 72;
+  toggle();
+  assert.equal(elements["composer-extras"].hidden, false);
+  assert.equal(elements["composer-menu"].hidden, true);
+  assert.equal(elements["extras-skills"].children.length, 8);
+  assert.equal(elements["composer-extras"].scrollTop, 72);
+  assert.equal(elements["skill-control"].getAttribute("aria-expanded"), "true");
+  assert.equal(elements["skill-label"].textContent, "收起技能");
+  toggle();
+  assert.equal(elements["extras-skills"].children.length, 6);
+  assert.equal(elements["skill-control"].getAttribute("aria-expanded"), "false");
+  toggle();
+  elements["extras-skills"].children[7].listeners.get("click")[0]();
+  assert.deepEqual(Array.from(harness.hooks.getState().composerSelection.skillNames), ["skill-7"]);
+  assert.equal(elements["composer-extras"].hidden, true);
+  open();
+  assert.equal(elements["extras-skills"].children.length, 6);
 });
 
 test("composer controls send the selected model effort mode and skills", async () => {
@@ -693,13 +997,14 @@ test("composer controls send the selected model effort mode and skills", async (
   assert.equal(harness.elements["effort-label"].textContent, "低");
 
   harness.elements["model-control"].listeners.get("click")[0]();
+  harness.elements["composer-menu"].children[0].children[0].listeners.get("click")[0]();
   const modelList = harness.elements["composer-menu"].children[1];
   modelList.children[1].listeners.get("click")[0]();
   assert.equal(harness.elements["model-label"].textContent, "GPT Terra");
   assert.equal(harness.elements["effort-label"].textContent, "中");
 
-  harness.elements["skill-control"].listeners.get("click")[0]();
-  const skillList = harness.elements["composer-menu"].children[2];
+  harness.elements["extras-button"].listeners.get("click")[0]();
+  const skillList = harness.elements["extras-skills"];
   skillList.children[0].listeners.get("click")[0]();
   assert.equal(harness.elements["skill-count"].textContent, "1");
   assert.match(harness.elements["selected-skills"].textContent, /\$docs/);
@@ -1265,8 +1570,8 @@ test("an optimistic user message stays before live replies that beat the send re
   await eventually(() => harness.hooks.getState().sendingThreads.includes("A"));
 
   let rendered = harness.elements["message-list"].children;
-  assert.equal(rendered[0].tagName, "DETAILS");
-  assert.match(rendered[0].children[0].textContent, /早期上下文/);
+  assert.equal(rendered[0].dataset.role, "assistant");
+  assert.match(rendered[0].textContent, /earlier message/);
   assert.equal(rendered[1].dataset.role, "user");
   assert.equal(rendered[1].children[1].textContent, "test");
 
@@ -1325,10 +1630,10 @@ test("a stale thread load failure cannot replace the newer conversation", async 
   assert.match(harness.elements["message-list"].textContent, /newer conversation/);
 });
 
-test("an SSE error that probes as unauthorized returns to sign-in", async () => {
+test("an SSE fallback that receives unauthorized returns to sign-in", async () => {
   let bootstrapCalls = 0;
   const harness = await createHarness(async (url) => {
-    if (url !== "/api/bootstrap") throw new Error(`Unexpected fetch: ${url}`);
+    if (url !== "/api/bootstrap" && url !== "/api/sync") throw new Error(`Unexpected fetch: ${url}`);
     bootstrapCalls += 1;
     if (bootstrapCalls === 1) {
       return jsonResponse(200, { status: { state: "ready" }, threads: [] });

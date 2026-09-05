@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
+import { permissionCatalog, resolvePermissionMode } from "./permissions.mjs";
 
 const MAX_LIVE_MESSAGE_LENGTH = 80_000;
 export const MAX_LIVE_MESSAGE_COUNT = 128;
@@ -74,6 +75,7 @@ export class CodexAppServer extends EventEmitter {
     this.interruptingThreads = new Set();
     this.liveAgentMessages = new Map();
     this.threadSettings = new Map();
+    this.newThreads = new Map();
     this.serverRequests = new Map();
     this.serverRequestTokensById = new Map();
     this.nextServerRequestToken = 1;
@@ -198,7 +200,7 @@ export class CodexAppServer extends EventEmitter {
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(message.error.message || "Codex App Server request failed"));
+        pending.reject(Object.assign(new Error(message.error.message || "Codex App Server request failed"), { code: message.error.code }));
       } else {
         pending.resolve(message.result);
       }
@@ -258,6 +260,9 @@ export class CodexAppServer extends EventEmitter {
       effort: result.reasoningEffort || null,
       serviceTier: result.serviceTier || null,
       collaborationMode: null,
+      approvalPolicy: result.approvalPolicy,
+      approvalsReviewer: result.approvalsReviewer,
+      sandboxPolicy: result.sandbox,
     });
     return threadId;
   }
@@ -384,6 +389,13 @@ export class CodexAppServer extends EventEmitter {
   }
 
   _trackNotification(message) {
+    if (message.method === "thread/settings/updated") {
+      const { threadId, threadSettings } = message.params || {};
+      if (threadId && threadSettings) {
+        this.threadSettings.set(threadId, threadSettings);
+        this.emit("control", { threadId });
+      }
+    }
     const { method, params = {} } = message;
     const threadId = params.threadId || "";
     let controlChanged = false;
@@ -454,23 +466,34 @@ export class CodexAppServer extends EventEmitter {
     this._write({ method, params });
   }
 
-  async listThreads({ limit = 60 } = {}) {
+  async listThreads({ limit = 60, archived = false, cursor } = {}) {
     await this.start();
-    return this.request("thread/list", {
+    const result = await this.request("thread/list", {
       limit,
       sortKey: "updated_at",
       sortDirection: "desc",
-      archived: false,
+      archived,
+      ...(cursor ? { cursor } : {}),
       useStateDbOnly: false,
     });
+    for (const thread of result.data || []) this.newThreads.delete(thread.id);
+    if (!archived && !cursor && this.newThreads.size) {
+      result.data = [...this.newThreads.values(), ...(result.data || [])];
+    }
+    return result;
   }
 
   async readThread(threadId, { includeTurns = true } = {}) {
     await this.start();
-    const result = await this.request("thread/read", {
-      threadId,
-      includeTurns,
-    });
+    let result;
+    try {
+      result = await this.request("thread/read", { threadId, includeTurns });
+      if (result.thread?.turns?.length) this.newThreads.delete(threadId);
+    } catch (error) {
+      const draft = this.newThreads.get(threadId);
+      if (!draft || !/no rollout found|not materialized|not found/i.test(error.message)) throw error;
+      result = { thread: draft };
+    }
     if (includeTurns) this._captureThreadState(result.thread);
     return result;
   }
@@ -545,10 +568,10 @@ export class CodexAppServer extends EventEmitter {
       : this.readThread(threadId, { includeTurns: false });
     const [{ thread }, models] = await Promise.all([
       threadResult,
-      this.listModels(),
+      this.listModels({ includeHidden: true }),
     ]);
     const cwd = String(thread?.cwd || process.cwd());
-    const [skillEntries, modeResult, goalResult] = await Promise.all([
+    const [skillEntries, modeResult, goalResult, configResult, permissions] = await Promise.all([
       this.listSkills(cwd),
       this.listCollaborationModes()
         .then((modes) => ({ supported: true, modes }))
@@ -556,6 +579,8 @@ export class CodexAppServer extends EventEmitter {
       this.getGoal(threadId)
         .then((goal) => ({ supported: true, goal }))
         .catch(() => ({ supported: false, goal: null })),
+      this.request("config/read", { cwd, includeLayers: false }).catch(() => null),
+      this.readPermissions(threadId, cwd),
     ]);
     return {
       models,
@@ -565,15 +590,54 @@ export class CodexAppServer extends EventEmitter {
       goal: goalResult.goal,
       goalSupported: goalResult.supported,
       current: this.threadSettings.get(threadId) || null,
+      configuredModel: configResult?.config?.model || "",
+      permissions,
     };
   }
 
-  async startThread({ cwd = "" } = {}) {
+  async readPermissions(threadId, cwd) {
+    try {
+      const [profiles, constraints] = await Promise.all([
+        this.request("permissionProfile/list", { cwd }),
+        this.request("configRequirements/read", {}),
+      ]);
+      return permissionCatalog({
+        profiles: profiles.data,
+        requirements: constraints.requirements,
+        current: this.threadSettings.get(threadId),
+        supported: true,
+      });
+    } catch {
+      return permissionCatalog({ current: this.threadSettings.get(threadId) });
+    }
+  }
+
+  async updatePermissions(threadId, mode, catalog) {
+    const overrides = resolvePermissionMode(mode, catalog);
+    if (this.isThreadBusy(threadId)) throw new Error("请在当前任务结束后更改权限");
+    this.startingThreads.add(threadId);
+    this.emit("control", { threadId });
+    try {
+      await this.resumeThread(threadId);
+      if (this.activeTurns.has(threadId)) throw new Error("请在当前任务结束后更改权限");
+      await this.request("thread/settings/update", { threadId, ...overrides });
+      const current = { ...this.threadSettings.get(threadId), permissionMode: mode };
+      this.threadSettings.set(threadId, current);
+      return { ...catalog, current: mode };
+    } finally {
+      this.startingThreads.delete(threadId);
+      this.emit("control", { threadId });
+    }
+  }
+
+  async startThread({ cwd = "", projectId } = {}) {
     await this.start();
     const params = { ephemeral: false };
     if (cwd) params.cwd = cwd;
+    if (projectId) params.projectId = projectId;
     const result = await this.request("thread/start", params);
     this._rememberThreadSession(result);
+    if (result.thread?.id) this.newThreads.set(result.thread.id, result.thread);
     return result;
   }
 

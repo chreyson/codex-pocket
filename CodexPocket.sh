@@ -13,7 +13,11 @@ if [ ! -x "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c \
     'import os, sys; raise SystemExit(0 if os.path.realpath(sys.prefix) == os.path.realpath(sys.argv[1]) else 1)' \
     "$SCRIPT_DIR/.venv" >/dev/null 2>&1
 then
-    exec /bin/sh "$SCRIPT_DIR/Install-CodexPocket.sh"
+    if [ "${1:-}" = "--check" ]; then
+        echo "Project environment is missing. Run Install-CodexPocket.sh first." >&2
+        exit 1
+    fi
+    exec /bin/sh "$SCRIPT_DIR/Install-CodexPocket.sh" "$@"
 fi
 
 case "${1:-}" in
@@ -21,7 +25,7 @@ case "${1:-}" in
         exec "$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" --check
         ;;
     --headless)
-        exec "$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" --headless
+        exec "$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" "$@"
         ;;
     *)
         exec "$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" --start

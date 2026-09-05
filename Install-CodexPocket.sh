@@ -91,7 +91,7 @@ if ! venv_is_ready; then
     fi
 fi
 
-"$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" --install --start
+"$VENV_PYTHON" "$SCRIPT_DIR/setup_codex_pocket.py" --install --start "$@"
 status=$?
 if [ "$status" -ne 0 ]; then
     pause_after_failure

@@ -3,30 +3,31 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-    <meta name="theme-color" content="#f7f7f8" media="(prefers-color-scheme: light)">
-    <meta name="theme-color" content="#1f2022" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#212121" media="(prefers-color-scheme: dark)">
     <title>Codex Pocket</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <section id="boot-screen" class="boot-screen" aria-label="正在连接" aria-busy="true">
       <div class="boot-lockup">
-        <strong>Codex</strong>
+        <strong>Codex Pocket</strong>
         <span class="boot-spinner" aria-hidden="true"></span>
       </div>
     </section>
 
     <section id="auth-screen" class="auth-screen" hidden>
-      <div class="auth-panel">
+      <header class="auth-header">
         <div class="auth-brand" aria-label="Codex Pocket">
           <strong>Codex</strong>
           <span>Pocket</span>
         </div>
-        <h1>连接到电脑</h1>
-        <p>输入桌面端显示的访问密钥。</p>
+      </header>
+      <div class="auth-panel">
+        <h1>连接 Codex</h1>
         <form id="auth-form">
           <label for="token-input">访问密钥</label>
-          <input id="token-input" name="token" type="password" autocomplete="off" required>
+          <input id="token-input" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="auth-error" required>
           <button id="auth-submit" class="command-button" type="submit">连接电脑</button>
           <p id="auth-error" class="form-error" role="alert"></p>
         </form>
@@ -37,12 +38,8 @@
       <aside class="thread-pane" aria-label="Codex 会话列表">
         <header class="pane-header">
           <div class="brand-lockup">
-            <h1>Codex <span>Pocket</span></h1>
+            <h1>Codex Pocket</h1>
           </div>
-          <span id="connection-state" class="connection-state" data-state="connecting">
-            <span class="status-dot"></span>
-            <span id="connection-label">连接中</span>
-          </span>
         </header>
 
         <div class="search-row">
@@ -50,56 +47,114 @@
           <input id="thread-search" type="search" placeholder="搜索会话" aria-label="搜索会话">
         </div>
 
-        <div class="thread-section-label">项目</div>
+        <div class="sidebar-section-heading">
+          <span id="sidebar-section-title" class="thread-section-label">项目</span>
+          <button id="new-project-button" class="project-create" type="button" aria-label="新建项目" title="新建项目"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg></button>
+          <button id="archived-button" class="project-create" type="button" aria-label="查看已归档" title="查看已归档" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="4" rx="1"></rect><path d="M5 7v14h14V7M10 11h4"></path></svg></button>
+        </div>
         <p id="thread-action-status" class="thread-action-status" role="status" hidden></p>
         <nav id="thread-list" class="thread-list" aria-label="项目会话"></nav>
+        <button id="archived-more" class="project-show-more" type="button" hidden>加载更多</button>
         <div id="thread-empty" class="empty-state" hidden>
           <p id="thread-empty-title">还没有可显示的会话</p>
           <span id="thread-empty-detail">在电脑上打开 Codex 并开始对话。</span>
         </div>
+        <footer class="pane-footer">
+          <span id="connection-state" class="connection-state" data-state="connecting">
+            <span class="status-dot"></span>
+            <span id="connection-label">连接中</span>
+          </span>
+          <span class="pane-footer-label">本机 Codex</span>
+        </footer>
       </aside>
+      <div id="sidebar-menu" class="sidebar-menu" role="menu" hidden></div>
+      <dialog id="management-dialog" class="management-dialog" aria-labelledby="management-title">
+        <form id="management-form">
+          <h2 id="management-title">新建项目</h2>
+          <label for="management-name">名称</label>
+          <input id="management-name" name="name" maxlength="160" autocomplete="off" required>
+          <div id="management-path-field">
+            <label for="management-path">电脑上的文件夹</label>
+            <input id="management-path" name="path" autocomplete="off" spellcheck="false" placeholder="文件夹的完整路径">
+          </div>
+          <p id="management-error" class="form-error" role="alert"></p>
+          <div class="management-dialog-actions">
+            <button id="management-cancel" type="button">取消</button>
+            <button id="management-submit" class="command-button" type="submit">创建</button>
+          </div>
+        </form>
+      </dialog>
 
       <section class="conversation-pane" aria-label="会话内容">
         <header class="conversation-header">
           <button id="back-button" class="icon-button back-button" type="button" aria-label="返回会话列表" title="返回会话列表">
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg>
           </button>
+          <svg class="conversation-project-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 20H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2Z"></path><path d="M2 10h20"></path></svg>
           <div class="conversation-title-wrap">
             <h2 id="conversation-title">选择一个会话</h2>
-            <p id="conversation-meta">连接到电脑上的 Codex</p>
           </div>
-          <button id="refresh-button" class="icon-button" type="button" aria-label="刷新" title="刷新">
-            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"></path><path d="M20 4v7h-7"></path></svg>
-          </button>
+          <details id="conversation-actions" class="conversation-actions">
+            <summary class="icon-button" aria-label="会话详情与操作" title="会话详情与操作">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>
+            </summary>
+            <div class="conversation-actions-menu">
+              <p id="conversation-meta" role="status">连接到电脑上的 Codex</p>
+              <button id="refresh-button" type="button" aria-label="刷新" title="刷新">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"></path><path d="M20 4v7h-7"></path></svg>
+                刷新会话
+              </button>
+            </div>
+          </details>
         </header>
+
+        <div id="network-banner" class="network-banner" role="status" hidden>
+          <span id="network-message"></span>
+          <button id="reconnect-button" type="button">重新连接</button>
+        </div>
 
         <div id="conversation-placeholder" class="conversation-placeholder">
           <div class="placeholder-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="4"></rect><path d="m8 10 3 2-3 2"></path><path d="M13 15h3"></path></svg>
           </div>
-          <p id="placeholder-title">从左侧选择一个会话</p>
-          <span id="placeholder-detail">消息和任务状态会自动更新。</span>
+          <p id="placeholder-title">继续工作</p>
+          <span id="placeholder-detail">Codex Pocket</span>
         </div>
 
         <div id="message-list" class="message-list" aria-live="polite" hidden></div>
         <div id="approval-tray" class="approval-tray" aria-live="assertive" hidden></div>
 
         <form id="composer" class="composer-shell" hidden>
+          <button id="latest-button" class="latest-button" type="button" aria-label="回到最新消息" title="回到最新消息" hidden>↓</button>
+          <span id="draft-status" class="draft-status" role="status" hidden></span>
           <div id="composer-menu" class="composer-menu" role="dialog" hidden></div>
-          <div class="composer-box">
-            <div class="composer-context-row">
-              <div id="mode-control" class="mode-control" role="radiogroup" aria-label="工作模式">
-                <button class="mode-option" type="button" role="radio" data-mode="default" aria-checked="true">执行</button>
-                <button class="mode-option" type="button" role="radio" data-mode="plan" aria-checked="false">计划</button>
-                <button class="mode-option" type="button" role="radio" data-mode="goal" aria-checked="false">目标</button>
-              </div>
-              <button id="skill-control" class="composer-control skill-control" type="button" aria-haspopup="dialog" aria-expanded="false">
-                <span class="skill-symbol" aria-hidden="true">$</span>
-                <span id="skill-label">Skills</span>
-                <span id="skill-count" class="control-count" hidden></span>
+          <div id="composer-extras" class="composer-extras" role="dialog" aria-label="附件与工作选项" hidden>
+            <div class="extras-section-heading">添加</div>
+            <button id="image-upload-button" class="extras-image-button extras-menu-row" type="button" aria-label="添加图片" title="添加图片">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+              <span>添加图片</span>
+            </button>
+            <div id="mode-control" class="mode-control" role="radiogroup" aria-label="工作模式">
+              <button class="mode-option extras-menu-row" type="button" role="radio" data-mode="default" aria-checked="true" hidden>
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path><path d="M5 12h10"></path></svg><span>执行模式</span>
+              </button>
+              <button class="mode-option extras-menu-row" type="button" role="radio" data-mode="plan" aria-checked="false">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M15.09 14a6 6 0 1 0-6.18 0C9.7 14.6 10 16 10 16h4s.3-1.4 1.09-2"></path></svg><span>计划模式</span>
+              </button>
+              <button class="mode-option extras-menu-row" type="button" role="radio" data-mode="goal" aria-checked="false">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1"></circle></svg><span>目标</span>
               </button>
             </div>
-
+            <div class="extras-section-heading extras-skills-heading">技能</div>
+            <div id="extras-skills" class="extras-skills" role="group" aria-label="可用技能"></div>
+            <button id="skill-control" class="composer-control skill-control extras-menu-row" type="button" aria-controls="extras-skills" aria-expanded="false">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>
+              <span id="skill-label">全部技能</span>
+              <span id="skill-count" class="control-count" hidden></span>
+              <svg class="extras-row-chevron" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></svg>
+            </button>
+          </div>
+          <div class="composer-box">
             <div id="goal-banner" class="goal-banner" hidden>
               <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="3"></circle></svg>
               <span class="goal-copy"><span>目标</span><strong id="goal-objective"></strong></span>
@@ -115,24 +170,23 @@
             <div id="selected-skills" class="selected-skills" aria-label="已选 Skills" hidden></div>
             <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
             <label class="sr-only" for="message-input">发送消息给 Codex</label>
-            <textarea id="message-input" rows="1" maxlength="12000" placeholder="给 Codex 发送消息" autocomplete="off"></textarea>
+            <textarea id="message-input" rows="1" maxlength="12000" placeholder="随心输入" autocomplete="off"></textarea>
             <div class="composer-footer">
               <div class="composer-footer-main">
-                <button id="image-upload-button" class="composer-icon-button" type="button" aria-label="添加图片" title="添加图片">
-                  <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"></rect><circle cx="8.5" cy="10" r="1.5"></circle><path d="m21 15-5-5L5 19"></path><path d="M19 2v6M22 5h-6"></path></svg>
+                <button id="extras-button" class="composer-icon-button" type="button" aria-label="附件与工作选项" title="附件与工作选项" aria-haspopup="dialog" aria-expanded="false">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg>
                 </button>
+                <button id="permission-control" class="approval-policy composer-control" type="button" title="更改权限" aria-label="更改权限" aria-haspopup="dialog" aria-expanded="false" disabled>
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 8 4v5c0 5-8 9-8 9S4 17 4 12V7Z"></path><path d="m9 12 2 2 4-4"></path></svg>
+                  <span id="permission-label">权限</span>
+                </button>
+              </div>
                 <div class="composer-settings">
-                  <button id="model-control" class="composer-control" type="button" aria-haspopup="dialog" aria-expanded="false">
-                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 4.5 7.5v9L12 21l7.5-4.5v-9Z"></path><path d="m4.5 7.5 7.5 4.5 7.5-4.5M12 12v9"></path></svg>
+                  <button id="model-control" class="composer-control model-effort-control" type="button" aria-label="模型与思考强度" aria-haspopup="dialog" aria-controls="composer-menu" aria-expanded="false">
                     <span id="model-label">模型</span>
-                  </button>
-                  <button id="effort-control" class="composer-control" type="button" aria-haspopup="dialog" aria-expanded="false">
-                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 15h3V9H5zM10.5 18h3V6h-3zM16 20h3V4h-3z"></path></svg>
                     <span id="effort-label">强度</span>
                   </button>
                 </div>
-                <span id="composer-status" class="composer-status" role="status"></span>
-              </div>
               <div class="composer-actions">
                 <div id="delivery-control" class="delivery-control" role="radiogroup" aria-label="运行中消息处理方式" hidden>
                   <button class="delivery-option" type="button" role="radio" data-action="queue" aria-checked="true">等待</button>
@@ -146,6 +200,7 @@
                 </button>
               </div>
             </div>
+            <span id="composer-status" class="composer-status" role="status"></span>
           </div>
         </form>
       </section>

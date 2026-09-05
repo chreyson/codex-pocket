@@ -318,6 +318,27 @@ test("starting a persistent thread uses the selected project cwd", async () => {
   assert.equal(client.threadSettings.get("thread-new").model, "gpt-5.6-sol");
 });
 
+test("new threads remain readable and listed until the first persisted history", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  client.request = async (method, params) => {
+    if (method === "thread/start") {
+      assert.equal(params.projectId, "project-a");
+      return { thread: { id: "new-thread", projectId: params.projectId, turns: [] } };
+    }
+    if (method === "thread/list") return { data: [] };
+    throw new Error("no rollout found for thread id new-thread");
+  };
+  await client.startThread({ cwd: "/repo", projectId: "project-a" });
+  assert.equal((await client.listThreads()).data[0].id, "new-thread");
+  assert.equal((await client.listThreads({ archived: true })).data.length, 0);
+  assert.deepEqual((await client.readThread("new-thread")).thread.turns, []);
+  await assert.rejects(client.readThread("unrelated"), /no rollout/);
+  client.request = async () => ({ data: [{ id: "new-thread", turns: [{ id: "first-turn" }] }] });
+  assert.equal((await client.listThreads()).data.length, 1);
+  assert.equal(client.newThreads.size, 0);
+});
+
 test("invalid thread lifecycle responses never pollute loaded session state", async () => {
   const client = new CodexAppServer();
   client.start = async () => {};

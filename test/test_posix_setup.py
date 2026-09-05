@@ -49,7 +49,7 @@ class PosixSetupTests(unittest.TestCase):
         with (
             patch(
                 "setup_codex_pocket.probe_python",
-                side_effect=[True, False, False, True],
+                side_effect=[False, False, True],
             ),
             patch("setup_codex_pocket.run_pip") as run_pip,
             patch("builtins.print"),
@@ -57,11 +57,13 @@ class PosixSetupTests(unittest.TestCase):
             backend = setup.ensure_desktop_dependencies("Linux")
 
         self.assertEqual(backend, "qt")
-        run_pip.assert_called_once_with(["pywebview[pyside6]>=5.4,<6"])
+        run_pip.assert_called_once_with([
+            "-r", str(setup.REQUIREMENTS_PATH), "pywebview[pyside6]>=5.4,<6",
+        ])
 
     def test_macos_uses_the_cocoa_backend(self):
         with (
-            patch("setup_codex_pocket.probe_python", side_effect=[True, True]),
+            patch("setup_codex_pocket.probe_python", return_value=True),
             patch("setup_codex_pocket.run_pip") as run_pip,
         ):
             backend = setup.ensure_desktop_dependencies("Darwin")
@@ -125,8 +127,39 @@ class PosixSetupTests(unittest.TestCase):
                 run_name="codex_pocket_without_tkinter",
             )
 
-        self.assertIsNone(namespace["tk"])
-        self.assertIs(namespace["TkCanvasBase"], object)
+        self.assertIn("ServiceManager", namespace)
+
+    def test_check_never_installs_missing_desktop_dependencies(self):
+        with patch.object(setup, "probe_python", return_value=False), patch.object(setup, "run_pip") as pip:
+            with self.assertRaises(RuntimeError):
+                setup.ensure_desktop_dependencies("Linux", install=False)
+        pip.assert_not_called()
+
+    def test_headless_check_neither_installs_nor_launches_desktop(self):
+        with (
+            patch.object(setup.platform, "system", return_value="Linux"),
+            patch.object(setup, "ensure_project_virtualenv"),
+            patch.object(setup, "resolve_node", return_value=("/usr/bin/node", "22.0.0")),
+            patch.object(setup, "resolve_codex", return_value="/usr/bin/codex"),
+            patch.object(setup, "ensure_desktop_dependencies") as desktop,
+            patch.object(setup, "launch_desktop") as launch,
+            patch.object(setup, "write_runtime_config"),
+            patch.object(setup, "write_json_atomic"),
+            patch.dict(os.environ, {}),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(setup.main(["--headless", "--check"]), 0)
+        desktop.assert_not_called()
+        launch.assert_not_called()
+
+    def test_environment_override_precedes_saved_runtime(self):
+        with (
+            patch.dict(os.environ, {"NODE_BIN": "/override/node"}),
+            patch.object(setup, "common_bin_directories", return_value=[]),
+            patch.object(setup, "resolve_candidate", side_effect=lambda value, _dirs: Path(value)),
+        ):
+            candidates = setup.command_candidates("node", "/saved/node", "NODE_BIN")
+        self.assertEqual(candidates[:2], [Path("/override/node"), Path("/saved/node")])
 
     def test_unix_launchers_are_root_relative(self):
         project_root = Path(__file__).resolve().parents[1]

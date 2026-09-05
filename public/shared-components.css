@@ -62,3 +62,14 @@
 .command-button:disabled {
   cursor: default;
 }
+
+button {
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+button:active:not(:disabled) { filter: brightness(.96); }
+
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
+}

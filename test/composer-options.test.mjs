@@ -71,6 +71,23 @@ test("composer catalog exposes account options without leaking skill paths", () 
   assert.equal(catalog.skills[0].path, "C:\\private\\docs\\SKILL.md");
 });
 
+test("configured and active hidden models remain selectable without exposing unrelated hidden models", () => {
+  const raw = rawCatalog();
+  raw.models.push({ model: "gpt-6-astra", hidden: true, supportedReasoningEfforts: [
+    { reasoningEffort: "low" }, { reasoningEffort: "ultra" },
+  ], defaultReasoningEffort: "low" });
+  raw.configuredModel = "gpt-6-astra";
+  const catalog = normalizeComposerCatalog(raw);
+  assert.deepEqual(catalog.models.map((item) => item.id), ["gpt-balanced", "gpt-6-astra"]);
+  assert.equal(catalog.defaultModel, "gpt-6-astra");
+  assert.equal(resolveComposerSelection({ model: "gpt-6-astra", effort: "ultra" }, catalog).effort, "ultra");
+  raw.current = { model: "hidden-model" };
+  assert.equal(normalizeComposerCatalog(raw).defaultModel, "hidden-model");
+  raw.configuredModel = "not-in-catalog";
+  raw.current = null;
+  assert.deepEqual(normalizeComposerCatalog(raw).models.map((item) => item.id), ["gpt-balanced"]);
+});
+
 test("composer selections validate model effort mode and selected skills", () => {
   const catalog = normalizeComposerCatalog(rawCatalog());
   const selection = resolveComposerSelection({

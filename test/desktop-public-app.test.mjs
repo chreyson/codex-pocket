@@ -19,6 +19,7 @@ const ELEMENT_IDS = [
   "dismiss-error",
   "copy-toast",
   "copy-toast-text",
+  "connection-description",
 ];
 
 class FakeClassList {

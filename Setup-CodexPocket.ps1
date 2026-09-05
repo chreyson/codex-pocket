@@ -179,6 +179,7 @@ try {
     Write-Host 'Checking Python, Node.js, Codex, and WebView2...'
     $script:pocketPython = Resolve-PocketPython $configuredPython
     $node = Resolve-PocketNode $configuredNode
+    $env:Path = (Split-Path -Parent $node.Path) + ';' + ((Get-PocketPathEntries) -join ';')
     $codexPath = Resolve-PocketCodex $configuredCodex
     $webView2Path = Find-WebView2Runtime
     if (-not $webView2Path) {

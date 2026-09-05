@@ -10,6 +10,7 @@ import {
 } from "./desktop-delivery.mjs";
 import { ImageStore, MAX_IMAGE_BYTES } from "./image-store.mjs";
 import { boundedInteger, loopbackHost } from "./runtime-config.mjs";
+import { createProject, listProjects, updateProject, managementName, managementError } from "./management.mjs";
 import {
   collectTrackedThreadIds,
   parseApprovalPayload,
@@ -93,6 +94,8 @@ const desktopBridge = new CodexDesktopBridge();
 let codexState = "starting";
 let codexError = "";
 const queuedTurns = new Map();
+const queueEvents = new Map();
+let nextQueueEventId = 1;
 const drainingQueuedThreads = new Set();
 codex.on("ready", () => {
   codexState = "ready";
@@ -122,6 +125,16 @@ let desktopPollDueAt = 0;
 let desktopPolling = false;
 let latestThreads = [];
 let latestThreadsHash = "";
+let latestProjects = [];
+let projectsSupported = true;
+let latestProjectsHash = "";
+const managementMutations = new Set();
+let shuttingDown = false;
+let pollFailures = 0;
+const threadLoads = new Map();
+const pollingThreads = new Set();
+const httpWatches = new Map();
+const desktopSnapshots = new Map();
 
 function commonHeaders(extra = {}) {
   return {
@@ -216,6 +229,12 @@ function sseSend(client, event, value) {
 }
 
 function broadcastMessageEvent(event, value) {
+  if (event === "queueStarted" || event === "queueFailed") {
+    value = { ...value, eventId: nextQueueEventId++ };
+    queueEvents.delete(value.threadId);
+    queueEvents.set(value.threadId, { event, value });
+    if (queueEvents.size > 128) queueEvents.delete(queueEvents.keys().next().value);
+  }
   for (const client of clients) {
     if (client.threadId === value.threadId) sseSend(client, event, value);
   }
@@ -227,10 +246,26 @@ codex.on("messageDone", (value) => broadcastMessageEvent("messageDone", value));
 
 async function loadThreads() {
   const result = await codex.listThreads();
+  if (projectsSupported) {
+    try { latestProjects = await listProjects(codex); }
+    catch (error) {
+      if (error.code !== -32601 && !/unknown method|method not found|experimental.*required/i.test(error.message)) throw error;
+      projectsSupported = false;
+    }
+  }
+  codexState = "ready";
+  codexError = "";
   const data = Array.isArray(result?.data) ? result.data : [];
   return data
     .filter((thread) => thread && typeof thread === "object" && typeof thread.id === "string")
-    .map(sanitizeThreadSummary);
+    .map(sidebarThread);
+}
+
+function sidebarThread(value) {
+  const summary = sanitizeThreadSummary(value);
+  const project = latestProjects.find((item) => item.id === summary.projectId)
+    || (!summary.projectId && latestProjects.find((item) => item.roots.some((root) => path.normalize(root) === path.normalize(value.cwd || ""))));
+  return project ? { ...summary, project: project.name, projectId: project.id } : summary;
 }
 
 function desktopMutationError(message, code) {
@@ -319,7 +354,15 @@ async function drainQueuedTurn(threadId) {
   }
 }
 
-async function loadThreadState(threadId) {
+function loadThreadState(threadId) {
+  if (!threadLoads.has(threadId)) {
+    const pending = readThreadState(threadId).finally(() => threadLoads.delete(threadId));
+    threadLoads.set(threadId, pending);
+  }
+  return threadLoads.get(threadId);
+}
+
+async function readThreadState(threadId) {
   try {
     const result = await codex.readThread(threadId);
     if (!result?.thread?.id) throw new Error("Codex App Server 返回的会话快照无效");
@@ -402,6 +445,7 @@ async function loadThreadPage(threadId) {
 }
 
 function schedulePoll(delay = POLL_INTERVAL_MS) {
+  if (shuttingDown) return;
   const dueAt = Date.now() + delay;
   if (pollTimer && pollDueAt <= dueAt) return;
   if (pollTimer) clearTimeout(pollTimer);
@@ -414,12 +458,18 @@ function schedulePoll(delay = POLL_INTERVAL_MS) {
 }
 
 async function runPoll() {
+  if (shuttingDown) return;
   if (polling) return schedulePoll();
   polling = true;
   try {
+    if (!clients.size && !queuedTurns.size && codexState === "ready") return;
     const threads = await loadThreads();
-    codexState = "ready";
-    codexError = "";
+    pollFailures = 0;
+    const projectsHash = JSON.stringify(latestProjects);
+    if (projectsHash !== latestProjectsHash) {
+      latestProjectsHash = projectsHash;
+      for (const client of clients) sseSend(client, "projects", latestProjects);
+    }
     const threadsHash = JSON.stringify(threads);
     if (threadsHash !== latestThreadsHash) {
       latestThreads = threads;
@@ -429,39 +479,51 @@ async function runPoll() {
 
     const watchedIds = collectTrackedThreadIds(clients, queuedTurns.keys());
     for (const threadId of watchedIds) {
-      try {
-        const { thread, agentMessages } = await loadThreadState(threadId);
-        const hash = JSON.stringify(thread);
-        let broadcasted = false;
-        for (const client of clients) {
-          if (client.threadId === threadId && client.threadHash !== hash) {
-            client.threadHash = hash;
-            if (sseSend(client, "thread", thread)) broadcasted = true;
-          }
-        }
-        if (broadcasted) codex.confirmLiveAgentMessageSnapshot(threadId, agentMessages);
-        observeQueuedTurn(threadId, thread.control?.busy);
-      } catch (error) {
-        for (const client of clients) {
-          if (client.threadId === threadId) sseSend(client, "threadError", { message: error.message });
-        }
-      }
+      if (!pollingThreads.has(threadId)) void pollThread(threadId);
     }
 
     for (const client of clients) {
       sseSend(client, "status", { state: codexState, error: codexError });
     }
   } catch (error) {
+    pollFailures += 1;
     codexState = "error";
     codexError = error.message;
     for (const client of clients) sseSend(client, "status", { state: codexState, error: codexError });
   } finally {
     polling = false;
-    schedulePoll();
+    schedulePoll(pollFailures
+      ? Math.min(30_000, POLL_INTERVAL_MS * 2 ** Math.min(pollFailures, 5))
+      : clients.size || queuedTurns.size ? POLL_INTERVAL_MS : 15_000);
+  }
+}
+
+async function pollThread(threadId) {
+  pollingThreads.add(threadId);
+  try {
+    const { thread, agentMessages } = await loadThreadState(threadId);
+    if (shuttingDown) return;
+    const hash = JSON.stringify(thread);
+    let broadcasted = false;
+    for (const client of clients) {
+      if (client.threadId === threadId && client.threadHash !== hash) {
+        client.threadHash = hash;
+        if (sseSend(client, "thread", thread)) broadcasted = true;
+      }
+    }
+    if (broadcasted) codex.confirmLiveAgentMessageSnapshot(threadId, agentMessages);
+    observeQueuedTurn(threadId, thread.control?.busy);
+  } catch (error) {
+    for (const client of clients) {
+      if (client.threadId === threadId) sseSend(client, "threadError", { message: error.message });
+    }
+  } finally {
+    pollingThreads.delete(threadId);
   }
 }
 
 function scheduleDesktopPoll(delay = DESKTOP_SYNC_INTERVAL_MS) {
+  if (shuttingDown) return;
   const dueAt = Date.now() + delay;
   if (desktopPollTimer && desktopPollDueAt <= dueAt) return;
   if (desktopPollTimer) clearTimeout(desktopPollTimer);
@@ -474,10 +536,17 @@ function scheduleDesktopPoll(delay = DESKTOP_SYNC_INTERVAL_MS) {
 }
 
 async function runDesktopPoll() {
+  if (shuttingDown) return;
   if (desktopPolling) return scheduleDesktopPoll();
-  const watchedIds = [...new Set(
-    [...clients].map((client) => client.threadId).filter(Boolean),
-  )];
+  for (const [threadId, timestamp] of httpWatches) {
+    if (Date.now() - timestamp > 15_000) httpWatches.delete(threadId);
+  }
+  const watchedIds = [...new Set([
+    ...[...clients].map((client) => client.threadId).filter(Boolean), ...httpWatches.keys(),
+  ])];
+  for (const threadId of desktopSnapshots.keys()) {
+    if (!watchedIds.includes(threadId)) desktopSnapshots.delete(threadId);
+  }
   if (!watchedIds.length) return scheduleDesktopPoll(1_000);
 
   desktopPolling = true;
@@ -497,6 +566,7 @@ async function runDesktopPoll() {
 
     for (const { threadId, snapshot, error } of results) {
       if (error) {
+        desktopSnapshots.delete(threadId);
         if ([
           "DESKTOP_BRIDGE_UNAVAILABLE",
           "DESKTOP_BRIDGE_TOOL_UNAVAILABLE",
@@ -506,6 +576,7 @@ async function runDesktopPoll() {
       }
 
       const hash = JSON.stringify(snapshot);
+      desktopSnapshots.set(threadId, snapshot);
       for (const client of clients) {
         if (client.threadId !== threadId || client.desktopThreadHash === hash) continue;
         client.desktopThreadHash = hash;
@@ -550,7 +621,7 @@ function enforceActionRateLimit(request) {
 }
 
 function parseThreadRoute(pathname) {
-  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|interrupt|approvals|goal)(?:\/([^/]+))?)?$/);
+  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|interrupt|approvals|goal|permissions|rename|archive|restore)(?:\/([^/]+))?)?$/);
   if (!match) return null;
   try {
     return {
@@ -568,7 +639,7 @@ function parseThreadRoute(pathname) {
 function isThreadMutation(method, route) {
   if (!route?.action) return false;
   if (route.action === "goal") return ["POST", "DELETE"].includes(method);
-  return method === "POST" && ["messages", "interrupt", "approvals"].includes(route.action);
+  return method === "POST" && ["messages", "interrupt", "approvals", "permissions", "rename", "archive", "restore"].includes(route.action);
 }
 
 async function prepareGoalForTurn(threadId, message, selection, goal, dispatch) {
@@ -689,23 +760,83 @@ const server = createServer(async (request, response) => {
       latestThreadsHash = JSON.stringify(threads);
       return sendJson(response, 200, {
         status: { state: codexState, error: codexError },
+        transports: ["sse", "poll"],
+        projects: latestProjects,
+        projectsSupported,
         threads,
       });
     }
 
+    if (request.method === "GET" && pathname === "/api/sync") {
+      const threadId = url.searchParams.get("threadId") || "";
+      if (threadId) httpWatches.set(threadId, Date.now());
+      const [threads, state] = await Promise.all([
+        loadThreads(), threadId ? loadThreadState(threadId) : null,
+      ]);
+      const events = [{ event: "projects", value: latestProjects }, { event: "threads", value: threads }];
+      if (state) {
+        const queued = queueEvents.get(threadId);
+        if (queued) events.push(queued);
+        events.push({ event: "desktopThread", value: desktopSnapshots.get(threadId) || null });
+        events.push({ event: "thread", value: state.thread });
+        codex.confirmLiveAgentMessageSnapshot(threadId, state.agentMessages);
+        events.push(...codex.liveAgentMessagesForThread(threadId));
+      }
+      events.push({ event: "status", value: { state: codexState, error: codexError } });
+      return sendJson(response, 200, { events });
+    }
+
+    if (request.method === "GET" && pathname === "/api/projects") {
+      await loadThreads();
+      return sendJson(response, 200, { projects: latestProjects, projectsSupported });
+    }
+    if (request.method === "POST" && pathname === "/api/projects") {
+      enforceActionRateLimit(request);
+      const project = await createProject(codex, await readJson(request, 8_192));
+      schedulePoll(0);
+      return sendJson(response, 201, { project });
+    }
+    const projectRoute = pathname.match(/^\/api\/projects\/([^/]+)\/(rename|archive|restore)$/);
+    if (request.method === "POST" && projectRoute) {
+      enforceActionRateLimit(request);
+      const projectId = decodeURIComponent(projectRoute[1]);
+      if (managementMutations.has(projectId)) throw managementError(409, "项目正在更新，请稍后重试");
+      const value = await readJson(request, 2_048);
+      managementMutations.add(projectId);
+      try {
+        const project = await updateProject(codex, projectId, projectRoute[2], value);
+        schedulePoll(0);
+        return sendJson(response, 200, { project });
+      } finally { managementMutations.delete(projectId); }
+    }
+    if (request.method === "GET" && pathname === "/api/threads") {
+      const archived = url.searchParams.get("archived") === "true";
+      const page = await codex.listThreads({ archived, limit: 100, cursor: url.searchParams.get("cursor") || undefined });
+      return sendJson(response, 200, { threads: page.data.map(sidebarThread), nextCursor: page.nextCursor || null });
+    }
     if (request.method === "POST" && pathname === "/api/threads") {
       enforceActionRateLimit(request);
-      const { projectThreadId } = parseThreadCreatePayload(await readJson(request, 2_048));
-      const source = await codex.readThread(projectThreadId, { includeTurns: false });
-      const cwd = typeof source.thread?.cwd === "string" ? source.thread.cwd.trim() : "";
-      if (!source.thread?.id || !cwd) {
+      const value = await readJson(request, 2_048);
+      let cwd, projectId;
+      if (typeof value?.projectId === "string" && value.projectId) {
+        const { project } = await codex.request("project/read", { projectId: value.projectId });
+        if (project.metadata?.["codexPocket.archived"] === "true") throw managementError(409, "请先恢复项目");
+        cwd = project.roots?.[0]?.path;
+        projectId = project.id;
+      } else {
+        const { projectThreadId } = parseThreadCreatePayload(value);
+        const source = await codex.readThread(projectThreadId, { includeTurns: false });
+        cwd = source.thread?.cwd;
+        projectId = source.thread?.projectId;
+      }
+      if (typeof cwd !== "string" || !cwd.trim()) {
         const error = new Error("无法读取这个项目的工作目录");
         error.status = 409;
         throw error;
       }
-      const result = await codex.startThread({ cwd });
+      const result = await codex.startThread({ cwd, projectId });
       if (!result.thread?.id) throw new Error("Codex 未返回新会话");
-      const thread = sanitizeThreadSummary(result.thread);
+      const thread = sidebarThread(result.thread);
       schedulePoll(0);
       return sendJson(response, 201, { ok: true, thread });
     }
@@ -716,6 +847,46 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && threadRoute && !threadRoute.action) {
       return sendJson(response, 200, await loadThreadPage(threadRoute.threadId));
+    }
+
+    if (request.method === "POST" && ["rename", "archive", "restore"].includes(threadRoute?.action) && !threadRoute.requestToken) {
+      const { threadId, action } = threadRoute;
+      const value = await readJson(request, 2_048);
+      if (managementMutations.has(threadId)) throw managementError(409, "会话正在更新，请稍后重试");
+      managementMutations.add(threadId);
+      try {
+        if (action === "archive") {
+          const state = await loadThreadState(threadId);
+          if (state.thread.control?.busy || queuedTurns.has(threadId)) throw managementError(409, "请在任务和等待消息处理完成后归档");
+          await codex.request("thread/archive", { threadId });
+        } else if (action === "restore") await codex.request("thread/unarchive", { threadId });
+        else {
+          const name = managementName(value?.name);
+          await codex.request("thread/name/set", { threadId, name });
+          const draft = codex.newThreads.get(threadId);
+          if (draft) codex.newThreads.set(threadId, { ...draft, name });
+        }
+        if (action === "archive") codex.newThreads.delete(threadId);
+        schedulePoll(0);
+        return sendJson(response, 200, { ok: true });
+      } catch (error) {
+        if (action === "archive" && /no rollout found|not materialized/i.test(error.message)) throw managementError(409, "该会话尚无历史内容，发送第一条消息后可以归档");
+        throw error;
+      } finally { managementMutations.delete(threadId); }
+    }
+
+    if (request.method === "POST" && threadRoute?.action === "permissions" && !threadRoute.requestToken) {
+      const { threadId } = threadRoute;
+      const value = await readJson(request, 2_048);
+      const state = await loadThreadState(threadId);
+      if (state.thread.control?.busy || queuedTurns.has(threadId)) {
+        const error = new Error("请在当前任务结束后更改权限");
+        error.status = 409;
+        throw error;
+      }
+      const catalog = await codex.readPermissions(threadId, state.catalogThread?.cwd);
+      const permissions = await codex.updatePermissions(threadId, value?.mode, catalog);
+      return sendJson(response, 200, { permissions });
     }
 
     if (request.method === "POST" && threadRoute?.action === "messages" && !threadRoute.requestToken) {
@@ -739,6 +910,7 @@ const server = createServer(async (request, response) => {
           options: prepared.options,
         };
         queuedTurns.set(threadRoute.threadId, queued);
+        queueEvents.delete(threadRoute.threadId);
         imageStore.commitUploads(message.imageIds || []);
         schedulePoll(10);
         return sendJson(response, 202, {
@@ -785,6 +957,7 @@ const server = createServer(async (request, response) => {
         throw desktopMutationError(DESKTOP_STEER_UNAVAILABLE, "DESKTOP_WRITER_CONFLICT");
       }
       imageStore.commitUploads(message.imageIds || []);
+      queueEvents.delete(threadRoute.threadId);
       schedulePoll(10);
       scheduleDesktopPoll(0);
       return sendJson(response, 202, {
@@ -897,14 +1070,22 @@ const server = createServer(async (request, response) => {
         desktopThreadHash: "",
       };
       clients.add(client);
+      const heartbeat = setInterval(() => {
+        sseSend(client, "heartbeat", { timestamp: Date.now() });
+      }, 15000);
+      heartbeat.unref();
+      response.on("close", () => {
+        clearInterval(heartbeat);
+        clients.delete(client);
+      });
       sseSend(client, "threads", latestThreads);
+      sseSend(client, "projects", latestProjects);
       sseSend(client, "status", { state: codexState, error: codexError });
       for (const liveMessage of codex.liveAgentMessagesForThread(client.threadId)) {
         sseSend(client, liveMessage.event, liveMessage.value);
       }
       schedulePoll(10);
       scheduleDesktopPoll(0);
-      request.on("close", () => clients.delete(client));
       return;
     }
 
@@ -969,7 +1150,7 @@ server.on("error", (error) => {
 });
 
 server.listen(PORT, HOST, () => {
-  const localUrl = `http://${HOST}:${PORT}/`;
+  const localUrl = `http://${HOST === "::1" ? "[::1]" : HOST}:${PORT}/`;
   void fs.writeFile(path.join(DATA_DIR, "local-url.txt"), `${localUrl}\n`, "utf8")
     .catch((error) => console.error(`Unable to write local URL: ${error.message}`));
   console.log(`Codex Pocket: ${localUrl}`);
@@ -981,8 +1162,6 @@ server.listen(PORT, HOST, () => {
   schedulePoll(50);
   scheduleDesktopPoll(50);
 });
-
-let shuttingDown = false;
 
 function shutdown() {
   if (shuttingDown) return;

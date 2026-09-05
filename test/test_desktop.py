@@ -6,29 +6,94 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from codex_pocket import (
     ServiceManager,
     SingleInstanceLock,
     cloudflared_download_spec,
-    constrain_tooltip_position,
-    dpi_scale,
     enable_windows_dpi_awareness,
     ensure_cloudflared,
     find_codex,
     find_node,
     hidden_process_options,
-    monitor_work_area_for_point,
     parse_tunnel_url,
     runtime_configured_path,
     run_headless,
     terminate_process_tree,
-    window_position,
 )
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_windows_arm64_uses_an_existing_cloudflare_release_asset(self):
+        url, archive = cloudflared_download_spec("Windows", "ARM64")
+        self.assertTrue(url.endswith("cloudflared-windows-amd64.exe"))
+        self.assertFalse(archive)
+
+    def test_tunnel_recovery_retries_without_stopping_local_tasks_or_rotating_key(self):
+        ready = []
+        manager = ServiceManager(lambda _value: None, lambda *args: ready.append(args), lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        viewer = SimpleNamespace(poll=lambda: None)
+        manager.viewer_process = viewer
+        manager.port = 4173
+        manager.access_key = "existing-key"
+        tunnel = SimpleNamespace(poll=lambda: None)
+
+        def connected(_run, process):
+            self.assertIs(process, tunnel)
+            manager.public_url = "https://recovered.trycloudflare.com"
+
+        with (
+            patch.object(run.cancel, "wait", return_value=False),
+            patch.object(manager, "_start_tunnel", side_effect=[OSError("network unavailable"), tunnel]) as start,
+            patch.object(manager, "_wait_for_tunnel", side_effect=connected),
+            patch.object(manager, "_log"),
+            patch("codex_pocket.terminate_process_tree") as terminate,
+        ):
+            self.assertIs(manager._recover_tunnel(run, "cloudflared"), tunnel)
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(start.call_args.args, (run, "cloudflared", 4173))
+        self.assertIs(manager.viewer_process, viewer)
+        self.assertEqual(ready, [("https://recovered.trycloudflare.com", "existing-key")])
+        terminate.assert_called_once_with(None)
+
+    def test_tunnel_recovery_cancellation_does_not_spawn_another_process(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        manager.request_shutdown()
+        with patch.object(manager, "_start_tunnel") as start:
+            with self.assertRaises(manager._StartCancelled):
+                manager._recover_tunnel(run, "cloudflared")
+        start.assert_not_called()
+
+    def test_monitor_recovers_an_exited_tunnel_without_stopping_the_viewer(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        viewer = SimpleNamespace(poll=lambda: None)
+        exited = SimpleNamespace(poll=lambda: 17)
+        with (
+            patch.object(run.cancel, "wait", side_effect=[False, True]),
+            patch.object(manager, "_recover_tunnel", return_value=viewer) as recover,
+            patch.object(manager, "_stop_run") as stop,
+        ):
+            manager._watch_processes(run, viewer, exited, "cloudflared")
+        recover.assert_called_once_with(run, "cloudflared")
+        stop.assert_not_called()
+
+    def test_old_tunnel_output_cannot_replace_a_recovered_url(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        manager.tunnel_process = object()
+        manager._read_stream("tunnel", io.StringIO("https://old.trycloudflare.com\n"), run, object())
+        self.assertEqual(manager.public_url, "")
+        self.assertFalse(manager._url_event.is_set())
+
     def test_headless_mode_exits_and_cleans_up_after_service_failure(self):
         instances = []
 
@@ -340,36 +405,25 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertTrue(linux.endswith("cloudflared-linux-amd64"))
         self.assertFalse(linux_archive)
 
-    def test_scales_fixed_dimensions_for_high_dpi(self):
-        self.assertEqual(dpi_scale(96), 1.0)
-        self.assertEqual(dpi_scale(120), 1.25)
-        self.assertEqual(dpi_scale(144), 1.5)
-        self.assertEqual(dpi_scale(72), 1.0)
-        self.assertEqual(dpi_scale(480), 3.0)
-        self.assertEqual(dpi_scale(None), 1.0)
-
     def test_dpi_awareness_is_a_noop_outside_windows(self):
         self.assertFalse(enable_windows_dpi_awareness("Linux"))
 
-    def test_tooltip_stays_on_negative_coordinate_monitor_and_flips_above(self):
-        position = constrain_tooltip_position(
-            x=-1820,
-            y=1020,
-            width=160,
-            height=40,
-            anchor_top=990,
-            gap=8,
-            work_area=(-1920, 0, 0, 1040),
-        )
-        self.assertEqual(position, (-1820, 942))
-        self.assertEqual(window_position(*position), "-1820+942")
+    def test_port_allocation_failure_does_not_leave_start_or_stop_stuck(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        with patch("codex_pocket.find_free_port", side_effect=OSError("port unavailable")):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, "port unavailable"):
+                    manager.start()
+                self.assertIsNone(manager._run)
+                self.assertIsNone(manager._starting_run)
+                manager.stop()
 
-    def test_monitor_work_area_has_a_platform_api_fallback(self):
-        fallback = (-1920, 0, 1920, 1080)
-        self.assertEqual(
-            monitor_work_area_for_point(-800, 400, fallback, "Linux"),
-            fallback,
-        )
+    def test_direct_gui_entry_uses_the_same_webview_host(self):
+        from codex_pocket import main
+
+        with patch("sys.argv", ["codex_pocket.py"]), patch("desktop_host.main", return_value=0) as desktop:
+            self.assertEqual(main(), 0)
+        desktop.assert_called_once_with()
 
     def test_shutdown_during_environment_check_prevents_process_spawn(self):
         manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
@@ -390,6 +444,7 @@ class DesktopControllerTests(unittest.TestCase):
                 errors.append(error)
 
         with (
+            patch("codex_pocket.find_free_port", return_value=4173),
             patch("codex_pocket.find_node", side_effect=delayed_find_node),
             patch("codex_pocket.find_codex", return_value="codex"),
             patch("codex_pocket.ensure_cloudflared", return_value="cloudflared"),
@@ -454,6 +509,7 @@ class DesktopControllerTests(unittest.TestCase):
             stop_returned.set()
 
         with (
+            patch("codex_pocket.find_free_port", return_value=4173),
             patch("codex_pocket.find_node", return_value="node"),
             patch("codex_pocket.find_codex", return_value="codex"),
             patch("codex_pocket.ensure_cloudflared", return_value="cloudflared"),

@@ -27,7 +27,7 @@ function cleanText(value, limit = 2_000) {
 
 function projectName(value) {
   const normalized = cleanText(value, 1_000).replace(/[\\/]+$/, "");
-  return normalized ? path.basename(normalized) || normalized : "";
+  return normalized ? path.win32.basename(normalized) || normalized : "";
 }
 
 export function parseMessagePayload(value) {

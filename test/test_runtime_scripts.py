@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -6,6 +7,36 @@ from pathlib import Path
 
 
 class LauncherContractTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX shell launcher")
+    def test_first_headless_launch_preserves_arguments_from_another_directory(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project with spaces"
+            root.mkdir()
+            shutil.copyfile(project_root / "CodexPocket.sh", root / "CodexPocket.sh")
+            (root / "Install-CodexPocket.sh").write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["/bin/sh", str(root / "CodexPocket.sh"), "--headless"],
+                cwd=directory, capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "--headless")
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell launcher")
+    def test_check_without_a_venv_does_not_start_the_installer(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = Path(directory) / "CodexPocket.sh"
+            shutil.copyfile(project_root / "CodexPocket.sh", launcher)
+            result = subprocess.run(
+                ["/bin/sh", str(launcher), "--check"],
+                cwd=directory, capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("environment is missing", result.stderr)
+
     def test_double_click_launchers_are_root_relative_and_keep_failures_visible(self):
         project_root = Path(__file__).resolve().parents[1]
         installer = (project_root / "Install-CodexPocket.cmd").read_text(

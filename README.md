@@ -2,7 +2,7 @@
 
 Codex Pocket 是一个最小的手机端 Codex 会话遥控器。电脑端读取 Codex App 使用的
 同一份会话数据，再通过 Cloudflare Quick Tunnel 提供临时 HTTPS 入口。手机可以
-实时查看回复增量、思考、工具活动和对话图片，发送文字或图片消息，中断或继续任务，
+查看持续更新的回复、思考、工具活动和对话图片，发送文字或图片消息，中断或继续任务，
 并处理常见的命令与文件修改审批。
 
 Web composer 会直接读取当前 Codex 账户和项目的能力目录，支持选择模型、该模型实际
@@ -17,7 +17,7 @@ Codex App Server 始终只通过本机 stdio 连接，不会直接暴露到公�
 ### 通用前置环境
 
 - Python 3.8 或更高版本。
-- Node.js 20 或更高版本。
+- Node.js 20 或更高版本，推荐使用 Node.js 22/24 LTS。
 - Codex App 或 Codex CLI；先打开或运行一次，确认 API 登录配置可正常使用。
 - 项目目录必须对当前用户可写。下载或克隆后请保留整个目录，不要只复制启动文件。
 
@@ -28,6 +28,8 @@ Codex App Server 始终只通过本机 stdio 连接，不会直接暴露到公�
 
 支持 Windows 10/11。系统还需要 Microsoft Edge WebView2 Runtime，通常已经预装；
 缺失时安装 [Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+ARM64 设备需要 Windows 11 的 x64 兼容运行支持；Cloudflare 尚未提供 Windows ARM64
+原生包，安装器会使用官方 x64 包。
 
 首次使用直接双击 `Install-CodexPocket.cmd`。安装窗口会自动切换到项目目录、检查环境、
 准备依赖并打开 Codex Pocket，不需要手动输入命令。以后双击 `CodexPocket.cmd` 即可。
@@ -49,6 +51,11 @@ macOS 首次拦截脚本，可在 Finder 中右键该文件并选择“打开”
 nvm、fnm、asdf、mise、Bun 和常见用户级目录，因此这些位置中的 Node/Codex 不要求
 额外加入 Finder 的 `PATH`。
 
+部分 macOS Codex App 版本会对桌面通信接口校验调用进程的代码签名，拒绝 Pocket 的
+Node 进程，日志表现为 `missing-code-signing-identity`。这种情况下，桌面持有会话的
+原生续写回退不可用；设置接口路径无法解决。可使用由 Pocket 管理的任务，或在桌面
+释放会话后通过 App Server 接续。手机端不能保证接管桌面正在运行的任务。
+
 ### Linux
 
 支持带 X11 或 Wayland 图形桌面的主流 x86_64/arm64 发行版。在文件管理器的“属性 / 权限”
@@ -65,6 +72,9 @@ Ubuntu 如果不能创建 venv，需要先安装 `python3-venv`；极简桌面�
 ```sh
 ./CodexPocket.sh --headless
 ```
+
+首次安装也可以运行 `./Install-CodexPocket.sh --headless`。无界面模式不会安装 GTK、Qt
+或 Cocoa 依赖；`./CodexPocket.sh --headless --check` 只检查环境。
 
 ### 跨电脑与非标准安装
 
@@ -96,7 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Setup-CodexPocket.ps1 `
 | --- | --- | --- |
 | 出站 | UDP 7844 | Cloudflare Tunnel 的 QUIC 首选连接 |
 | 出站 | TCP 7844 | QUIC 不可用时的 HTTP/2 连接 |
-| 出站 | TCP 443 | Quick Tunnel 建立、HTTPS 控制请求及回退连接 |
+| 出站 | TCP 443 | Quick Tunnel 建立与 HTTPS 控制请求 |
 
 不创建 Windows 入站规则，不需要在路由器上做端口映射，也不需要公网 IP。手机的
 HTTPS 请求先到 Cloudflare，再沿电脑主动建立的出站隧道返回本机服务。本地查看器
@@ -127,10 +137,44 @@ macOS/Linux 安装器不修改系统防火墙。这些系统只需允许 `cloudf
 访问密钥，Quick Tunnel 的公网域名也可能变化。桌面控制器只允许一个实例运行，
 重复双击不会启动第二套端口和隧道。
 
+运行中的 Cloudflared 进程意外退出后，控制器会单独恢复隧道，保留本地 Codex 服务、
+任务和访问密钥。恢复失败时逐步延长重试间隔，最长 30 秒；点击“取消启动”可停止。
+Quick Tunnel 重建可能产生新域名，需要从桌面窗口获取新链接。普通网络中断且进程仍在
+运行时，由 Cloudflared 自身重连。电脑休眠或关机期间无法继续提供远程访问。
+
+### 手机接续工作
+
+- 文字草稿按会话保存在当前浏览器，切换会话、刷新或锁屏返回后可继续编辑；成功收到
+  服务端的发送确认后清除对应草稿。最多保留 30 个会话的草稿，恢复时忽略超过 7 天的内容。
+  图片附件不跨页面刷新保存。浏览器禁用存储时，文字草稿只能保留在当前页面。
+- 重新打开同一访问地址会恢复上次会话；刷新按钮原地同步消息和能力目录，保留当前
+  输入及附件。网络恢复、页面重新可见时重新建立事件流，服务器每 15 秒发送保活消息。
+- Cloudflare 官方明确表示 Quick Tunnel 不支持 SSE，因此 `trycloudflare.com` 地址
+  使用普通 HTTPS 同步，任务运行时约每 0.5 秒刷新一次，空闲时约每 1.5 秒刷新一次
+  （另加请求耗时）。其他地址优先使用 SSE，连接失败或持续没有事件时自动转入 HTTPS
+  同步。两种通道共用消息更新逻辑，切换时保留草稿和阅读位置。
+- 断网时仍可编辑文字，会话页显示连接状态，恢复连接后不会自动发送草稿。
+  若发送时没有收到确认，先核对会话最新消息再决定是否重试。
+- 手机回车换行，发送按钮提交；外接键盘也可使用 Command/Ctrl + Enter。桌面键盘仍
+  支持 Enter 发送、Shift + Enter 换行，中文输入法选字不会触发发送。
+- 向上阅读历史消息时保持当前位置，可用向下箭头返回最新消息。键盘弹出时按可见
+  视口调整输入区；系统开启减少动态效果时沿用静态交互。
+- 工具活动默认显示一行操作摘要，思考内容默认收起；点击摘要可以展开细节。
+  展开状态在实时更新时保留。工具失败在细节内标记，审批请求和任务错误仍独立显示。
+- 输入框左下角的 `+` 打开图片、工作模式与 Skills 选项；模型和推理强度位于右下角。
+  权限菜单沿用 Codex App 的中文名称：“请求批准”“帮我批准”“完全访问权限”。
+  切换后立即保存到当前任务，运行中和有等待消息时不能更改。不可用的模式会禁用；
+  未能读取当前任务权限时显示“自定义”，不会猜测或自动放宽权限。
+
+草稿保存在浏览器对应域名的本地存储中；Quick Tunnel 更换域名、清理站点数据或换用
+另一台手机后，无法读取原域名的草稿。远程继续工作仍要求电脑保持运行和联网。
+
 ### Composer 选项
 
 - **模型与推理强度**：模型来自 App Server 的 `model/list`；切换模型后，只显示该
   模型支持的强度。选择会保存在当前浏览器中，并在服务端再次校验。
+  配置或当前任务明确选用的隐藏模型也会保留，例如 `gpt-6-astra`；其余隐藏模型仍不展示。
+  出现在目录中不等于账户已获得调用权限，实际可用性仍由 Codex 服务端决定。
 - **Skills**：列表来自当前会话工作目录的 `skills/list`，支持搜索和多选。发送时使用
   App Server 的结构化 Skill 输入，Skill 的本机路径不会返回浏览器。
 - **图片**：支持 PNG、JPEG、WebP 和 GIF；单张不超过 12 MB，每条消息最多 4 张。
@@ -193,6 +237,26 @@ Get-NetFirewallRule -Group 'Codex Pocket' |
 npm test
 npm run test:desktop
 ```
+
+浏览器回归测试使用隔离的静态服务和模拟 API，不会发送真实 Codex 任务：
+
+```sh
+npm ci
+npx playwright install chromium webkit
+npm run test:ui
+```
+
+设置 `PLAYWRIGHT_BROWSER=webkit` 可使用 WebKit 引擎；本机已有 Chrome 时，也可设置
+`PLAYWRIGHT_CHANNEL=chrome`。截图输出到 `.data/qa/`。
+
+`.github/workflows/stability.yml` 覆盖 Windows/Linux/macOS 的运行时测试、桌面后端导入，
+以及 Chromium/WebKit 的移动端回归。当前检查结果与真机验证边界见
+[稳定性检查记录](docs/STABILITY.md)。
+
+前端浏览器回归脚本为 `scripts/check-mobile.mjs`，需要可用的 Playwright。启动本地
+查看器后运行 `node scripts/check-mobile.mjs`；可用 `PLAYWRIGHT_MODULE` 指定模块路径，
+`PLAYWRIGHT_CHANNEL=chrome` 使用本机 Chrome，`POCKET_TEST_URL` 指定本地服务地址。
+测试使用模拟会话，不向真实 Codex 任务发送消息，截图保存在 `.data/qa/`。
 
 也可以仅启动本地查看器：
 

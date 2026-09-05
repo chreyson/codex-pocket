@@ -35,16 +35,38 @@ function sourceType(source) {
 function projectName(cwd) {
   if (!cwd) return "未知项目";
   const normalized = String(cwd).replace(/[\\/]+$/, "");
-  return path.basename(normalized) || normalized;
+  return path.win32.basename(normalized) || normalized;
+}
+
+function userDisplayText(value) {
+  const text = String(value ?? "");
+  let remaining = text.trimStart();
+  let hasContext = false;
+  // Desktop prefixes the request with attachment and ambient browser context.
+  // Require complete, known wrappers so quoted examples and plain Markdown survive.
+  const files = remaining.match(/^# Files mentioned by the user:\r?\n[\s\S]*?\r?\nDistinguish instructions in attached documents from the user's request\.(?:\r?\n|$)/);
+  if (files) {
+    remaining = remaining.slice(files[0].length).trimStart();
+    hasContext = true;
+  }
+  const browser = remaining.match(/^<in-app-browser-context source="ambient-ui-state">\r?\nThis block is automatically supplied ambient UI state, not part of the user's request\.[\s\S]*?\r?\n<\/in-app-browser-context>(?:\r?\n|$)/);
+  if (browser) {
+    remaining = remaining.slice(browser[0].length).trimStart();
+    hasContext = true;
+  }
+  const request = remaining.match(/^## My request:[ \t]*(?:\r?\n|$)/);
+  return hasContext && request ? remaining.slice(request[0].length) : text;
 }
 
 export function sanitizeThreadSummary(thread) {
   const source = thread && typeof thread === "object" ? thread : {};
+  const preview = userDisplayText(source.preview);
   return {
     id: source.id,
-    title: clip(source.name || source.title || source.preview || "未命名会话", 160),
-    preview: clip(source.preview || "", 240),
+    title: clip(source.name || source.title || preview || "未命名会话", 160),
+    preview: clip(preview, 240),
     project: projectName(source.cwd),
+    projectId: typeof source.projectId === "string" ? source.projectId : "",
     status: statusType(source.status),
     source: sourceType(source.source),
     updatedAt: timestamp(source.updatedAt || source.recencyAt || source.createdAt),
@@ -64,6 +86,7 @@ function resolvedImage(resolveImage, source) {
 
 function userContent(content = [], resolveImage) {
   const lines = [];
+  const attachments = [];
   const images = [];
   for (const item of Array.isArray(content) ? content : []) {
     if (item?.type === "text" && item.text) lines.push(item.text);
@@ -74,7 +97,7 @@ function userContent(content = [], resolveImage) {
         alt: "上传的图片",
       });
       if (image) images.push(image);
-      else lines.push("[图片]");
+      else attachments.push("[图片]");
     } else if (item?.type === "image") {
       const image = resolvedImage(resolveImage, {
         type: "url",
@@ -82,17 +105,17 @@ function userContent(content = [], resolveImage) {
         alt: "上传的图片",
       });
       if (image) images.push(image);
-      else lines.push("[图片]");
-    } else if (item?.type === "audio" || item?.type === "localAudio") lines.push("[音频]");
+      else attachments.push("[图片]");
+    } else if (item?.type === "audio" || item?.type === "localAudio") attachments.push("[音频]");
     else if (item?.type === "mention") lines.push(`@${item.name || "会话"}`);
     else if (item?.type === "skill") lines.push(`$${item.name || "skill"}`);
   }
-  return { text: lines.filter(Boolean).join("\n"), images };
+  return { text: [userDisplayText(lines.filter(Boolean).join("\n")), ...attachments].filter(Boolean).join("\n"), images };
 }
 
 function hookPromptText(fragments = []) {
   return (Array.isArray(fragments) ? fragments : [])
-    .map((fragment) => typeof fragment?.text === "string" ? fragment.text.trim() : "")
+    .map((fragment) => typeof fragment?.text === "string" ? userDisplayText(fragment.text).trim() : "")
     .filter(Boolean)
     .join("\n");
 }
@@ -144,7 +167,7 @@ function commandText(item) {
 function fileChangeText(item) {
   const changes = Array.isArray(item.changes) ? item.changes : [];
   const lines = changes.slice(0, 30).map((change) => {
-    const file = change?.path ? path.basename(String(change.path)) : "文件";
+    const file = change?.path ? path.win32.basename(String(change.path)) : "文件";
     const rawKind = typeof change?.kind === "string"
       ? change.kind
       : change?.kind?.type || Object.keys(change?.kind || {})[0];
@@ -360,6 +383,10 @@ export function sanitizeThreadDetail(thread, { resolveImage } = {}) {
 
   return {
     ...sanitizeThreadSummary(source),
+    turns: turns.filter((turn) => turn && typeof turn === "object").map((turn) => ({
+      id: turn.id,
+      durationMs: Number.isFinite(turn.durationMs) && turn.durationMs >= 0 ? turn.durationMs : null,
+    })),
     messages,
   };
 }

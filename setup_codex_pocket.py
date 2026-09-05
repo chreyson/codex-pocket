@@ -140,9 +140,10 @@ def resolve_candidate(value: str | Path, search_directories) -> Path | None:
 
 def command_candidates(name: str, configured: str = "", environment_name: str = ""):
     directories = common_bin_directories()
-    values = [configured]
+    values = []
     if environment_name:
         values.append(os.environ.get(environment_name, ""))
+    values.append(configured)
     values.append(name)
     values.extend(directory / name for directory in directories)
     return unique_paths(
@@ -208,6 +209,7 @@ def macos_codex_app_candidates():
         "Codex.app/Contents/Resources/codex",
         "Codex.app/Contents/Resources/bin/codex",
         "Codex.app/Contents/MacOS/codex",
+        "ChatGPT.app/Contents/Resources/codex",
     ]
     for root in roots:
         for relative in relative_candidates:
@@ -273,35 +275,23 @@ def probe_python(code: str) -> bool:
     return result.returncode == 0
 
 
-def ensure_desktop_dependencies(system_name: str | None = None) -> str:
+def ensure_desktop_dependencies(system_name: str | None = None, *, install: bool = True) -> str:
     system_name = (system_name or platform.system()).lower()
-    if not probe_python("import webview"):
-        run_pip(["-r", str(REQUIREMENTS_PATH)])
-
-    if system_name == "darwin":
-        cocoa_ready = probe_python("import webview.platforms.cocoa")
-        if not cocoa_ready:
-            run_pip(["-r", str(REQUIREMENTS_PATH)])
-            cocoa_ready = probe_python("import webview.platforms.cocoa")
-        if not cocoa_ready:
-            raise RuntimeError("macOS Cocoa 桌面后端不可用。")
-        return "cocoa"
-
-    if system_name == "linux":
-        if probe_python("import webview.platforms.gtk"):
-            return "gtk"
-        if probe_python("import webview.platforms.qt"):
-            return "qt"
-
-        print("未检测到 GTK/Qt，正在项目虚拟环境中安装 Qt 桌面后端...", flush=True)
-        run_pip(["pywebview[pyside6]>=5.4,<6"])
-        if not probe_python("import webview.platforms.qt"):
-            raise RuntimeError(
-                "Linux Qt 桌面后端不可用。请查看 README 中对应发行版的原生依赖说明。"
-            )
-        return "qt"
-
-    raise RuntimeError(f"此安装器不支持当前系统：{platform.system()}")
+    backends = {"darwin": ("cocoa",), "linux": ("gtk", "qt")}.get(system_name)
+    if not backends:
+        raise RuntimeError(f"此安装器不支持当前系统：{system_name}")
+    for backend in backends:
+        if probe_python(f"import webview.platforms.{backend}"):
+            return backend
+    if install:
+        arguments = ["-r", str(REQUIREMENTS_PATH)]
+        if system_name == "linux":
+            arguments.append("pywebview[pyside6]>=5.4,<6")
+        run_pip(arguments)
+        backend = backends[-1]
+        if probe_python(f"import webview.platforms.{backend}"):
+            return backend
+    raise RuntimeError("桌面后端不可用，请运行安装器并检查 README 中的原生依赖说明。")
 
 
 def prepare_cloudflared() -> str:
@@ -415,7 +405,9 @@ def main(argv=None) -> int:
         os.environ["NODE_BIN"] = node_path
         os.environ["PATH"] = portable_environment([node_path])["PATH"]
         codex_path = resolve_codex(config)
-        backend = ensure_desktop_dependencies(system_name)
+        backend = "headless" if args.headless else ensure_desktop_dependencies(
+            system_name, install=not args.check,
+        )
         cloudflared_path = ""
         if args.install:
             print("正在准备 Cloudflared...", flush=True)
@@ -438,7 +430,7 @@ def main(argv=None) -> int:
             print(f"Codex: {codex_path}")
             print(f"Desktop backend: {backend}")
 
-        if args.start or args.headless:
+        if not args.check and (args.start or args.headless):
             print("正在启动 Codex Pocket...", flush=True)
             launch_desktop(node_path, codex_path, headless=args.headless)
             result["Started"] = True

@@ -11,8 +11,7 @@
     <div id="desktop-app" class="desktop-app" aria-busy="true">
       <aside class="sidebar">
         <div class="brand" aria-label="Codex Pocket">
-          <strong>Codex</strong>
-          <span>Pocket</span>
+          <strong>Codex Pocket</strong>
         </div>
 
         <nav aria-label="桌面控制">
@@ -23,7 +22,6 @@
         </nav>
 
         <div class="sidebar-status">
-          <span class="status-label">连接状态</span>
           <div class="status-line">
             <span id="status-dot" class="status-dot" data-phase="stopped" aria-hidden="true"></span>
             <span id="status-text">服务已停止</span>
@@ -35,18 +33,21 @@
         <header class="toolbar">
           <div class="toolbar-title">
             <h1 id="remote-access-heading">远程访问</h1>
-            <p>在手机上继续当前 Codex 会话</p>
           </div>
-          <button id="service-button" class="command-button service-button primary" type="button" disabled>
+        </header>
+
+        <section class="content" aria-labelledby="connection-heading">
+          <div class="section-intro">
+            <div class="section-heading">
+              <span class="device-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"></rect><path d="M10 18h4"></path></svg></span>
+              <h2 id="connection-heading">连接你的设备</h2>
+              <p id="connection-description" role="status">服务未开启</p>
+            </div>
+            <button id="service-button" class="command-button service-button primary" type="button" disabled>
             <svg class="start-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 7 8 5-8 5Z"></path></svg>
             <svg class="stop-icon" aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="8" height="8" rx="1"></rect></svg>
             <span>开启服务</span>
-          </button>
-        </header>
-
-        <section class="content" aria-labelledby="remote-access-heading" aria-describedby="connection-description">
-          <div class="section-intro">
-            <p id="connection-description">开启服务后，这里会生成本次连接专用的公网链接和访问密钥。</p>
+            </button>
           </div>
 
           <div id="error-banner" class="error-banner" role="alert" hidden>
@@ -60,7 +61,10 @@
           <div class="connection-fields">
             <section class="field-section" aria-labelledby="url-label">
               <div class="field-heading">
-                <label id="url-label">公网链接</label>
+                <label id="url-label">访问地址</label>
+              </div>
+              <div class="value-row">
+                <span id="public-url" class="field-value">服务启动后生成</span>
                 <div class="field-actions">
                   <button id="copy-url" class="icon-button" type="button" aria-label="复制公网链接" title="复制公网链接" disabled>
                     <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
@@ -70,29 +74,26 @@
                   </button>
                 </div>
               </div>
-              <div class="value-row">
-                <code id="public-url">服务启动后生成</code>
-              </div>
             </section>
 
             <section class="field-section" aria-labelledby="key-label">
               <div class="field-heading">
                 <label id="key-label">访问密钥</label>
+              </div>
+              <div class="value-row">
+                <code id="access-key" class="field-value field-value-secret">服务启动后生成</code>
                 <div class="field-actions">
                   <button id="copy-key" class="icon-button" type="button" aria-label="复制访问密钥" title="复制访问密钥" disabled>
                     <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
                   </button>
                 </div>
               </div>
-              <div class="value-row">
-                <code id="access-key">服务启动后生成</code>
-              </div>
             </section>
           </div>
 
           <footer class="security-note">
             <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3"></path></svg>
-            <p>停止服务后，本次链接和密钥立即失效。</p>
+            <p>此连接仅在服务运行期间有效</p>
           </footer>
         </section>
       </main>

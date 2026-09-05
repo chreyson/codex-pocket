@@ -174,7 +174,7 @@ class DesktopController:
             return dict(self._state)
 
     def _on_status(self, value: str) -> None:
-        self._update(phase="starting", status=value, busy=True)
+        self._update(phase="starting", status=value, busy=True, publicUrl="")
 
     def _on_ready(self, url: str, key: str) -> None:
         self._update(

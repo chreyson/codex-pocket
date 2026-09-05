@@ -19,6 +19,7 @@ try {
     $config = Read-PocketRuntimeConfig $runtimeConfigPath
     $python = Resolve-PocketPython (Get-PocketRuntimePath $config 'Python')
     $node = Resolve-PocketNode (Get-PocketRuntimePath $config 'Node')
+    $env:Path = (Split-Path -Parent $node.Path) + ';' + ((Get-PocketPathEntries) -join ';')
     $codex = Resolve-PocketCodex (Get-PocketRuntimePath $config 'Codex')
 
     Write-PocketRuntimeConfig `
@@ -29,6 +30,7 @@ try {
 
     $env:NODE_BIN = $node.Path
     $env:CODEX_BIN = $codex
+    $env:Path = (Split-Path -Parent $codex) + ';' + $env:Path
 
     $webviewReady = $false
     try {
@@ -38,6 +40,9 @@ try {
         $webviewReady = $false
     }
     if (-not $webviewReady) {
+        if ($Check) {
+            throw 'Desktop dependencies are missing. Run Install-CodexPocket.cmd first.'
+        }
         Write-Host 'Codex Pocket is preparing the WebView2 desktop interface...'
         & $python.Command `
             -m pip install `

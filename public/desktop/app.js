@@ -13,6 +13,7 @@ const errorText = document.querySelector("#error-text");
 const dismissErrorButton = document.querySelector("#dismiss-error");
 const copyToast = document.querySelector("#copy-toast");
 const copyToastText = document.querySelector("#copy-toast-text");
+const connectionDescription = document.querySelector("#connection-description");
 
 let bridge = null;
 let refreshTimer = null;
@@ -30,7 +31,9 @@ let currentState = {
 };
 
 function setValue(element, value, fallback) {
-  element.textContent = value || fallback;
+  const text = value || fallback;
+  if (element.textContent === text) return;
+  element.textContent = text;
   element.dataset.empty = String(!value);
   element.title = value || "";
 }
@@ -44,6 +47,14 @@ function render(state) {
   const hasKey = Boolean(currentState.accessKey);
 
   desktopApp.setAttribute("aria-busy", String(inFlight));
+  desktopApp.dataset.phase = phase;
+  if (connectionDescription) connectionDescription.textContent = {
+    stopped: "服务未开启",
+    starting: "正在建立连接…",
+    stopping: "正在断开连接…",
+    running: "连接已就绪",
+    error: "连接未完成",
+  }[phase] || currentState.status;
   statusDot.dataset.phase = phase;
   statusText.textContent = currentState.status || "服务已停止";
   statusText.title = statusText.textContent;
@@ -68,7 +79,8 @@ async function refresh() {
   if (!bridge || refreshInFlight || serviceActionInFlight) return;
   refreshInFlight = true;
   try {
-    render(await bridge.get_state());
+    const next = await bridge.get_state();
+    if (Object.keys(next).some((key) => next[key] !== currentState[key])) render(next);
   } catch {
     render({
       phase: "error",

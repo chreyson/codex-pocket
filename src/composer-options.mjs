@@ -27,8 +27,9 @@ function normalizedModels(value) {
   const seen = new Set();
   const normalized = [];
   for (const model of Array.isArray(value?.models) ? value.models : []) {
-    if (!model || model.hidden) continue;
+    if (!model) continue;
     const id = cleanString(model.model || model.id, 160);
+    if (model.hidden && id !== value.configuredModel && id !== value.current?.model) continue;
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const efforts = normalizedEfforts(model);
@@ -114,7 +115,9 @@ export function normalizeComposerCatalog(value = {}) {
   const models = normalizedModels(value);
   const skills = normalizedSkills(value);
   const modes = normalizedModes(value);
-  const defaultModel = models.find((model) => model.isDefault) || models[0] || null;
+  const defaultModel = models.find((model) => model.id === value.current?.model)
+    || models.find((model) => model.id === value.configuredModel)
+    || models.find((model) => model.isDefault) || models[0] || null;
   return {
     models,
     skills,
@@ -122,6 +125,7 @@ export function normalizeComposerCatalog(value = {}) {
     defaultModel: defaultModel?.id || "",
     defaultEffort: defaultModel?.defaultEffort || "",
     goal: normalizedGoal(value.goal),
+    permissions: value.permissions || null,
     features: {
       plan: modes.includes("plan"),
       goal: Boolean(value.goalSupported),
