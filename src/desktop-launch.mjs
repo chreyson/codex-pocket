@@ -41,7 +41,10 @@ export async function prepareDesktopProxy(url, {
     if (!existsSync(executable)) {
       await run("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
         path.join(POCKET_ROOT, "scripts/build-windows-proxy.ps1"), "-OutputPath", temporary],
-      { windowsHide: true, timeout: 30_000 });
+      // Hosted Windows images can cold-start the .NET compiler on the first
+      // Node version in the matrix; compilation is bounded but not tied to the
+      // normal CLI request timeout.
+      { windowsHide: true, timeout: 120_000 });
       await rename(temporary, executable);
     }
     await writeFile(`${temporary}.json`, JSON.stringify({ nodePath, codexPath, proxyArgs }), { mode: 0o600 });
