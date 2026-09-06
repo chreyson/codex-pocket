@@ -27,6 +27,41 @@ test("Windows pipe discovery keeps an explicit path first and removes duplicates
   ]);
 });
 
+for (const platform of ["darwin", "linux"]) {
+  test(`${platform} discovers only sockets owned by the current user`, async () => {
+    const paths = await discoverCodexAppPipePaths({
+      platform, env: {}, uid: 501,
+      readdir: async (directory) => directory.endsWith("browser-use")
+        ? ["app.sock", "other-user.sock", "link.sock", "removed.sock", "ignore.txt"] : [],
+      lstat: async (candidate) => {
+        if (candidate.endsWith("removed.sock")) throw new Error("ENOENT");
+        return { isSocket: () => !candidate.endsWith("link.sock"), uid: candidate.endsWith("other-user.sock") ? 502 : 501 };
+      },
+    });
+    assert.deepEqual(paths, ["/tmp/codex-browser-use/app.sock"]);
+  });
+}
+
+test("failed discovery is briefly cached instead of repeated on every poll", async () => {
+  let calls = 0;
+  const bridge = new CodexDesktopBridge({ discover: async () => { calls++; return []; } });
+  for (let i = 0; i < 3; i++) {
+    await assert.rejects(bridge.readThread("thread-1"), { code: "DESKTOP_BRIDGE_UNAVAILABLE" });
+  }
+  assert.equal(calls, 1);
+});
+
+test("a dropped connection after sending has an unknown outcome", async () => {
+  const bridge = new CodexDesktopBridge({
+    discover: async () => ["pipe"],
+    request: async (_path, method) => {
+      if (method === "tools/list") return { tools: [{ name: "send_message_to_thread" }] };
+      throw Object.assign(new Error("closed"), { code: "DESKTOP_BRIDGE_CONNECTION", requestSent: true });
+    },
+  });
+  await assert.rejects(bridge.sendMessage("thread-1", "once"), { code: "DESKTOP_BRIDGE_DELIVERY_UNKNOWN" });
+});
+
 test("native frames use the Codex App four-byte length prefix", () => {
   const message = { id: 1, jsonrpc: "2.0", method: "tools/list", params: {} };
   const frame = encodeNativeFrame(message);

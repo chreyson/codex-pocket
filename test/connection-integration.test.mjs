@@ -44,6 +44,7 @@ async function startServer(t) {
       ...process.env, HOST: "127.0.0.1", PORT: String(port), CODEX_BIN: command,
       RELAY_DATA_DIR: path.join(directory, "data"), CODEX_RELAY_TOKEN: "integration-test-token",
       CODEX_APP_TOOLS_PIPE_PATH: "", FORCE_SECURE_COOKIE: "0", POLL_INTERVAL_MS: "700",
+      POCKET_SHARED_SERVER: "off", CODEX_APP_SERVER_WS_URL: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -113,6 +114,144 @@ async function subscribe(t, url, cookie, threadId = "test-thread") {
     },
   };
 }
+
+test("an idle writer conflict has a recovery code and explicit continuation is idempotent", { timeout: 15_000 }, async (t) => {
+  const { url } = await startServer(t);
+  const headers = { Authorization: "Bearer integration-test-token", "Content-Type": "application/json" };
+  const health = await (await fetch(url + "/api/health")).json();
+  const bootstrap = await (await fetch(url + "/api/bootstrap", { headers })).json();
+  const sync = await (await fetch(url + "/api/sync", { headers })).json();
+  const status = sync.events.find((entry) => entry.event === "status").value;
+  assert.equal(health.connectionMode, "standalone");
+  assert.deepEqual(status.desktopConnection, health.desktopConnection);
+  assert.deepEqual(bootstrap.status.desktopConnection, health.desktopConnection);
+  assert.equal(status.connectionMode, health.connectionMode);
+  const post = (route, body) => fetch(url + route, { method: "POST", headers, body: JSON.stringify(body) });
+  const conflict = await post("/api/threads/locked-thread/permissions", { mode: "ask" });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).code, "THREAD_CONTINUATION_REQUIRED");
+  const anonymous = await fetch(url + "/api/threads/locked-thread/continue", { method: "POST", body: "{}" });
+  assert.equal(anonymous.status, 401);
+  const results = await Promise.all([post("/api/threads/locked-thread/continue", {}), post("/api/threads/locked-thread/continue", {})]);
+  const bodies = [];
+  for (const result of results) {
+    assert.equal(result.status, 201);
+    bodies.push(await result.json());
+  }
+  assert.notEqual(bodies[0].thread.id, "locked-thread");
+  assert.equal(bodies[0].thread.id, bodies[1].thread.id);
+  const sent = await post(`/api/threads/${bodies[0].thread.id}/messages`, { text: "Continue", clientMessageId: "continuation-message" });
+  assert.equal(sent.status, 202, await sent.text());
+});
+
+test("questions and approvals travel through stdio, HTTP, SSE, reconnect and resolution", { timeout: 15000 }, async (t) => {
+  const { url } = await startServer(t);
+  const headers = { Authorization: "Bearer integration-test-token", "Content-Type": "application/json" };
+  const post = (route, body) => fetch(url + route, { method: "POST", headers, body: JSON.stringify(body) });
+  const session = await fetch(url + "/api/session", { method: "POST", headers });
+  const cookie = session.headers.get("set-cookie").split(";")[0];
+  const stream = await subscribe(t, url, cookie);
+  const started = await post("/api/threads/test-thread/messages", { text: "Synthetic requests", clientMessageId: "request-test" });
+  assert.equal(started.status, 202, await started.text());
+  const event = await stream.waitFor((event) => event.name === "thread" && event.value.control.requests.length === 4);
+  const requests = event.value.control.requests;
+  assert.deepEqual(requests.map((r) => r.type), ["userInput", "command", "permissions", "elicitation"]);
+  await stream.close();
+  const recovered = await subscribe(t, url, cookie);
+  const replay = await recovered.waitFor((event) => event.name === "thread" && event.value.control.requests.length === 4);
+  assert.deepEqual(replay.value.control.requests.map((r) => r.token), requests.map((r) => r.token));
+  const sync = await (await fetch(url + "/api/sync?threadId=test-thread", { headers })).json();
+  assert.equal(sync.events.find((e) => e.event === "thread").value.control.requests.length, 4);
+  const route = (request, thread = "test-thread") => `/api/threads/${thread}/approvals/${request.token}`;
+  assert.equal((await fetch(url + route(requests[0]), { method: "POST", body: "{}" })).status, 401);
+  assert.equal((await post(route(requests[0], "wrong-thread"), {})).status, 404);
+  assert.equal((await post(route(requests[0]), { answers: {} })).status, 400);
+  assert.equal((await post(route(requests[1]), { decision: "acceptForSession" })).status, 400);
+  const payloads = [
+    { answers: { target: { answers: ["Web"] } } },
+    { choice: "0" }, { choice: "turn", permissions: { fileSystem: { write: ["/"] } } },
+    { action: "accept", content: { count: 2 } },
+  ];
+  for (const [i, request] of requests.entries()) assert.equal((await post(route(request), payloads[i])).status, 200);
+  const completed = await recovered.waitFor((event) => event.name === "thread" && event.value.control.requests.length === 0 && event.value.messages.some((m) => m.text?.includes("fixture-3")));
+  const replies = JSON.parse(completed.value.messages.find((m) => m.text?.includes("fixture-3")).text);
+  assert.deepEqual(replies.map((r) => r.result), [payloads[0], { decision: "accept" }, { permissions: { network: { enabled: true } }, scope: "turn" }, payloads[3]]);
+  assert.equal((await post(route(requests[0]), payloads[0])).status, 404);
+});
+
+test("waiting messages support multiple entries, cancellation, Steer and ordered draining", { timeout: 15000 }, async (t) => {
+  const { url } = await startServer(t);
+  const headers = { Authorization: "Bearer integration-test-token", "Content-Type": "application/json" };
+  const post = async (route, body) => {
+    const response = await fetch(url + `/api/threads/queue-thread/${route}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const value = await response.json();
+    assert.ok(response.ok, JSON.stringify(value));
+    return value;
+  };
+  const read = async () => (await fetch(url + "/api/threads/queue-thread", { headers })).json();
+  await post("messages", { text: "hold" });
+  for (const id of ["one", "two"]) await post("messages", { text: id, action: "queue", clientMessageId: id });
+  assert.deepEqual((await read()).control.queue.map((item) => item.id), ["one", "two"]);
+  await post("queue/one", { action: "remove" });
+  await post("queue/two", { action: "send" });
+  assert.deepEqual((await read()).control.queue, []);
+  assert.ok((await read()).messages.some((item) => item.text === "two"));
+  for (const id of ["auto3", "auto4"]) await post("messages", { text: id, action: "queue", clientMessageId: id });
+  await post("messages", { text: "finish", action: "steer" });
+  let done;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    done = await read();
+    if (!done.control.busy && !done.control.queued) break;
+    await delay(50);
+  }
+  assert.equal(done.control.busy, false);
+  assert.deepEqual(done.control.queue, []);
+  assert.deepEqual(done.messages.filter((item) => item.role === "user").map((item) => item.text), ["hold", "two", "auto3", "auto4"]);
+  await post("messages", { text: "hold again" });
+  await post("messages", { text: "must stay queued", action: "queue", clientMessageId: "paused" });
+  await post("interrupt", {});
+  await delay(900);
+  assert.equal((await read()).control.queue[0].id, "paused", "interruption does not automatically consume the queue");
+});
+
+test("editing a waiting message pauses dispatch and preserves queue order through save and cancel", { timeout: 15000 }, async (t) => {
+  const { url } = await startServer(t);
+  const headers = { Authorization: "Bearer integration-test-token", "Content-Type": "application/json" };
+  const post = async (route, body, status = 200) => {
+    const response = await fetch(url + `/api/threads/queue-thread/${route}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const value = await response.json();
+    assert.equal(response.status, status, JSON.stringify(value));
+    return value;
+  };
+  const read = async () => (await fetch(url + "/api/threads/queue-thread", { headers })).json();
+  await post("messages", { text: "hold" }, 202);
+  for (const id of ["one", "two"]) {
+    await post("messages", { text: `auto ${id}`, action: "queue", clientMessageId: id }, 202);
+    await post(`queue/${id}`, { action: "edit" });
+  }
+  await post("messages", { text: "finish", action: "steer" }, 202);
+  await delay(800);
+  assert.deepEqual((await read()).control.queue.map((item) => [item.id, item.editing]), [["one", true], ["two", true]]);
+  await post("queue/one", { action: "send" }, 409);
+  await post("queue/one", { action: "update", text: " " }, 400);
+  await post("queue/one", { action: "update", text: "x".repeat(12001) }, 413);
+  await post("queue/one", { action: "update", text: "auto edited one" });
+  let state;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    state = await read();
+    if (!state.control.busy && state.control.queue.length === 1) break;
+    await delay(50);
+  }
+  assert.deepEqual(state.control.queue.map((item) => item.id), ["two"]);
+  await post("queue/two", { action: "cancelEdit" });
+  for (let attempt = 0; attempt < 60; attempt++) {
+    state = await read();
+    if (!state.control.busy && !state.control.queued) break;
+    await delay(50);
+  }
+  assert.deepEqual(state.messages.filter((item) => item.role === "user").map((item) => item.text), ["hold", "auto edited one", "auto two"]);
+  await post("queue/one", { action: "update", text: "too late" }, 404);
+});
 
 test("management HTTP routes authenticate, validate, persist names and restore archived data", { timeout: 15000 }, async (t) => {
   const { url } = await startServer(t);

@@ -21,6 +21,7 @@ const ELEMENT_IDS = [
   "thread-search",
   "connection-state",
   "connection-label",
+  "connection-mode-warning",
   "conversation-title",
   "conversation-meta",
   "conversation-actions",
@@ -30,6 +31,7 @@ const ELEMENT_IDS = [
   "message-list",
   "approval-tray",
   "composer",
+  "queued-message-list",
   "composer-menu",
   "composer-extras",
   "extras-button",
@@ -53,7 +55,7 @@ const ELEMENT_IDS = [
   "permission-label",
   "effort-label",
   "composer-status",
-  "delivery-control",
+  "continue-web",
   "interrupt-button",
   "send-button",
   "back-button",
@@ -62,7 +64,6 @@ const ELEMENT_IDS = [
   "network-message",
   "reconnect-button",
   "latest-button",
-  "draft-status",
   "image-viewer",
   "image-viewer-image",
   "image-viewer-caption",
@@ -125,6 +126,10 @@ class FakeElement {
 
   prepend(...children) {
     this.children.unshift(...children);
+  }
+
+  contains(element) {
+    return this === element || this.children.some((child) => child.contains?.(element));
   }
 
   replaceChildren(...children) {
@@ -298,7 +303,6 @@ async function createHarness(fetchImpl, { storedSelection, storage = new Map(), 
   elements["selected-skills"].hidden = true;
   elements["composer-images"].hidden = true;
   elements["goal-banner"].hidden = true;
-  elements["delivery-control"].hidden = true;
   elements["interrupt-button"].hidden = true;
   elements["interrupt-button"].setAttribute("aria-label", "中断任务");
   elements["skill-count"].hidden = true;
@@ -309,12 +313,6 @@ async function createHarness(fetchImpl, { storedSelection, storage = new Map(), 
     button.dataset.mode = mode;
     button.setAttribute("aria-checked", String(mode === "default"));
     elements["mode-control"].append(button);
-  }
-  for (const action of ["queue", "steer"]) {
-    const button = new FakeElement("button");
-    button.dataset.action = action;
-    button.setAttribute("aria-checked", String(action === "queue"));
-    elements["delivery-control"].append(button);
   }
 
   const document = {
@@ -358,11 +356,14 @@ async function createHarness(fetchImpl, { storedSelection, storage = new Map(), 
     },
   });
   const source = (await fs.readFile(APP_SOURCE_URL, "utf8"))
-    .replace('import { renderMarkdown } from "./markdown.js";', "");
+    .replace('import { renderMarkdown } from "./markdown.js";', "")
+    .replace('import { createRequestTray } from "./user-requests.js";',
+      (await fs.readFile(new URL("../public/user-requests.js", import.meta.url), "utf8")).replace("export function createRequestTray", "function createRequestTray"));
   const hooks = `\n;globalThis.__appTest = {
     selectThread,
     createProjectThread,
     sendMessage,
+    continueInWeb,
     interruptTurn,
     connectEvents,
     syncSelectedThread,
@@ -409,7 +410,6 @@ async function createHarness(fetchImpl, { storedSelection, storage = new Map(), 
       })),
       viewerImages: [...viewerImages],
       viewerImageIndex,
-      runningMessageAction,
     }),
   };`;
   vm.runInContext(`"use strict";\n${source}${hooks}`, context, { filename: "public/app.js" });
@@ -561,6 +561,113 @@ test("a failed send retains its draft after navigating to another thread", async
   assert.equal(harness.elements["message-input"].value, "do not lose this");
 });
 
+test("writer conflicts offer an explicit Web continuation and preserve the draft", async () => {
+  let forks = 0;
+  let sends = 0;
+  const harness = await createHarness((url) => {
+    if (url.endsWith("/messages")) {
+      sends++;
+      return jsonResponse(409, { code: "THREAD_CONTINUATION_REQUIRED", error: "保留历史创建续接会话" });
+    }
+    if (url.endsWith("/continue")) { forks++; return jsonResponse(201, { thread: { id: "B", title: "Web continuation" } }); }
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "continue my work";
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  assert.equal(forks, 0);
+  assert.equal(harness.elements["continue-web"].hidden, false);
+  assert.equal(harness.elements["message-input"].value, "continue my work");
+  await harness.hooks.continueInWeb();
+  assert.equal(forks, 1);
+  assert.equal(sends, 1);
+  assert.equal(harness.hooks.getState().selectedThreadId, "B");
+  assert.equal(harness.elements["message-input"].value, "continue my work");
+  assert.equal(harness.elements["continue-web"].hidden, true);
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.elements["message-input"].value, "continue my work");
+});
+
+test("Web continuation retains uploaded images and ignores repeated clicks", async () => {
+  const response = deferred();
+  let forks = 0;
+  const image = { id: `img_${"a".repeat(32)}`, src: "/api/images/upload", mimeType: "image/png" };
+  const harness = await createHarness((url) => {
+    if (url === "/api/uploads") return jsonResponse(201, { image });
+    if (url.endsWith("/messages")) return jsonResponse(409, { code: "THREAD_CONTINUATION_REQUIRED", error: "continue" });
+    if (url.endsWith("/continue")) { forks++; return response.promise; }
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  await harness.hooks.addPendingImages([{ name: "screen.png", type: "image/png", size: 128 }]);
+  await harness.hooks.sendMessage({ preventDefault() {} });
+  const continuing = harness.hooks.continueInWeb();
+  await harness.hooks.continueInWeb();
+  response.resolve(jsonResponse(201, { thread: { id: "B", title: "Continuation" } }));
+  await continuing;
+  assert.equal(forks, 1);
+  assert.equal(harness.hooks.getState().pendingImages[0].id, image.id);
+  assert.equal(harness.elements["composer-images"].hidden, false);
+});
+
+test("uploads finish in the originating task while another task is open", async () => {
+  const response = deferred();
+  let deletions = 0;
+  const harness = await createHarness((url, options) => {
+    if (url === "/api/uploads") return response.promise;
+    if (options?.method === "DELETE") { deletions++; return jsonResponse(200, {}); }
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  const upload = harness.hooks.addPendingImages([{ name: "screen.png", type: "image/png", size: 128 }]);
+  await harness.hooks.selectThread("B");
+  response.resolve(jsonResponse(201, { image: { id: "image-a", src: "/api/images/image-a" } }));
+  await upload;
+  assert.equal(harness.hooks.getState().pendingImages.length, 0);
+  await harness.hooks.selectThread("A");
+  assert.equal(harness.hooks.getState().pendingImages[0].id, "image-a");
+  assert.equal(harness.hooks.getState().pendingImages[0].status, "ready");
+  assert.equal(deletions, 0);
+});
+
+test("opening a task restores its actual desktop model and mode", async () => {
+  const harness = await createHarness((url) => {
+    if (url === "/api/threads/A") return jsonResponse(200, {
+      ...threadDetail("A", "history"),
+      composerOptions: {
+        models: [{ id: "desktop-model", efforts: [{ id: "high" }], defaultEffort: "high" }],
+        modes: ["default", "plan"], skills: [],
+        currentSelection: { model: "desktop-model", effort: "high", mode: "plan" },
+      },
+    });
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  const selection = harness.hooks.getState().composerSelection;
+  assert.equal(selection.model, "desktop-model");
+  assert.equal(selection.effort, "high");
+  assert.equal(selection.mode, "plan");
+});
+
+test("refresh picks up model settings changed on desktop", async () => {
+  let model = "first";
+  const harness = await createHarness((url) => {
+    if (url === "/api/threads/A") return jsonResponse(200, {
+      ...threadDetail("A", "history"),
+      composerOptions: {
+        models: ["first", "second"].map((id) => ({ id, efforts: [{ id: "high" }], defaultEffort: "high" })),
+        modes: ["default"], skills: [],
+        currentSelection: { model, effort: "high", mode: "default" },
+      },
+    });
+    return mobileFetch(url);
+  });
+  await harness.hooks.selectThread("A");
+  model = "second";
+  await harness.hooks.syncSelectedThread();
+  assert.equal(harness.hooks.getState().composerSelection.model, "second");
+});
+
 test("returning to an in-flight send does not resurrect an acknowledged draft", async () => {
   const response = deferred();
   const harness = await createHarness((url) => url.endsWith("/messages") ? response.promise : mobileFetch(url));
@@ -678,6 +785,23 @@ test("thread navigation groups conversations by project and search opens matchin
   assert.match(matchingItems.textContent, /Thread B/);
 });
 
+test("sidebar shows one row per task ID across initial load and live catalog refresh", async () => {
+  const a = { ...threadSummary("A"), title: "Same title", project: "Shared project" };
+  const b = { ...a, id: "B" };
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/bootstrap") return jsonResponse(200, { status: { state: "ready" }, threads: [a, b, { ...a, project: "Obsolete project" }] });
+    if (url === "/api/threads/A") return jsonResponse(200, threadDetail("A", ""));
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+  assert.equal(harness.elements["thread-list"].children.length, 1);
+  assert.equal(harness.elements["thread-list"].children[0].children[1].children.length, 2);
+  await harness.hooks.selectThread("A");
+  emitSse(harness.eventSources.at(-1), "threads", [a, b, a]);
+  const rows = harness.elements["thread-list"].children[0].children[1].children.map((row) => row.children[0]);
+  assert.deepEqual(rows.map((row) => row.dataset.threadId), ["A", "B"]);
+  assert.equal(rows.filter((row) => row.getAttribute("aria-current") === "true").length, 1);
+});
+
 test("a project can create and open a new conversation without exposing its cwd", async () => {
   const calls = [];
   const created = {
@@ -720,7 +844,8 @@ test("consecutive tool activity renders as one compact group and merges duplicat
       { id: "progress", role: "assistant", kind: "commentary", text: "先检查代码。", timestamp: 1 },
       { id: "command-1", role: "system", kind: "activity", label: "终端", activityType: "command", activityStatus: "completed", text: "运行 rg -n renderThread public/app.js", timestamp: 1 },
       { id: "command-2", role: "system", kind: "activity", label: "终端", activityType: "command", activityStatus: "completed", text: "运行 rg -n renderThread public/app.js", timestamp: 1 },
-      { id: "file-1", role: "system", kind: "activity", label: "文件", activityType: "file", activityStatus: "completed", text: "读取 app.js", timestamp: 1 },
+      { id: "old-thinking", role: "assistant", kind: "reasoning", activityStatus: "completed", text: "Past internal detail" },
+      { id: "file-1", role: "system", kind: "activity", label: "文件", activityType: "command", activityActions: ["read"], activityStatus: "completed", text: "读取 app.js", timestamp: 1 },
       { id: "done", role: "assistant", kind: "message", text: "检查完成。", timestamp: 2 },
     ],
   };
@@ -738,7 +863,8 @@ test("consecutive tool activity renders as one compact group and merges duplicat
   const disclosure = activity.children[0];
   assert.equal(disclosure.tagName, "DETAILS");
   assert.equal(disclosure.open, false);
-  assert.match(disclosure.children[0].textContent, /已处理 3 项操作/);
+  assert.equal(disclosure.children[0].textContent, "已读取文件、运行了命令");
+  assert.doesNotMatch(rendered[0].textContent, /已思考|Past internal detail|项操作/);
   assert.doesNotMatch(disclosure.children[0].textContent, /rg|app\.js/);
   assert.match(activity.textContent, /运行 rg -n renderThread public\/app\.js/);
   assert.match(activity.textContent, /×2/);
@@ -974,6 +1100,89 @@ test("all skills expand and collapse inside the existing extras menu", async () 
   assert.equal(elements["extras-skills"].children.length, 6);
 });
 
+test("message actions copy the latest text and show the provided message time", async () => {
+  const detail = threadDetail("A", "First answer");
+  detail.messages[0].timestamp = 1788605100;
+  const harness = await createHarness(async (url) => jsonResponse(200,
+    url === "/api/bootstrap" ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail));
+  const copied = [];
+  harness.navigator.clipboard = { async writeText(value) { copied.push(value); } };
+  await harness.hooks.selectThread("A");
+  const article = harness.elements["message-list"].children[0];
+  const actions = article.children.find((child) => child.className === "message-actions");
+  const [copy, time, status] = actions.children;
+  assert.equal(actions.hidden, false);
+  assert.match(time.textContent, /^\d{2}:\d{2}$/);
+  assert.equal(time.dateTime, new Date(detail.messages[0].timestamp * 1000).toISOString());
+  await copy.listeners.get("click")[0]();
+  assert.deepEqual(copied, ["First answer"]);
+  assert.equal(status.textContent, "已复制");
+  detail.messages[0].text = "Updated **answer**";
+  await harness.hooks.syncSelectedThread();
+  await copy.listeners.get("click")[0]();
+  assert.deepEqual(copied, ["First answer", "Updated **answer**"]);
+  assert.equal(copy.getAttribute("aria-label"), "已复制");
+  harness.navigator.clipboard.writeText = async () => { throw new Error("Clipboard denied"); };
+  await copy.listeners.get("click")[0]();
+  assert.equal(copy.dataset.state, "error");
+  assert.equal(status.textContent, "复制失败");
+});
+
+test("one response footer copies all answer parts without process text or another request", async () => {
+  const detail = threadDetail("A", "");
+  const item = (id, role, kind, text) => ({ id, role, kind, text, turnId: "shared-source-turn", timestamp: 1788605100 });
+  detail.messages = [
+    item("request-one", "user", "message", "First request"),
+    item("progress", "assistant", "commentary", "Checking files"),
+    item("answer-one", "assistant", "message", "First paragraph"),
+    item("answer-two", "assistant", "message", "Second paragraph"),
+    item("request-two", "user", "message", "Next request"),
+    item("next-answer", "assistant", "message", "Separate answer"),
+  ];
+  const harness = await createHarness(async (url) => jsonResponse(200,
+    url === "/api/bootstrap" ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail));
+  const copied = [];
+  harness.navigator.clipboard = { async writeText(value) { copied.push(value); } };
+  await harness.hooks.selectThread("A");
+  const [, process, firstPart, lastPart, , nextAnswer] = harness.elements["message-list"].children;
+  const actions = (article) => article.children.find((child) => child.className === "message-actions");
+  assert.equal(actions(process.children[1].children[0]).hidden, true);
+  assert.equal(actions(firstPart).hidden, true);
+  assert.equal(actions(lastPart).hidden, false);
+  assert.equal(actions(nextAnswer).hidden, false);
+  firstPart.listeners.get("pointerenter")[0]({ pointerType: "mouse" });
+  assert.equal(lastPart.dataset.responseHovered, "true");
+  firstPart.listeners.get("pointerleave")[0]();
+  assert.equal(lastPart.dataset.responseHovered, undefined);
+  firstPart.listeners.get("pointerup")[0]({ pointerType: "touch", target: firstPart });
+  assert.equal(lastPart.dataset.actionsActive, "true");
+  await actions(lastPart).children[0].listeners.get("click")[0]();
+  await actions(nextAnswer).children[0].listeners.get("click")[0]();
+  assert.deepEqual(copied, ["First paragraph\n\nSecond paragraph", "Separate answer"]);
+  detail.messages[3].text = "Updated second paragraph";
+  await harness.hooks.syncSelectedThread();
+  await actions(lastPart).children[0].listeners.get("click")[0]();
+  assert.equal(copied.at(-1), "First paragraph\n\nUpdated second paragraph");
+});
+
+test("touch selects only one message action row and unknown timestamps stay hidden", async () => {
+  const detail = threadDetail("A", "First");
+  detail.messages.push({ id: "next-request", role: "user", kind: "message", text: "Continue" });
+  detail.messages.push({ ...detail.messages[0], id: "second", text: "Second", timestamp: null });
+  const harness = await createHarness(async (url) => jsonResponse(200,
+    url === "/api/bootstrap" ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail));
+  await harness.hooks.selectThread("A");
+  const [first, , second] = harness.elements["message-list"].children;
+  first.listeners.get("pointerup")[0]({ pointerType: "touch", target: first });
+  assert.equal(first.dataset.actionsActive, "true");
+  second.listeners.get("pointerup")[0]({ pointerType: "touch", target: second });
+  assert.equal(first.dataset.actionsActive, undefined);
+  assert.equal(second.dataset.actionsActive, "true");
+  second.listeners.get("pointerup")[0]({ pointerType: "touch", target: second });
+  assert.equal(second.dataset.actionsActive, undefined);
+  assert.equal(second.children.find((child) => child.className === "message-actions").children[1].hidden, true);
+});
+
 test("composer controls send the selected model effort mode and skills", async () => {
   let sentBody;
   const detail = {
@@ -1160,7 +1369,7 @@ test("conversation images open in the full-screen viewer", async () => {
   assert.equal(harness.elements["image-viewer"].hidden, true);
 });
 
-test("desktop snapshots render live thinking and tool state without replacing history", async () => {
+test("desktop snapshots show current thinking status but omit past thinking and its content", async () => {
   const harness = await createHarness(async (url) => {
     if (url === "/api/bootstrap") {
       return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
@@ -1199,7 +1408,7 @@ test("desktop snapshots render live thinking and tool state without replacing hi
 
   assert.match(harness.elements["message-list"].textContent, /已有记录/);
   assert.match(harness.elements["message-list"].textContent, /思考中/);
-  assert.match(harness.elements["message-list"].textContent, /正在检查消息链路/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /正在检查消息链路/);
   assert.match(harness.elements["message-list"].textContent, /正在运行 npm test/);
   assert.match(harness.elements["message-list"].textContent, /进行中/);
   assert.equal(harness.hooks.getState().currentThread.control.busy, true);
@@ -1230,10 +1439,23 @@ test("desktop snapshots render live thinking and tool state without replacing hi
     control: { busy: false, phase: "idle" },
   });
 
-  assert.match(harness.elements["message-list"].textContent, /已思考/);
-  assert.match(harness.elements["message-list"].textContent, /消息链路检查完成/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /已思考|思考中|消息链路检查完成/);
   assert.doesNotMatch(harness.elements["message-list"].textContent, /进行中/);
   assert.equal(harness.hooks.getState().currentThread.control.busy, false);
+});
+
+test("an older in-progress thinking record never replaces the latest completed thinking", async () => {
+  const detail = { ...threadDetail("A", "Ready"), control: { busy: true, turnId: "active", requests: [] }, messages: [
+    { id: "r1", turnId: "active", role: "assistant", kind: "reasoning", activityStatus: "inProgress", text: "Old thinking" },
+    { id: "r2", turnId: "active", role: "assistant", kind: "reasoning", activityStatus: "completed", text: "Current completed thinking" },
+    { id: "tool", turnId: "active", role: "system", kind: "activity", activityType: "command", activityStatus: "running", text: "Running test" },
+  ] };
+  const harness = await createHarness(async (url) => url === "/api/bootstrap"
+    ? jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] })
+    : jsonResponse(200, detail));
+  await harness.hooks.selectThread("A");
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /思考|thinking/);
+  assert.match(harness.elements["message-list"].textContent, /正在运行命令/);
 });
 
 test("optimistic messages show sending and delivered receipts", async () => {
@@ -1319,11 +1541,11 @@ test("a running turn keeps the composer editable and exposes a separate stop act
 
   await harness.hooks.selectThread("A");
   assert.equal(harness.elements["message-input"].disabled, false);
-  assert.equal(harness.elements["delivery-control"].hidden, false);
-  assert.equal(harness.elements["interrupt-button"].hidden, false);
-  assert.equal(harness.elements["send-button"].disabled, true);
-  assert.equal(harness.elements["send-button"].dataset.action, "queue");
-  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "加入等待");
+  assert.equal(harness.elements["composer-status"].textContent, "");
+  assert.equal(harness.elements["interrupt-button"].hidden, true);
+  assert.equal(harness.elements["send-button"].disabled, false);
+  assert.equal(harness.elements["send-button"].dataset.action, "stop");
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "停止");
   assert.equal(harness.elements["interrupt-button"].getAttribute("aria-label"), "中断任务");
 
   const interrupting = harness.hooks.interruptTurn({ preventDefault() {} });
@@ -1350,7 +1572,6 @@ test("a running turn keeps the composer editable and exposes a separate stop act
   });
   assert.equal(harness.hooks.getState().interruptingThreads.includes("A"), false);
   assert.equal(harness.elements["message-input"].disabled, false);
-  assert.equal(harness.elements["delivery-control"].hidden, true);
   assert.equal(harness.elements["interrupt-button"].hidden, true);
   assert.equal(harness.elements["send-button"].dataset.action, "start");
   assert.equal(harness.elements["composer-status"].textContent, "");
@@ -1367,7 +1588,7 @@ test("a running turn queues a follow-up by default", async () => {
     ...threadDetail("A", "正在执行"),
     status: "active",
     control: { busy: true, phase: "running", turnId: "turn-1", requests: [] },
-    composerOptions: composerOptions(),
+    composerOptions: { ...composerOptions(), followUpQueueMode: "steer" },
   };
   detail.messages[0].turnId = "turn-1";
   const harness = await createHarness(async (url, options = {}) => {
@@ -1399,18 +1620,22 @@ test("a running turn queues a follow-up by default", async () => {
 
   assert.equal(sentBody.action, "queue");
   assert.equal("expectedTurnId" in sentBody, false);
-  assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "queued");
-  assert.equal(harness.elements["message-list"].children.at(-1).children[2].textContent, "等待中");
-  assert.equal(harness.elements["send-button"].disabled, true);
-  assert.match(harness.elements["composer-status"].textContent, /当前任务完成后发送/);
+  assert.equal(harness.hooks.getState().pendingMessage, null);
+  assert.match(harness.elements["queued-message-list"].textContent, /完成后继续测试/);
+  assert.equal(harness.elements["send-button"].disabled, false);
+  assert.equal(harness.elements["send-button"].dataset.action, "stop");
+  assert.equal(harness.elements["composer-status"].textContent, "");
+  harness.elements["message-input"].value = "下一条";
+  harness.elements["message-input"].listeners.get("input")[0]();
+  assert.equal(harness.elements["send-button"].disabled, false);
 });
 
-test("Steer sends input to the active turn with its expected turn id", async () => {
+test("adjust direction sends only the chosen waiting message and keeps new input in queue mode", async () => {
   let sentBody;
   const detail = {
     ...threadDetail("A", "正在执行"),
     status: "active",
-    control: { busy: true, phase: "running", turnId: "turn-1", requests: [] },
+    control: { busy: true, phase: "running", turnId: "turn-1", requests: [], queue: [{ id: "queued-1", text: "先检查失败日志" }] },
     composerOptions: composerOptions(),
   };
   detail.messages[0].turnId = "turn-1";
@@ -1419,29 +1644,28 @@ test("Steer sends input to the active turn with its expected turn id", async () 
       return jsonResponse(200, { status: { state: "ready" }, threads: [threadSummary("A")] });
     }
     if (url === "/api/threads/A") return jsonResponse(200, detail);
-    if (url === "/api/threads/A/messages") {
+    if (url === "/api/threads/A/queue/queued-1") {
       sentBody = JSON.parse(options.body);
+      detail.control.queue = [];
       return jsonResponse(202, {
-        delivery: "steered",
-        turnId: "turn-1",
-        control: { busy: true, phase: "running", turnId: "turn-1" },
+        control: detail.control,
       });
     }
     throw new Error(`Unexpected fetch: ${url}`);
   });
 
   await harness.hooks.selectThread("A");
-  const steer = harness.elements["delivery-control"].children[1];
-  steer.listeners.get("click")[0]();
-  harness.elements["message-input"].value = "先检查失败日志";
+  assert.equal(sentBody, undefined);
+  const steer = harness.elements["queued-message-list"].children[0].children[2].children[0];
+  assert.equal(steer.textContent, "调整方向");
+  harness.elements["message-input"].value = "之后检查其他日志";
   harness.elements["message-input"].listeners.get("input")[0]();
-  await harness.hooks.sendMessage({ preventDefault() {} });
-
-  assert.equal(sentBody.action, "steer");
-  assert.equal(sentBody.expectedTurnId, "turn-1");
-  assert.equal(harness.hooks.getState().pendingMessage.deliveryState, "steered");
-  assert.equal(harness.elements["send-button"].dataset.action, "steer");
-  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "Steer 当前任务");
+  steer.listeners.get("click")[0]();
+  await eventually(() => sentBody);
+  assert.deepEqual(sentBody, { action: "send" });
+  assert.equal(harness.elements["message-input"].value, "之后检查其他日志");
+  assert.equal(harness.elements["send-button"].dataset.action, "queue");
+  assert.equal(harness.elements["send-button"].getAttribute("aria-label"), "加入等待");
 });
 
 test("returning to authentication clears in-flight composer state", async () => {
@@ -1791,6 +2015,88 @@ test("lagging snapshots and queued deltas cannot regress a completed message", a
   emitSse(source, "thread", snapshot("最终文本"));
   assert.equal(harness.hooks.getState().liveMessages.length, 0);
   assert.equal(harness.elements["message-list"].children.length, 1);
+});
+
+test("an idle snapshot closes a missed completion without losing text or replaying old deltas", async () => {
+  const idle = { ...emptyThreadDetail("A"), control: { busy: false, turnId: null, requests: [] }, turns: [{ id: "turn-1", status: "completed" }] };
+  const harness = await createHarness(async (url) => jsonResponse(200, url === "/api/bootstrap"
+    ? { status: { state: "ready" }, threads: [threadSummary("A")] } : idle));
+  await harness.hooks.selectThread("A");
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "thread", { ...idle, turns: [{ id: "turn-1", status: "inProgress" }], control: { busy: true, turnId: "turn-1", requests: [] } });
+  const live = { threadId: "A", turnId: "turn-1", itemId: "live-1", text: "完整回复", kind: "message" };
+  emitSse(source, "messageStart", live);
+  emitSse(source, "messageDelta", { ...live, delta: "过期增量" });
+  emitSse(source, "thread", idle);
+  harness.flushAnimationFrames();
+  assert.equal(harness.hooks.getState().currentThread.control.busy, false);
+  assert.equal(harness.elements["interrupt-button"].hidden, true);
+  assert.match(harness.elements["message-list"].textContent, /完整回复/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /过期增量/);
+  emitSse(source, "messageStart", live);
+  emitSse(source, "messageDelta", { ...live, delta: "重放增量" });
+  emitSse(source, "queueStarted", { threadId: "A", turnId: "turn-1" });
+  harness.flushAnimationFrames();
+  assert.equal(harness.hooks.getState().currentThread.control.busy, false);
+  harness.elements["message-input"].value = "继续";
+  harness.elements["message-input"].listeners.get("input")[0]();
+  assert.equal(harness.elements["send-button"].disabled, false);
+  assert.equal(harness.elements["send-button"].dataset.action, "start");
+  emitSse(source, "thread", { ...idle, messages: [{ id: "live-1", turnId: "turn-1", role: "assistant", kind: "message", text: "完整回复以及最后一段" }] });
+  emitSse(source, "messageDone", live);
+  assert.match(harness.elements["message-list"].textContent, /完整回复以及最后一段/);
+});
+
+test("a lagging idle snapshot does not stop a newer live turn", async () => {
+  const idle = { ...emptyThreadDetail("A"), control: { busy: false, requests: [] }, turns: [{ id: "old", status: "completed" }] };
+  const harness = await createHarness(async (url) => jsonResponse(200, url === "/api/bootstrap"
+    ? { status: { state: "ready" }, threads: [threadSummary("A")] } : idle));
+  await harness.hooks.selectThread("A");
+  const source = harness.eventSources.at(-1);
+  emitSse(source, "messageStart", { threadId: "A", turnId: "new", itemId: "new-answer", text: "Working" });
+  emitSse(source, "thread", idle);
+  assert.equal(harness.hooks.getState().currentThread.control.busy, true);
+  assert.equal(harness.hooks.getState().currentThread.control.turnId, "new");
+});
+
+test("completion before a send response keeps normal send available", async () => {
+  const response = deferred();
+  const detail = emptyThreadDetail("A");
+  const harness = await createHarness(async (url) => {
+    if (url.endsWith("/messages")) return response.promise;
+    return jsonResponse(200, url === "/api/bootstrap"
+      ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail);
+  });
+  await harness.hooks.selectThread("A");
+  harness.elements["message-input"].value = "test";
+  const sending = harness.hooks.sendMessage({ preventDefault() {} });
+  emitSse(harness.eventSources.at(-1), "thread", { ...detail, turns: [{ id: "fast", status: "completed" }] });
+  response.resolve(jsonResponse(202, { delivery: "app-server", turnId: "fast", control: { busy: true, turnId: "fast" } }));
+  await sending;
+  assert.equal(harness.hooks.getState().currentThread.control.busy, false);
+});
+
+test("waiting messages stay ordered outside history and can be cancelled individually", async () => {
+  let queue = [{ id: "one", text: "第一条" }, { id: "two", text: "第二条" }];
+  const calls = [];
+  const detail = () => ({ ...emptyThreadDetail("A"), control: { busy: true, turnId: "active", queued: queue.length > 0, queue, requests: [] } });
+  const harness = await createHarness(async (url, options = {}) => {
+    if (url === "/api/threads/A/queue/one") {
+      calls.push(JSON.parse(options.body));
+      queue = queue.slice(1);
+      return jsonResponse(200, { control: detail().control });
+    }
+    return jsonResponse(200, url === "/api/bootstrap"
+      ? { status: { state: "ready" }, threads: [threadSummary("A")] } : detail());
+  });
+  await harness.hooks.selectThread("A");
+  const list = harness.elements["queued-message-list"];
+  assert.match(list.textContent, /第一条调整方向.*第二条调整方向/);
+  assert.doesNotMatch(harness.elements["message-list"].textContent, /第一条|第二条/);
+  list.children[0].children[2].children[1].listeners.get("click")[0]();
+  await eventually(() => list.children.length === 1);
+  assert.deepEqual(calls, [{ action: "remove" }]);
+  assert.match(list.textContent, /第二条/);
 });
 
 test("queued output and stale A to B to A loads cannot pollute the current view", async () => {

@@ -126,3 +126,29 @@ test("unrelated App Server failures do not fall back to Desktop", async () => {
     (error) => error === expected,
   );
 });
+
+test("an unavailable Desktop writer offers explicit continuation, never an automatic fork", async () => {
+  for (const code of ["DESKTOP_BRIDGE_UNAVAILABLE", "DESKTOP_BRIDGE_CONNECTION", "DESKTOP_BRIDGE_TOOL_UNAVAILABLE"]) {
+    const codex = { startTurn: async () => { throw new Error("thread already has an active writer"); } };
+    const desktopBridge = { readThread: async () => { throw Object.assign(new Error("no bridge"), { code }); } };
+    await assert.rejects(startTurnWithDesktopFallback({ codex, desktopBridge, threadId: "t", text: "continue" }),
+      (error) => error.code === "THREAD_CONTINUATION_REQUIRED" && error.status === 409);
+  }
+});
+
+test("an uncertain Desktop delivery does not offer another delivery path", async () => {
+  const codex = { startTurn: async () => { throw new Error("thread already has an active writer"); } };
+  const desktopBridge = {
+    readThread: async () => desktopThread(),
+    sendMessage: async () => { throw Object.assign(new Error("unknown"), { code: "DESKTOP_BRIDGE_DELIVERY_UNKNOWN" }); },
+  };
+  await assert.rejects(startTurnWithDesktopFallback({ codex, desktopBridge, threadId: "t", text: "once" }),
+    { code: "DESKTOP_BRIDGE_DELIVERY_UNKNOWN" });
+});
+
+test("shared mode hands an existing writer to the native desktop bridge", async () => {
+  const codex = { websocketUrl: "ws://127.0.0.1:4500", startTurn: async () => { throw new Error("thread already has an active writer"); } };
+  const desktopBridge = { readThread: async () => desktopThread(), sendMessage: async () => ({ turn: { id: "desktop-turn" } }) };
+  const result = await startTurnWithDesktopFallback({ codex, desktopBridge, threadId: "t", text: "continue" });
+  assert.equal(result.delivery, "codex-app");
+});

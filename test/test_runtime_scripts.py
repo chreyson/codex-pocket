@@ -56,6 +56,26 @@ class LauncherContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell runtime configuration")
 class RuntimeScriptTests(unittest.TestCase):
+    def test_npm_powershell_shim_resolves_to_verified_native_executable(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shim = root / "codex.ps1"
+            shim.touch()
+            (root / "codex.cmd").touch()
+            native = root / "node_modules/@openai/codex/vendor/test/codex/codex.exe"
+            native.parent.mkdir(parents=True)
+            shutil.copyfile(shutil.which("node"), native)
+            environment = {**os.environ, "CODEX_BIN": str(shim),
+                           "POCKET_TEST_HELPER": str(project_root / "CodexPocket.Runtime.ps1"),
+                           "POCKET_TEST_NATIVE": str(native)}
+            result = subprocess.run([
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                ". $env:POCKET_TEST_HELPER; $resolved = Resolve-PocketCodex; "
+                "if ($resolved -cne $env:POCKET_TEST_NATIVE) { throw ('Unexpected CLI: ' + $resolved) }",
+            ], env=environment, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+
     def test_runtime_config_round_trips_unicode_paths(self):
         project_root = Path(__file__).resolve().parents[1]
         helper = project_root / "CodexPocket.Runtime.ps1"

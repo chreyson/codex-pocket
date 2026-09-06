@@ -1,11 +1,16 @@
 import time
+import base64
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from desktop_host import (
     DesktopController,
     copy_system_text,
+    copy_system_image,
     desktop_dependency_message,
     main,
     webview_start_options,
@@ -42,6 +47,73 @@ def wait_for_state(controller, phase, timeout=1):
 
 
 class DesktopHostTests(unittest.TestCase):
+    def test_backend_config_alone_does_not_claim_desktop_attachment(self):
+        controller = DesktopController(FakeManager)
+        controller._on_ready("https://pocket.example.test", "sample-key")
+        self.assertEqual(controller.get_state()["connectionMode"], "unknown")
+        self.assertIsNone(controller.get_state()["desktopConnection"])
+
+    def test_connection_status_refreshes_without_restarting_service(self):
+        controller = DesktopController(FakeManager)
+        controller.manager.connection_status = lambda: {
+            "connectionMode": "shared", "desktopConnection": {"state": "independent"},
+        }
+        controller._on_ready("https://pocket.example.test", "sample-key")
+        controller._refresh_connection()
+        self.assertEqual(controller.get_state()["desktopConnection"]["state"], "independent")
+        controller.manager.connection_status = lambda: {
+            "connectionMode": "shared", "desktopConnection": {"state": "shared"},
+        }
+        controller._refresh_connection()
+        self.assertEqual(controller.get_state()["desktopConnection"]["state"], "shared")
+        self.assertEqual(controller.manager.stop_count, 0)
+
+    def test_qr_clipboard_accepts_only_bounded_pngs_for_the_current_connection(self):
+        images = []
+        controller = DesktopController(FakeManager, image_clipboard_writer=lambda value: images.append(value) or True)
+        controller._on_ready("https://pocket.example.test", "sample-key")
+        url = controller.get_state()["connectionUrl"]
+        png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP9sAAAAASUVORK5CYII=")
+        data = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        self.assertTrue(controller.copy_qr_image(url, data))
+        self.assertEqual(images, [png])
+        for invalid in (None, "file:///tmp/secret.png", "data:image/png;base64,!!!!", "data:image/png;base64," + "A" * 524_288):
+            self.assertFalse(controller.copy_qr_image(url, invalid))
+        self.assertFalse(controller.copy_qr_image(url + "old", data))
+        controller._on_status("Reconnecting")
+        self.assertFalse(controller.copy_qr_image(url, data))
+        self.assertEqual(images, [png])
+
+    def test_image_clipboard_uses_png_bytes_on_linux_and_sta_on_windows(self):
+        for system, executable in (("Linux", "wl-copy"), ("Windows", "powershell.exe")):
+            with patch("desktop_host.shutil.which", return_value=executable), patch("desktop_host.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+                self.assertTrue(copy_system_image(b"synthetic-png", system))
+                args = run.call_args.args[0]
+                if system == "Linux":
+                    self.assertEqual(args, ["wl-copy", "--type", "image/png"])
+                    self.assertEqual(run.call_args.kwargs["input"], b"synthetic-png")
+                else:
+                    self.assertIn("-STA", args)
+                    self.assertEqual(base64.b64decode(run.call_args.kwargs["input"]), b"synthetic-png")
+
+    def test_appearance_survives_controller_restart_without_service_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            appearance_path = Path(directory) / "appearance.json"
+            controller = DesktopController(FakeManager, appearance_path=appearance_path)
+            self.assertEqual(controller.get_theme(), "system")
+            for theme in ("dark", "light", "system"):
+                self.assertEqual(controller.set_theme(theme), theme)
+                reopened = DesktopController(FakeManager, appearance_path=appearance_path)
+                self.assertEqual(reopened.get_theme(), theme)
+                self.assertEqual(reopened.get_state()["phase"], "stopped")
+            self.assertEqual(controller.manager.stop_count, 0)
+            for invalid in ("auto", None, {}):
+                with self.assertRaises(ValueError):
+                    controller.set_theme(invalid)
+            for damaged in ("not json", "[]", '{"theme": "invalid"}'):
+                appearance_path.write_text(damaged, encoding="utf-8")
+                self.assertEqual(controller.get_theme(), "system")
+
     def test_webview_backend_is_only_forced_on_windows(self):
         self.assertEqual(webview_start_options("Windows")["gui"], "edgechromium")
         self.assertNotIn("gui", webview_start_options("Darwin"))
@@ -103,11 +175,13 @@ class DesktopHostTests(unittest.TestCase):
         running = wait_for_state(controller, "running")
         self.assertEqual(running["publicUrl"], "https://pocket.example.test")
         self.assertEqual(running["accessKey"], "sample-key")
+        self.assertEqual(running["connectionUrl"], "https://pocket.example.test#token=sample-key")
 
         controller.stop_service()
         stopped = wait_for_state(controller, "stopped")
         self.assertEqual(stopped["publicUrl"], "")
         self.assertEqual(stopped["accessKey"], "")
+        self.assertEqual(stopped["connectionUrl"], "")
 
     def test_clipboard_and_browser_only_accept_current_values(self):
         copied = []
@@ -128,6 +202,31 @@ class DesktopHostTests(unittest.TestCase):
         self.assertFalse(controller.open_url({"url": "https://pocket.example.test"}))
         self.assertTrue(controller.open_url(state["publicUrl"]))
         self.assertEqual(opened, ["https://pocket.example.test"])
+
+    def test_connection_links_encode_keys_and_reject_stale_clipboard_values(self):
+        copied = []
+        controller = DesktopController(FakeManager, clipboard_writer=lambda value: copied.append(value) or True)
+        controller._on_ready("https://pocket.example.test/path?view=mobile#old", "key+with /?#=&")
+        link = controller.get_state()["connectionUrl"]
+        parsed = urlsplit(link)
+        self.assertEqual(parsed.path, "/path")
+        self.assertEqual(parsed.query, "view=mobile")
+        self.assertEqual(parse_qs(parsed.fragment), {"token": ["key+with /?#=&"]})
+        self.assertTrue(controller.copy_text(link))
+        self.assertFalse(controller.copy_text(link + "tampered"))
+        controller._on_status("Reconnecting")
+        self.assertEqual(controller.get_state()["connectionUrl"], "")
+        self.assertFalse(controller.copy_text(link))
+        controller._on_ready("https://recovered.example.test", "new-key")
+        replacement = controller.get_state()["connectionUrl"]
+        self.assertNotEqual(replacement, link)
+        self.assertFalse(controller.copy_text(link))
+        self.assertTrue(controller.copy_text(replacement))
+        controller._on_failure("Disconnected")
+        self.assertEqual(controller.get_state()["connectionUrl"], "")
+        self.assertFalse(controller.copy_text(replacement))
+        controller._on_ready("http://insecure.example.test", "key")
+        self.assertEqual(controller.get_state()["connectionUrl"], "")
 
     def test_shutdown_prevents_future_state_changes(self):
         controller = DesktopController(FakeManager)

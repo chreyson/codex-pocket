@@ -4,10 +4,10 @@ import {
   redactSensitiveText,
 } from "./redaction.mjs";
 import { MAX_IMAGES_PER_MESSAGE } from "./image-store.mjs";
+import { interactiveRequest } from "./user-requests.mjs";
 
 export const MAX_MESSAGE_LENGTH = 12_000;
 
-const APPROVAL_DECISIONS = new Set(["accept", "acceptForSession", "decline", "cancel"]);
 const COMPOSER_MODES = new Set(["default", "plan", "goal"]);
 const MESSAGE_ACTIONS = new Set(["start", "queue", "steer"]);
 const GOAL_STATUSES = new Set(["active", "paused", "complete"]);
@@ -170,14 +170,6 @@ export function parseGoalPayload(value) {
   return result;
 }
 
-export function parseApprovalPayload(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw requestError(400, "审批格式无效");
-  }
-  if (!APPROVAL_DECISIONS.has(value.decision)) throw requestError(400, "审批选择无效");
-  return { decision: value.decision };
-}
-
 function commandPreview(params) {
   const commands = params.command || (params.commandActions || [])
     .map((action) => action?.command)
@@ -200,11 +192,13 @@ export function sanitizeServerRequest(record) {
     project: projectName(params.cwd || params.grantRoot),
     startedAt: Number(params.startedAtMs || 0),
   };
+  const interactive = interactiveRequest(record);
 
   if (message.method === "item/commandExecution/requestApproval") {
     const network = params.networkApprovalContext;
     return {
       ...base,
+      ...interactive,
       type: network ? "network" : "command",
       title: network ? "网络访问需要批准" : "命令需要批准",
       detail: network
@@ -216,6 +210,7 @@ export function sanitizeServerRequest(record) {
   if (message.method === "item/fileChange/requestApproval") {
     return {
       ...base,
+      ...interactive,
       type: "fileChange",
       title: "文件修改需要批准",
       detail: params.grantRoot
@@ -224,10 +219,12 @@ export function sanitizeServerRequest(record) {
     };
   }
 
+  if (interactive) return { ...base, ...interactive };
+
   return {
     ...base,
     type: "unsupported",
     title: "Codex 正在等待额外输入",
-    detail: "这个请求暂时需要回到电脑端处理",
+    detail: "此请求暂不支持在网页中处理",
   };
 }

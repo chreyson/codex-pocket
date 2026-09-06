@@ -25,19 +25,21 @@ try {
     });
     await page.route("**/api/**", (route) => {
       const pathname = new URL(route.request().url()).pathname;
-      const body = pathname.endsWith("bootstrap") ? { status: { state: "ready" }, threads }
+      const body = pathname.endsWith("bootstrap") ? { status: { state: "ready" }, threads: [...threads, threads[0]] }
         : threads.find((thread) => pathname.endsWith(thread.id));
       return route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
     });
     await page.goto(process.env.POCKET_TEST_URL || "http://127.0.0.1:4175");
     const server = page.locator('.project-group[aria-label="修服务器"]');
     await page.locator(".project-group").first().waitFor();
+    assert.equal(await page.locator('[data-thread-id="0-0"]').count(), 1);
     assert.equal(await server.locator(".project-threads").isVisible(), false);
     await server.locator(".project-toggle").click();
     assert.equal(await server.locator(".thread-row").count(), 5);
     await server.getByRole("button", { name: "展开显示：修服务器", exact: true }).click();
     assert.equal(await server.locator(".thread-row").count(), 8);
-    await page.evaluate((value) => window.sidebarSource.dispatchEvent(new MessageEvent("threads", { data: JSON.stringify(value) })), threads.map((item) => ({ ...item, updatedAt: 2 })));
+    await page.evaluate((value) => window.sidebarSource.dispatchEvent(new MessageEvent("threads", { data: JSON.stringify(value) })), [...threads, threads[0]].map((item) => ({ ...item, updatedAt: 2 })));
+    assert.equal(await page.locator('[data-thread-id="0-0"]').count(), 1);
     assert.equal(await server.locator(".thread-row").count(), 8);
     await server.getByRole("button", { name: "收起显示：修服务器", exact: true }).click();
     await page.locator("#thread-search").fill("查看发布结果");

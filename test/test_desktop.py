@@ -26,6 +26,29 @@ from codex_pocket import (
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {"POCKET_SHARED_SERVER": "off"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_local_readiness_waits_for_codex_and_handles_invalid_health(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        responses = [io.BytesIO(value) for value in [
+            b'{"ok":true,"codex":"starting"}', b'not json', b'{"ok":true,"codex":"ready"}',
+        ]]
+        for response in responses:
+            response.status = 200
+        with (
+            patch("codex_pocket.urllib.request.build_opener") as build_opener,
+            patch.object(run.cancel, "wait", return_value=False) as wait,
+        ):
+            build_opener.return_value.open.side_effect = responses
+            manager._wait_for_local_service(run, SimpleNamespace(poll=lambda: None), 4173)
+        self.assertEqual(build_opener.return_value.open.call_count, 3)
+        self.assertEqual(wait.call_count, 2)
+
     def test_windows_arm64_uses_an_existing_cloudflare_release_asset(self):
         url, archive = cloudflared_download_spec("Windows", "ARM64")
         self.assertTrue(url.endswith("cloudflared-windows-amd64.exe"))
@@ -173,6 +196,7 @@ class DesktopControllerTests(unittest.TestCase):
 
             with (
                 patch("codex_pocket.RUNTIME_CONFIG_PATH", runtime),
+                patch("codex_pocket.platform.system", return_value="Linux"),
                 patch.dict(os.environ, {"NODE_BIN": "", "CODEX_BIN": ""}),
                 patch("codex_pocket.shutil.which", return_value=None),
             ):
@@ -197,11 +221,28 @@ class DesktopControllerTests(unittest.TestCase):
 
             with (
                 patch("codex_pocket.RUNTIME_CONFIG_PATH", runtime),
+                patch("codex_pocket.platform.system", return_value="Linux"),
                 patch.dict(os.environ, {"NODE_BIN": "", "CODEX_BIN": ""}),
                 patch("codex_pocket.shutil.which", side_effect=which),
             ):
                 self.assertEqual(find_node(), "node-from-path")
                 self.assertEqual(find_codex(), "codex-from-path")
+
+    def test_macos_prefers_bundled_codex_but_explicit_override_wins(self):
+        bundled = "/Applications/ChatGPT.app/Contents/Resources/codex"
+        with (
+            patch("codex_pocket.platform.system", return_value="Darwin"),
+            patch("codex_pocket._is_accessible_file", side_effect=lambda value: str(value) == bundled),
+            patch.dict(os.environ, {"CODEX_BIN": ""}, clear=False),
+        ):
+            self.assertEqual(find_codex(), bundled)
+
+        with (
+            patch("codex_pocket.platform.system", return_value="Darwin"),
+            patch("codex_pocket._is_accessible_file", side_effect=lambda value: str(value) in {"/custom/codex", bundled}),
+            patch.dict(os.environ, {"CODEX_BIN": "/custom/codex"}, clear=False),
+        ):
+            self.assertEqual(find_codex(), "/custom/codex")
 
     def test_downloads_cloudflared_with_progress_and_verifies_it(self):
         class FakeResponse:
@@ -417,6 +458,182 @@ class DesktopControllerTests(unittest.TestCase):
                 self.assertIsNone(manager._run)
                 self.assertIsNone(manager._starting_run)
                 manager.stop()
+
+    def test_connect_desktop_reuses_the_runtime_selected_for_start(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        manager.viewer_process = SimpleNamespace(poll=lambda: None)
+        manager._runtime_node = "/runtime/node"
+        runtime_env = {
+            "PATH": "/runtime/bin",
+            "CODEX_BIN": "/runtime/codex",
+            "CODEX_HOME": "/runtime/home",
+        }
+        manager._runtime_env = runtime_env
+
+        class CompletedHelper:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        with (
+            patch("codex_pocket.find_node", side_effect=AssertionError("runtime must be reused")),
+            patch(
+                "codex_pocket.subprocess.Popen", return_value=CompletedHelper(),
+            ) as run_command,
+        ):
+            manager.connect_desktop()
+
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[0], "/runtime/node")
+        self.assertTrue(command[1].endswith("scripts/shared-codex.mjs"))
+        self.assertEqual(command[2:], ["--open-app"])
+        self.assertEqual(run_command.call_args.kwargs["env"], runtime_env)
+        self.assertEqual(run_command.call_args.kwargs["cwd"], Path(__file__).resolve().parents[1])
+
+    def test_cancelled_run_does_not_spawn_shared_backend_helper(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        run.cancel.set()
+
+        with patch("codex_pocket.subprocess.Popen") as popen:
+            with self.assertRaises(manager._StartCancelled):
+                manager._run_shared_backend("node", {"CODEX_HOME": "/runtime/home"}, run=run)
+
+        popen.assert_not_called()
+        self.assertIsNone(run.helper_process)
+
+    def test_stop_terminates_a_blocking_shared_backend_helper(self):
+        class BlockingHelper:
+            pid = 24681
+
+            def __init__(self):
+                self.terminated = False
+                self.returncode = None
+
+            def communicate(self, timeout=None):
+                if self.terminated:
+                    self.returncode = 0
+                    return "", ""
+                raise subprocess.TimeoutExpired(["node", "shared-codex.mjs"], timeout)
+
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        helper = BlockingHelper()
+        registered = threading.Event()
+        errors = []
+
+        def fake_popen(*_args, **_kwargs):
+            registered.set()
+            return helper
+
+        def terminate(process):
+            if process is helper:
+                helper.terminated = True
+
+        def run_helper():
+            try:
+                manager._run_shared_backend("node", {"CODEX_HOME": "/runtime/home"}, run=run)
+            except manager._StartCancelled:
+                return
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch("codex_pocket.subprocess.Popen", side_effect=fake_popen),
+            patch("codex_pocket.terminate_process_tree", side_effect=terminate) as terminate_tree,
+        ):
+            worker = threading.Thread(target=run_helper)
+            worker.start()
+            self.assertTrue(registered.wait(2))
+            manager.stop()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(helper.terminated)
+        terminate_tree.assert_any_call(helper)
+        self.assertIsNone(run.helper_process)
+        self.assertIsNone(manager._run)
+
+    def test_connect_desktop_cancellation_is_silent(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        manager.viewer_process = SimpleNamespace(poll=lambda: None)
+        manager._runtime_node = "node"
+        manager._runtime_env = {"CODEX_HOME": "/runtime/home"}
+
+        def cancel_helper(*_args, **_kwargs):
+            run.cancel.set()
+            raise manager._StartCancelled()
+
+        with patch.object(manager, "_run_shared_backend", side_effect=cancel_helper) as helper:
+            manager.connect_desktop()
+
+        helper.assert_called_once_with("node", {"CODEX_HOME": "/runtime/home"}, open_app=True, run=run)
+        self.assertIs(manager._run, run)
+
+    def test_shared_backend_failure_clears_runtime_binding(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        captured = []
+
+        def fail_shared_backend(node, env, *, open_app=False, run=None):
+            captured.append((node, env, open_app, run))
+            raise RuntimeError("backend failed")
+
+        with (
+            patch.dict(os.environ, {"POCKET_SHARED_SERVER": "on"}),
+            patch("codex_pocket.find_free_port", return_value=4173),
+            patch("codex_pocket.find_node", return_value="/runtime/node"),
+            patch("codex_pocket.find_codex", return_value="/runtime/codex"),
+            patch("codex_pocket.ensure_cloudflared", return_value="cloudflared"),
+            patch.object(manager, "_run_shared_backend", side_effect=fail_shared_backend),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backend failed"):
+                manager.start()
+
+        self.assertEqual(captured[0][0], "/runtime/node")
+        self.assertFalse(captured[0][2])
+        captured_run = captured[0][3]
+        self.assertIsNotNone(captured_run)
+        self.assertIsNone(manager._run)
+        self.assertEqual(captured[0][1]["CODEX_BIN"], "/runtime/codex")
+        self.assertEqual(captured[0][1]["CODEX_HOME"], str(Path.home() / ".codex"))
+        self.assertIsNone(manager._runtime_node)
+        self.assertIsNone(manager._runtime_env)
+        self.assertEqual(manager.port, 0)
+
+    def test_stop_clears_runtime_and_tunnel_connection_state(self):
+        manager = ServiceManager(lambda _value: None, lambda *_args: None, lambda _error: None)
+        run = manager._Run()
+        manager._run = run
+        manager.viewer_process = SimpleNamespace(poll=lambda: None)
+        manager.tunnel_process = SimpleNamespace(poll=lambda: None)
+        manager.port = 4173
+        manager.public_url = "https://example.trycloudflare.com"
+        manager.access_key = "key"
+        manager._runtime_node = "/runtime/node"
+        manager._runtime_env = {"CODEX_HOME": "/runtime/home"}
+        manager._url_event.set()
+        manager._connected_event.set()
+        manager._last_tunnel_lines = ["connected"]
+
+        with patch("codex_pocket.terminate_process_tree"):
+            manager.stop()
+
+        self.assertEqual(manager.port, 0)
+        self.assertEqual(manager.public_url, "")
+        self.assertEqual(manager.access_key, "")
+        self.assertIsNone(manager._runtime_node)
+        self.assertIsNone(manager._runtime_env)
+        self.assertFalse(manager._url_event.is_set())
+        self.assertFalse(manager._connected_event.is_set())
+        self.assertEqual(manager._last_tunnel_lines, [])
 
     def test_direct_gui_entry_uses_the_same_webview_host(self):
         from codex_pocket import main

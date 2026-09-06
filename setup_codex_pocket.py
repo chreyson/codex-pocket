@@ -206,10 +206,10 @@ def resolve_node(config: dict) -> tuple[str, str]:
 def macos_codex_app_candidates():
     roots = [Path("/Applications"), Path.home() / "Applications"]
     relative_candidates = [
+        "ChatGPT.app/Contents/Resources/codex",
         "Codex.app/Contents/Resources/codex",
         "Codex.app/Contents/Resources/bin/codex",
         "Codex.app/Contents/MacOS/codex",
-        "ChatGPT.app/Contents/Resources/codex",
     ]
     for root in roots:
         for relative in relative_candidates:
@@ -217,15 +217,18 @@ def macos_codex_app_candidates():
 
 
 def resolve_codex(config: dict) -> str:
-    candidates = list(
-        command_candidates(
-            "codex",
-            configured_path(config, "Codex"),
-            "CODEX_BIN",
-        )
-    )
+    explicit = os.environ.get("CODEX_BIN")
+    directories = common_bin_directories()
+    candidates = []
+    if explicit:
+        resolved = resolve_candidate(explicit, directories)
+        if resolved is not None:
+            candidates.append(resolved)
     if platform.system().lower() == "darwin":
+        # Keep the installer and runtime on the CLI shipped with the desktop
+        # app. An installed Homebrew CLI may be a different protocol version.
         candidates.extend(macos_codex_app_candidates())
+    candidates.extend(command_candidates("codex", configured_path(config, "Codex"), ""))
 
     for candidate in unique_paths(candidates):
         if not is_accessible_file(candidate, executable=True):
@@ -258,6 +261,36 @@ def run_pip(arguments) -> None:
     ]
     if subprocess.run(command, cwd=APP_DIR, check=False).returncode != 0:
         raise RuntimeError("Python 桌面依赖安装失败。")
+
+
+def ensure_node_dependencies(node_path: str, *, install: bool = True) -> None:
+    probe = subprocess.run(
+        [node_path, "--input-type=module", "-e", 'import("ws")'],
+        cwd=APP_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=10, check=False,
+    )
+    if probe.returncode == 0:
+        return
+    if not install:
+        raise RuntimeError("缺少 Node 依赖，请重新运行安装器或 npm ci。")
+    node_directory = Path(node_path).resolve().parent
+    candidates = [
+        node_directory / "node_modules/npm/bin/npm-cli.js",
+        node_directory.parent / "lib/node_modules/npm/bin/npm-cli.js",
+    ]
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if npm:
+        candidates.extend([Path(npm).resolve(), Path(npm).parent / "node_modules/npm/bin/npm-cli.js"])
+    cli = next((file for file in candidates if file.name == "npm-cli.js" and file.is_file()), None)
+    if cli is None:
+        raise RuntimeError("未找到 npm，请安装包含 npm 的 Node.js 后重试。")
+    print("正在安装 Node 运行依赖...", flush=True)
+    result = subprocess.run(
+        [node_path, str(cli), "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
+        cwd=APP_DIR, timeout=180, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("Node 运行依赖安装失败，请检查网络后重试。")
 
 
 def probe_python(code: str) -> bool:
@@ -386,6 +419,7 @@ def main(argv=None) -> int:
         "Codex": None,
         "Cloudflared": None,
         "DesktopBackend": None,
+        "SharedDesktop": None,
         "Started": False,
         "Error": None,
     }
@@ -405,6 +439,7 @@ def main(argv=None) -> int:
         os.environ["NODE_BIN"] = node_path
         os.environ["PATH"] = portable_environment([node_path])["PATH"]
         codex_path = resolve_codex(config)
+        ensure_node_dependencies(node_path, install=not args.check)
         backend = "headless" if args.headless else ensure_desktop_dependencies(
             system_name, install=not args.check,
         )
@@ -414,6 +449,11 @@ def main(argv=None) -> int:
             cloudflared_path = prepare_cloudflared()
 
         write_runtime_config(node_path, node_version, codex_path)
+        if not args.check and not args.headless and system_name == "darwin":
+            from install_desktop_launch import install
+            print("正在配置 Codex 桌面自动共享接入...", flush=True)
+            install(node=node_path, codex=codex_path)
+            result["SharedDesktop"] = {"Installed": True, "Mode": "shared"}
         result["Python"] = {
             "Path": str(Path(sys.executable).absolute()),
             "Version": platform.python_version(),

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { permissionCatalog } from "../src/permissions.mjs";
+import { connectionDescription } from "../src/desktop-connection.mjs";
 
 const playwright = await import(process.env.PLAYWRIGHT_MODULE || "playwright");
 const browser = await playwright[process.env.PLAYWRIGHT_BROWSER || "chromium"].launch({ headless: true, channel: process.env.PLAYWRIGHT_CHANNEL || undefined });
@@ -19,7 +20,7 @@ const thread = {
   messages: [
     { id: "u", role: "user", kind: "message", text: "把手机和桌面窗口调整得更舒适一些，运行细节也默认收起。" },
     { id: "p", role: "assistant", kind: "commentary", text: "我会统一两端的字体、灰阶和控件间距。运行细节将收起为简短摘要，需要时可以展开查看。" },
-    ...Array.from({ length: 4 }, (_, i) => ({ id: `tool-${i}`, role: "system", kind: "activity", activityType: "command", activityStatus: i === 2 ? "failed" : "completed", text: `运行 /bin/zsh -lc 'inspect-design --file public/example-${i}.css'` })),
+    ...Array.from({ length: 4 }, (_, i) => ({ id: `tool-${i}`, role: "system", kind: "activity", activityType: i === 3 ? "file" : "command", ...(i === 0 ? { activityActions: ["read"] } : {}), activityStatus: i === 2 ? "failed" : "completed", text: `运行 /bin/zsh -lc 'inspect-design --file public/example-${i}.css'` })),
     { id: "r", role: "assistant", kind: "reasoning", activityStatus: "inProgress", text: "Internal reasoning detail should remain collapsed." },
     { id: "a", role: "assistant", kind: "message", text: "界面已更新。\n\n现在会优先显示对话、任务结果和需要你处理的事项。工具操作和思考内容保留在折叠区域中。" },
   ].map((message) => ({ ...message, turnId: "design-turn" })),
@@ -53,7 +54,8 @@ try {
     await page.locator('#connection-state[data-state="ready"]').waitFor({ state: "attached", timeout: 5_000 });
     assert.equal(await page.locator(".activity-list").isVisible(), false);
     assert.equal(await page.locator(".reasoning-body").isVisible(), false);
-    assert.doesNotMatch(await page.locator(".activity-summary").innerText(), /zsh|失败|example/);
+    assert.equal((await page.locator(".activity-summary").textContent()).trim(), "编辑了文件、已读取文件、运行命令");
+    assert.equal(await page.locator('[data-kind="reasoning"]').count(), 0);
     await shot(page, name);
     const header = page.locator(".conversation-header");
     const actions = page.locator("#conversation-actions");
@@ -138,8 +140,14 @@ try {
       ...thread, control: { busy: true, turnId: "design-turn", requests: [] },
     });
     assert.equal(await page.locator('.message[data-kind="commentary"]').isVisible(), true);
+    assert.equal((await page.locator(".thinking-status").innerText()).trim(), "思考中");
+    assert.equal(await page.locator(".thinking-status").count(), 1);
+    await page.locator(".activity-summary").click();
+    await page.locator(".thinking-status").scrollIntoViewIfNeeded();
+    await shot(page, `${name}-thinking`);
     await page.evaluate((value) => window.designSource.dispatchEvent(new MessageEvent("thread", { data: JSON.stringify(value) })), thread);
     assert.equal(await page.locator(".turn-process").evaluate((element) => element.open), false);
+    assert.equal(await page.locator(".thinking-status").count(), 0);
     assert.equal(await page.evaluate(() => window.resultArticle === document.querySelector('#message-list > .message[data-role="assistant"]')), true);
     await shot(page, `${name}-completed`);
     await page.evaluate((value) => window.designSource.dispatchEvent(new MessageEvent("thread", { data: JSON.stringify(value) })), {
@@ -170,18 +178,41 @@ try {
     const context = await browser.newContext({ viewport: { width, height }, colorScheme });
     const page = await context.newPage();
     page.on("pageerror", (error) => errors.push(error.message));
-    await page.addInitScript(() => {
-      window.designState = { phase: "running", status: "服务运行中", publicUrl: "https://your-pocket-connection.trycloudflare.com", accessKey: "example-access-key-not-a-real-credential", busy: false, error: "" };
+    await page.addInitScript((desktopConnection) => {
+      window.designState = { phase: "running", connectionMode: "shared", desktopConnection, status: "服务运行中", publicUrl: "https://your-pocket-connection.trycloudflare.com", accessKey: "example-access-key-not-a-real-credential", busy: false, error: "" };
+      window.designConnects = 0;
       window.pywebview = { api: {
+        get_theme: async () => "system",
+        set_theme: async (theme) => theme,
         get_state: async () => window.designState,
         copy_text: async () => true,
         stop_service: async () => (window.designState = { phase: "stopped", status: "服务已停止", publicUrl: "", accessKey: "", busy: false, error: "" }),
         start_service: async () => window.designState,
+        connect_desktop: async () => { window.designConnects++; return window.designState; },
       } };
-    });
+    }, connectionDescription("independent"));
     await page.goto(`${base}/desktop/index.html`);
     await page.locator('#desktop-app[data-phase="running"]').waitFor();
     assert.equal(await page.locator("#connection-description").innerText(), "连接已就绪");
+    const mode = page.locator("#connection-mode");
+    assert.equal(await mode.innerText(), "桌面未接入");
+    assert.equal(await page.evaluate(() => window.designConnects), 0);
+    const bounds = await mode.boundingBox();
+    assert.ok(bounds.width >= 48 && bounds.height <= 28, "mode label must remain on one line");
+    const headerBefore = await page.locator(".section-intro").boundingBox();
+    await shot(page, `${name}-mode`);
+    await page.locator(".connection-mode-details > summary").click();
+    await page.locator(".connection-mode-help").waitFor({ state: "visible" });
+    assert.deepEqual(await page.locator(".section-intro").boundingBox(), headerBefore, "help must not shift the header");
+    const help = await page.locator(".connection-mode-help").boundingBox();
+    assert.ok(help.x >= 0 && help.x + help.width <= width);
+    await shot(page, `${name}-mode-help`);
+    await page.locator("#connect-desktop").click();
+    assert.equal(await page.evaluate(() => window.designConnects), 1);
+    await page.evaluate((connection) => { window.designState.desktopConnection = connection; }, connectionDescription("shared"));
+    await page.waitForFunction(() => document.querySelector("#connection-mode").textContent === "已共享");
+    assert.equal(await page.locator("#connect-desktop").isVisible(), false);
+    await page.locator(".connection-mode-details > summary").click();
     await page.locator("#copy-url").click();
     await page.locator("#copy-toast[data-visible=true]").waitFor();
     await shot(page, name);

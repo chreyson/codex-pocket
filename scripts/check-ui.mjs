@@ -24,6 +24,8 @@ server.listen(0, "127.0.0.1");
 await once(server, "listening");
 process.env.POCKET_TEST_URL = `http://127.0.0.1:${server.address().port}`;
 try {
+  await import("./check-queue.mjs");
+  await import("./check-qr.mjs");
   await import("./check-mobile.mjs");
   await import("./check-design.mjs");
   await import("./check-image-viewer.mjs");
@@ -33,6 +35,7 @@ try {
   await import("./check-markdown.mjs");
   await import("./check-sidebar.mjs");
   await import("./check-management.mjs");
+  await import("./check-user-requests.mjs");
 } finally {
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));

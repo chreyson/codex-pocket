@@ -247,7 +247,8 @@ def find_node() -> str:
 
 
 def find_codex() -> str:
-    for configured in (os.environ.get("CODEX_BIN"), runtime_configured_path("Codex")):
+    explicit = os.environ.get("CODEX_BIN")
+    for configured in (explicit,):
         if not _is_accessible_file(configured):
             continue
         configured_path = Path(configured)
@@ -256,6 +257,29 @@ def find_codex() -> str:
             if _is_accessible_file(command_wrapper):
                 return str(command_wrapper)
         return configured
+
+    # The desktop app and its app-server protocol must use the same bundled
+    # CLI. A globally installed CLI can be newer (or older) and may reject the
+    # app's dynamic MCP configuration during thread resume/start.
+    if platform.system().lower() == "darwin":
+        for candidate in (
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            Path("/Applications/Codex.app/Contents/Resources/codex"),
+            Path.home() / "Applications/ChatGPT.app/Contents/Resources/codex",
+            Path.home() / "Applications/Codex.app/Contents/Resources/codex",
+        ):
+            if _is_accessible_file(candidate):
+                return str(candidate)
+
+    configured = runtime_configured_path("Codex")
+    if _is_accessible_file(configured):
+        configured_path = Path(configured)
+        if configured_path.suffix.lower() == ".ps1":
+            command_wrapper = configured_path.with_suffix(".cmd")
+            if _is_accessible_file(command_wrapper):
+                return str(command_wrapper)
+        return configured
+
     found = shutil.which("codex")
     if found:
         return found
@@ -384,6 +408,7 @@ class ServiceManager:
             self.start_done = threading.Event()
             self.stop_done = threading.Event()
             self.start_thread_id = threading.get_ident()
+            self.helper_process: subprocess.Popen | None = None
 
     def __init__(self, on_status, on_ready, on_failure):
         self.on_status = on_status
@@ -402,6 +427,11 @@ class ServiceManager:
         self._run: ServiceManager._Run | None = None
         self._starting_run: ServiceManager._Run | None = None
         self._cleaning_run: ServiceManager._Run | None = None
+        # Keep the exact runtime selected for this service instance.  Desktop
+        # attachment must use the same Node/Codex executable and environment
+        # as the backend that was just started.
+        self._runtime_node: str | None = None
+        self._runtime_env: dict[str, str] | None = None
         self._closed = False
 
     @property
@@ -557,12 +587,81 @@ class ServiceManager:
                 raise RuntimeError("本地服务启动失败，请查看日志")
             try:
                 with opener.open(url, timeout=1) as response:
-                    if response.status == 200:
+                    if response.status == 200 and json.load(response).get("codex") == "ready":
                         return
-            except OSError:
-                if run.cancel.wait(0.25):
-                    self._check_cancelled(run)
+            except (OSError, ValueError):
+                pass
+            if run.cancel.wait(0.25):
+                self._check_cancelled(run)
         raise RuntimeError("等待本地服务启动超时")
+
+    def _run_shared_backend(
+        self,
+        node: str,
+        env: dict[str, str],
+        *,
+        open_app: bool = False,
+        run: _Run | None = None,
+    ) -> None:
+        """Run the shared-runtime helper while allowing the owning run to cancel it."""
+        command = [node, str(APP_DIR / "scripts" / "shared-codex.mjs")]
+        if open_app:
+            command.append("--open-app")
+        timeout = 90 if open_app else 60
+        # Register the helper while holding the same lock used by stop(). This
+        # closes the race where shutdown happens between the cancellation check
+        # and process creation.
+        with self._lock:
+            if run is not None and (self._run is not run or run.cancel.is_set()):
+                raise self._StartCancelled()
+            process = subprocess.Popen(
+                command,
+                cwd=APP_DIR,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **hidden_process_options(),
+            )
+            if run is not None:
+                run.helper_process = process
+
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if run is not None and (run.cancel.is_set() or not self._run_is_current(run)):
+                    terminate_process_tree(process)
+                    try:
+                        process.communicate(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    raise self._StartCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    terminate_process_tree(process)
+                    try:
+                        process.communicate(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            if process.returncode:
+                message = (stderr or "").strip()
+                if open_app:
+                    raise RuntimeError(message or "桌面 App 未接入共享后端")
+                raise RuntimeError(message or "共享 Codex 启动失败")
+        finally:
+            with self._lock:
+                if run is not None and run.helper_process is process:
+                    run.helper_process = None
 
     def start(self) -> None:
         with self._lock:
@@ -578,11 +677,20 @@ class ServiceManager:
             self._starting_run = run
             self.public_url = ""
             self.access_key = secrets.token_urlsafe(24)
+            self.port = 0
+            self._url_event.clear()
+            self._connected_event.clear()
+            self._last_tunnel_lines = []
+            self._runtime_node = None
+            self._runtime_env = None
             access_key = self.access_key
 
         try:
-            self.port = find_free_port()
-            port = self.port
+            allocated_port = find_free_port()
+            with self._lock:
+                self._check_cancelled(run)
+                self.port = allocated_port
+            port = allocated_port
 
             def report_status(value: str) -> None:
                 self._check_cancelled(run)
@@ -604,8 +712,17 @@ class ServiceManager:
             env["FORCE_SECURE_COOKIE"] = "1"
             env.setdefault("CODEX_HOME", str(Path.home() / ".codex"))
 
+            with self._lock:
+                self._check_cancelled(run)
+                self._runtime_node = node
+                self._runtime_env = dict(env)
+
             report_status("正在连接本机 Codex")
             DATA_DIR.mkdir(parents=True, exist_ok=True)
+            if env.get("POCKET_SHARED_SERVER") != "off" and not env.get("CODEX_APP_SERVER_WS_URL"):
+                # Keep the backend outside the viewer tree, including Windows taskkill /T.
+                self._run_shared_backend(node, env, run=run)
+                self._check_cancelled(run)
             viewer_process = self._spawn_process(
                 run, "viewer", [node, str(APP_DIR / "src" / "server.mjs")], env=env,
             )
@@ -637,6 +754,42 @@ class ServiceManager:
                 if self._starting_run is run:
                     self._starting_run = None
 
+    def connection_status(self) -> dict:
+        with self._lock:
+            port = self.port
+            viewer = self.viewer_process
+        if not port or viewer is None or viewer.poll() is not None:
+            return {"connectionMode": "unknown", "desktopConnection": None}
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=6) as response:
+            result = json.load(response)
+        return {
+            "connectionMode": result.get("connectionMode", "unknown"),
+            "desktopConnection": result.get("desktopConnection") if result.get("codex") == "ready" else None,
+        }
+
+    def connect_desktop(self) -> None:
+        with self._lock:
+            run = self._run
+            node = self._runtime_node
+            env = dict(self._runtime_env) if self._runtime_env is not None else None
+            viewer = self.viewer_process
+            if (
+                run is None
+                or run.cancel.is_set()
+                or not node
+                or env is None
+                or viewer is None
+                or viewer.poll() is not None
+            ):
+                raise RuntimeError("本地服务尚未运行，无法连接桌面 App")
+        try:
+            self._run_shared_backend(node, env, open_app=True, run=run)
+        except self._StartCancelled:
+            # stop()/shutdown owns cancellation; do not surface a late error
+            # or continue opening the desktop after the window has closed.
+            return
+
     def _stop_run(self, expected_run: _Run | None = None) -> _Run | None:
         with self._lock:
             run = self._run
@@ -647,14 +800,22 @@ class ServiceManager:
             run.cancel.set()
             tunnel = self.tunnel_process
             viewer = self.viewer_process
+            helper = run.helper_process
             self.tunnel_process = None
             self.viewer_process = None
+            run.helper_process = None
             self.public_url = ""
             self.access_key = ""
+            self.port = 0
+            self._runtime_node = None
+            self._runtime_env = None
+            self._url_event.clear()
+            self._connected_event.clear()
+            self._last_tunnel_lines = []
             self._run = None
             self._cleaning_run = run
         try:
-            for process in (tunnel, viewer):
+            for process in (helper, tunnel, viewer):
                 try:
                     terminate_process_tree(process)
                 except Exception as error:

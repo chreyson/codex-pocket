@@ -144,10 +144,23 @@ test("turn timing exposes only measured durations", () => {
     { id: "invalid", durationMs: -1, items: [] },
   ] });
   assert.deepEqual(detail.turns, [
-    { id: "measured", durationMs: 253000 },
-    { id: "missing", durationMs: null },
-    { id: "invalid", durationMs: null },
+    { id: "measured", status: null, durationMs: 253000 },
+    { id: "missing", status: null, durationMs: null },
+    { id: "invalid", status: null, durationMs: null },
   ]);
+});
+
+test("activity summaries receive structured command categories without action paths", () => {
+  const detail = sanitizeThreadDetail({ turns: [{ items: [
+    { type: "commandExecution", id: "read", command: "cat file", status: "completed", commandActions: [
+      { type: "read", path: "/private/secret.txt" }, { type: "listFiles", path: "/private" },
+      { type: "search", query: "private-query" }, { type: "unknown" },
+    ] },
+    { type: "commandExecution", id: "unknown", command: "custom-tool", status: "inProgress" },
+  ] }] });
+  assert.deepEqual(detail.messages[0].activityActions, ["read", "search", "command"]);
+  assert.deepEqual(detail.messages[1].activityActions, ["command"]);
+  assert.doesNotMatch(JSON.stringify(detail), /secret.txt|private-query/);
 });
 
 test("thread detail keeps conversation and redacts raw tool output", () => {

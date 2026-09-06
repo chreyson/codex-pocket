@@ -199,10 +199,54 @@ function Resolve-PocketNode {
     throw 'Node.js 20 or newer was not found. Install Node.js, then run setup again.'
 }
 
+function Find-PocketDesktop {
+    $candidates = @($env:CODEX_DESKTOP_PATH, $env:CODEX_DESKTOP_APP)
+    $local = [Environment]::GetFolderPath('LocalApplicationData')
+    foreach ($relative in @('Programs\Codex\Codex.exe', 'Programs\ChatGPT\ChatGPT.exe', 'Codex\Codex.exe')) {
+        if ($local) { $candidates += Join-Path $local $relative }
+    }
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        foreach ($package in @(Get-AppxPackage -Name '*Codex*' -ErrorAction SilentlyContinue)) {
+            if ($package.InstallLocation) {
+                foreach ($relative in @('app\Codex.exe', 'Codex.exe', 'app\ChatGPT.exe')) {
+                    $candidates += Join-Path $package.InstallLocation $relative
+                }
+            }
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    return $null
+}
+
 function Resolve-PocketCodex {
     param([string]$ConfiguredPath)
 
-    $candidateValues = @($env:CODEX_BIN, $ConfiguredPath)
+    # An explicit CODEX_BIN is an intentional override. Otherwise prefer the
+    # CLI shipped with the desktop app before a stale global/runtime-configured
+    # CLI, because app-server MCP schemas must stay in lockstep.
+    $candidateValues = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_BIN)) {
+        $candidateValues += $env:CODEX_BIN
+    }
+    $desktop = Find-PocketDesktop
+    if ($desktop) {
+        $resources = Join-Path (Split-Path -Parent $desktop) 'resources'
+        $candidateValues += Join-Path $resources 'codex.exe'
+        $candidateValues += Join-Path $resources 'app.asar.unpacked\codex.exe'
+    }
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($localAppData) {
+        $codexDirectory = Join-Path $localAppData 'OpenAI\Codex\bin'
+        if (Test-Path -LiteralPath $codexDirectory -PathType Container) {
+            $candidateValues += @(Get-ChildItem -LiteralPath $codexDirectory -Filter codex.exe -File -Recurse |
+                Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+        }
+    }
+    $candidateValues += $ConfiguredPath
     foreach ($name in @('codex.cmd', 'codex.exe', 'codex')) {
         $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($command) {
@@ -243,6 +287,17 @@ function Resolve-PocketCodex {
             $path = $replacement
         }
 
+        if ([IO.Path]::GetExtension($path) -ieq '.cmd') {
+            # npm's shim is not directly executable by the desktop's native spawn.
+            $packageDirectory = Join-Path (Split-Path -Parent $path) 'node_modules\@openai\codex'
+            if (Test-Path -LiteralPath $packageDirectory -PathType Container) {
+                $native = Get-ChildItem -LiteralPath $packageDirectory -Filter codex.exe -File -Recurse |
+                    Where-Object { $_.FullName -match '\\vendor\\' } |
+                    Select-Object -First 1
+                if ($native) { $path = $native.FullName }
+            }
+        }
+
         $key = $path.ToLowerInvariant()
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
@@ -253,19 +308,6 @@ function Resolve-PocketCodex {
                 }
             } catch {
                 continue
-            }
-        }
-    }
-
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-    if ($localAppData) {
-        $codexDirectory = Join-Path $localAppData 'OpenAI\Codex\bin'
-        if (Test-Path -LiteralPath $codexDirectory -PathType Container) {
-            $bundled = Get-ChildItem -LiteralPath $codexDirectory -Filter codex.exe -File -Recurse |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 1
-            if ($bundled) {
-                return $bundled.FullName
             }
         }
     }

@@ -14,6 +14,19 @@ const dismissErrorButton = document.querySelector("#dismiss-error");
 const copyToast = document.querySelector("#copy-toast");
 const copyToastText = document.querySelector("#copy-toast-text");
 const connectionDescription = document.querySelector("#connection-description");
+const connectionMode = document.querySelector("#connection-mode");
+const connectionModeCurrent = document.querySelector("#connection-mode-current");
+const connectionModeAdvice = document.querySelector("#connection-mode-advice");
+const connectDesktopButton = document.querySelector("#connect-desktop");
+const connectionQr = document.querySelector("#connection-qr");
+const qrPlaceholder = document.querySelector("#qr-placeholder");
+const copyQrButton = document.querySelector("#copy-qr");
+const showQrButton = document.querySelector("#show-qr");
+const closeQrButton = document.querySelector("#close-qr");
+const qrDialog = document.querySelector("#qr-dialog");
+const qrCopyStatus = document.querySelector("#qr-copy-status");
+let renderedConnectionUrl = "";
+let copyingQr = false;
 
 let bridge = null;
 let refreshTimer = null;
@@ -26,8 +39,10 @@ let currentState = {
   status: "正在连接桌面服务",
   publicUrl: "",
   accessKey: "",
+  connectionUrl: "",
   busy: true,
   error: "",
+  connectionMode: "unknown",
 };
 
 function setValue(element, value, fallback) {
@@ -36,6 +51,34 @@ function setValue(element, value, fallback) {
   element.textContent = text;
   element.dataset.empty = String(!value);
   element.title = value || "";
+}
+
+function renderConnectionQr() {
+  const url = currentState.phase === "running" ? currentState.connectionUrl || "" : "";
+  showQrButton.disabled = !url;
+  if (!url && qrDialog.open) qrDialog.close();
+  copyQrButton.disabled = !url || copyingQr;
+  if (url && url === renderedConnectionUrl) return;
+  renderedConnectionUrl = "";
+  qrCopyStatus.textContent = "";
+  connectionQr.hidden = true;
+  connectionQr.removeAttribute("src");
+  qrPlaceholder.hidden = false;
+  qrPlaceholder.textContent = currentState.phase === "starting" ? "正在建立连接" : "服务未开启";
+  if (!url) return;
+  try {
+    const qr = window.qrcode(0, "M");
+    qr.addData(url, "Byte");
+    qr.make();
+    // Keep four clear modules around the code in both light and dark themes.
+    connectionQr.src = qr.createDataURL(4, 16);
+    connectionQr.hidden = false;
+    qrPlaceholder.hidden = true;
+    renderedConnectionUrl = url;
+  } catch {
+    copyQrButton.disabled = true;
+    qrPlaceholder.textContent = "二维码暂不可用";
+  }
 }
 
 function render(state) {
@@ -55,6 +98,23 @@ function render(state) {
     running: "连接已就绪",
     error: "连接未完成",
   }[phase] || currentState.status;
+  if (connectionMode) {
+    const connection = running && currentState.desktopConnection || {
+      label: running ? "待确认" : "未连接",
+      advice: running ? "正在确认桌面 App 的实际连接。" : "启动服务后检测桌面连接。",
+    };
+    connectionMode.textContent = connection.label;
+    connectionMode.dataset.mode = running ? connection.state || "unknown" : "unknown";
+    if (connectionModeCurrent && connectionModeAdvice) {
+      connectionModeCurrent.textContent = connection.label;
+      connectionModeAdvice.textContent = connection.advice;
+    }
+    if (connectDesktopButton) {
+      connectDesktopButton.hidden = !running || currentState.connectionMode !== "shared" || connection.state === "shared";
+      connectDesktopButton.disabled = !bridge || Boolean(currentState.desktopConnecting);
+      connectDesktopButton.textContent = currentState.desktopConnecting ? "正在确认连接…" : "连接桌面 App";
+    }
+  }
   statusDot.dataset.phase = phase;
   statusText.textContent = currentState.status || "服务已停止";
   statusText.title = statusText.textContent;
@@ -71,6 +131,7 @@ function render(state) {
   copyUrlButton.disabled = !hasUrl;
   openUrlButton.disabled = !hasUrl;
   copyKeyButton.disabled = !hasKey;
+  renderConnectionQr();
   errorText.textContent = currentState.error || "";
   errorBanner.hidden = !currentState.error;
 }
@@ -101,6 +162,16 @@ async function connectBridge() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(refresh, 450);
 }
+
+connectDesktopButton?.addEventListener("click", async () => {
+  if (!bridge || currentState.desktopConnecting) return;
+  render({ desktopConnecting: true });
+  try {
+    render(await bridge.connect_desktop());
+  } catch {
+    render({ desktopConnecting: false, error: "无法连接桌面 App，请重试。" });
+  }
+});
 
 serviceButton.addEventListener("click", async () => {
   if (!bridge || serviceActionInFlight) return;
@@ -171,6 +242,58 @@ copyUrlButton.addEventListener("click", () => {
 });
 copyKeyButton.addEventListener("click", () => {
   copy(currentState.accessKey, "访问密钥", copyKeyButton);
+});
+showQrButton.addEventListener("click", () => {
+  if (currentState.phase !== "running" || !currentState.connectionUrl || qrDialog.open) return;
+  qrCopyStatus.textContent = "";
+  qrDialog.showModal();
+});
+closeQrButton.addEventListener("click", () => qrDialog.close());
+qrDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const controls = [copyQrButton, closeQrButton].filter((button) => !button.disabled);
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === document.querySelector("#scan-label"))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+qrDialog.addEventListener("click", (event) => {
+  if (event.target !== qrDialog) return;
+  const rect = qrDialog.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) qrDialog.close();
+});
+qrDialog.addEventListener("close", () => {
+  if (!showQrButton.disabled) showQrButton.focus();
+  else serviceButton.focus();
+});
+
+copyQrButton.addEventListener("click", async () => {
+  if (!bridge || copyingQr || currentState.phase !== "running" || !renderedConnectionUrl) return;
+  const url = renderedConnectionUrl;
+  copyingQr = true;
+  copyQrButton.disabled = true;
+  try {
+    await connectionQr.decode();
+    if (currentState.phase !== "running" || renderedConnectionUrl !== url) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = connectionQr.naturalWidth;
+    canvas.height = connectionQr.naturalHeight;
+    canvas.getContext("2d").drawImage(connectionQr, 0, 0);
+    const copied = await bridge.copy_qr_image(url, canvas.toDataURL("image/png"));
+    if (!copied) throw new Error("copy failed");
+    if (renderedConnectionUrl === url) markCopyButton(copyQrButton, "二维码");
+    qrCopyStatus.textContent = "二维码已复制";
+  } catch {
+    qrCopyStatus.textContent = "二维码复制失败";
+  } finally {
+    copyingQr = false;
+    copyQrButton.disabled = currentState.phase !== "running" || !renderedConnectionUrl;
+  }
 });
 openUrlButton.addEventListener("click", async () => {
   if (bridge && currentState.publicUrl) await bridge.open_url(currentState.publicUrl);

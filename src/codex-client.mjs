@@ -1,7 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
+import WebSocket from "ws";
 import { permissionCatalog, resolvePermissionMode } from "./permissions.mjs";
+import { localAppServerUrl } from "./runtime-config.mjs";
 
 const MAX_LIVE_MESSAGE_LENGTH = 80_000;
 export const MAX_LIVE_MESSAGE_COUNT = 128;
@@ -37,10 +40,11 @@ function turnInput(text, options = {}) {
 export function appServerLaunchSpec(command, {
   platform = process.platform,
   comspec = process.env.ComSpec || "cmd.exe",
+  listenUrl = "",
 } = {}) {
   const value = String(command || "").trim();
   if (!value) throw new Error("Codex executable is not configured");
-  const args = ["app-server", "--stdio"];
+  const args = listenUrl ? ["app-server", "--listen", new URL(localAppServerUrl(listenUrl)).origin] : ["app-server", "--stdio"];
   if (platform !== "win32" || /\.(?:exe|com)$/i.test(value)) {
     return { command: value, args, shell: false };
   }
@@ -48,7 +52,7 @@ export function appServerLaunchSpec(command, {
     throw new Error("Codex executable path contains unsupported characters");
   }
   return {
-    command: `"${value}" app-server --stdio`,
+    command: `"${value}" ${listenUrl ? `app-server --listen "${args[2]}"` : "app-server --stdio"}`,
     args: [],
     shell: comspec,
   };
@@ -59,11 +63,17 @@ export class CodexAppServer extends EventEmitter {
     command = process.env.CODEX_BIN || "codex",
     requestTimeoutMs = 20_000,
     experimentalApi = true,
+    websocketUrl = process.env.CODEX_APP_SERVER_WS_URL || "",
   } = {}) {
     super();
     this.command = command;
     this.requestTimeoutMs = requestTimeoutMs;
     this.experimentalApi = experimentalApi;
+    this.websocketUrl = websocketUrl ? localAppServerUrl(websocketUrl) : "";
+    this.socket = null;
+    this.socketHeartbeat = null;
+    this.resumePromises = new Map();
+    this.threadStateRevisions = new Map();
     this.proc = null;
     this.startPromise = null;
     this.pending = new Map();
@@ -78,7 +88,6 @@ export class CodexAppServer extends EventEmitter {
     this.newThreads = new Map();
     this.serverRequests = new Map();
     this.serverRequestTokensById = new Map();
-    this.nextServerRequestToken = 1;
   }
 
   _clearRuntimeState(error) {
@@ -93,6 +102,8 @@ export class CodexAppServer extends EventEmitter {
     this.interruptingThreads.clear();
     this.liveAgentMessages.clear();
     this.threadSettings.clear();
+    this.resumePromises.clear();
+    this.threadStateRevisions.clear();
     this.serverRequests.clear();
     this.serverRequestTokensById.clear();
   }
@@ -109,9 +120,9 @@ export class CodexAppServer extends EventEmitter {
 
   async start() {
     if (this.startPromise) return this.startPromise;
-    if (this.proc && !this.proc.killed) return;
+    if (this.socket?.readyState === WebSocket.OPEN || (this.proc && !this.proc.killed)) return;
 
-    this.startPromise = this._startProcess();
+    this.startPromise = this.websocketUrl ? this._startSocket() : this._startProcess();
     try {
       await this.startPromise;
     } catch (error) {
@@ -124,6 +135,48 @@ export class CodexAppServer extends EventEmitter {
     } finally {
       this.startPromise = null;
     }
+  }
+
+  async _startSocket() {
+    const socket = new WebSocket(this.websocketUrl, {
+      handshakeTimeout: this.requestTimeoutMs,
+      maxPayload: 16 * 1024 * 1024,
+      perMessageDeflate: false,
+    });
+    this.socket = socket;
+    this.lastError = null;
+    socket.on("message", (data) => {
+      if (this.socket === socket) this._handleLine(data.toString());
+    });
+    socket.on("error", (error) => {
+      if (this.socket === socket) { this.lastError = error; this.emit("diagnostic", error.message); }
+    });
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      clearInterval(this.socketHeartbeat);
+      const error = new Error("共享 Codex 连接已断开，正在重新连接");
+      this.lastError = error;
+      this._clearRuntimeState(error);
+      this.emit("exit", { code: null, signal: "connection-closed" });
+    });
+    await new Promise((resolve, reject) => {
+      const opened = () => { cleanup(); resolve(); };
+      const failed = (error) => { cleanup(); reject(error instanceof Error ? error : new Error("共享 Codex 连接未建立")); };
+      const cleanup = () => { socket.off("open", opened); socket.off("error", failed); socket.off("close", failed); };
+      socket.once("open", opened);
+      socket.once("error", failed);
+      socket.once("close", failed);
+    });
+    let alive = true;
+    socket.on("pong", () => { alive = true; });
+    this.socketHeartbeat = setInterval(() => {
+      if (!alive) { socket.terminate(); return; }
+      alive = false;
+      socket.ping();
+    }, 15_000);
+    this.socketHeartbeat.unref();
+    await this._initialize();
   }
 
   async _startProcess() {
@@ -167,6 +220,10 @@ export class CodexAppServer extends EventEmitter {
       proc.once("error", reject);
     });
 
+    await this._initialize();
+  }
+
+  async _initialize() {
     await this.request("initialize", {
       clientInfo: {
         name: "codex_pocket",
@@ -208,7 +265,7 @@ export class CodexAppServer extends EventEmitter {
     }
 
     if (message.id !== undefined && message.method) {
-      const token = `request-${this.nextServerRequestToken++}`;
+      const token = `request-${randomUUID()}`;
       const record = { token, message, responding: false };
       this.serverRequests.set(token, record);
       this.serverRequestTokensById.set(this._serverRequestIdKey(message.id), token);
@@ -230,18 +287,28 @@ export class CodexAppServer extends EventEmitter {
   _captureThreadState(thread, { authoritative = true } = {}) {
     if (!thread?.id) return;
     const turns = Array.isArray(thread.turns) ? thread.turns : [];
-    const activeTurn = [...turns].reverse().find(
-      (turn) => ["inProgress", "running"].includes(turn?.status),
-    );
+    const latestTurn = turns.at(-1);
+    const activeTurn = ["inProgress", "running"].includes(latestTurn?.status) ? latestTurn : null;
     if (activeTurn?.id) {
       this.activeTurns.set(thread.id, activeTurn.id);
     } else if (authoritative) {
       this.activeTurns.delete(thread.id);
       this.interruptingThreads.delete(thread.id);
+      this._finishLiveMessages(thread.id, undefined, turns.flatMap((turn) => turn.items || []));
     }
   }
 
-  _rememberThreadSession(result, expectedThreadId = "") {
+  _finishLiveMessages(threadId, turnId, items = []) {
+    const finalMessages = new Map(items.filter((item) => item.type === "agentMessage").map((item) => [item.id, item.text]));
+    for (const record of this.liveAgentMessages.values()) {
+      if (record.threadId !== threadId || record.done || (turnId && record.turnId !== turnId)) continue;
+      if (finalMessages.has(record.itemId)) record.text = clipLiveMessageText(finalMessages.get(record.itemId));
+      record.done = true;
+      this.emit("messageDone", this._publicLiveAgentMessage(record));
+    }
+  }
+
+  _rememberThreadSession(result, expectedThreadId = "", { captureState = true, captureSettings = true } = {}) {
     const threadId = result?.thread?.id;
     if (
       typeof threadId !== "string"
@@ -254,8 +321,8 @@ export class CodexAppServer extends EventEmitter {
     }
 
     this.loadedThreads.add(threadId);
-    this._captureThreadState(result.thread);
-    this.threadSettings.set(threadId, {
+    if (captureState) this._captureThreadState(result.thread);
+    if (captureSettings) this.threadSettings.set(threadId, {
       model: result.model || "",
       effort: result.reasoningEffort || null,
       serviceTier: result.serviceTier || null,
@@ -389,19 +456,13 @@ export class CodexAppServer extends EventEmitter {
   }
 
   _trackNotification(message) {
-    if (message.method === "thread/settings/updated") {
-      const { threadId, threadSettings } = message.params || {};
-      if (threadId && threadSettings) {
-        this.threadSettings.set(threadId, threadSettings);
-        this.emit("control", { threadId });
-      }
-    }
     const { method, params = {} } = message;
     const threadId = params.threadId || "";
     let controlChanged = false;
 
     if (method === "thread/settings/updated" && threadId && params.threadSettings) {
       this.threadSettings.set(threadId, params.threadSettings);
+      controlChanged = true;
     }
 
     if (method === "item/started") {
@@ -416,14 +477,17 @@ export class CodexAppServer extends EventEmitter {
       this.activeTurns.set(threadId, params.turn.id);
       this.interruptingThreads.delete(threadId);
       controlChanged = true;
-    } else if (method === "turn/completed" && threadId) {
+    } else if (method === "turn/completed" && threadId
+      && (!params.turn?.id || !this.activeTurns.has(threadId) || this.activeTurns.get(threadId) === params.turn.id)) {
       this.activeTurns.delete(threadId);
       this.interruptingThreads.delete(threadId);
       this._removeRequestsForThread(threadId);
+      this._finishLiveMessages(threadId, params.turn?.id, params.turn?.items);
       controlChanged = true;
     } else if (method === "thread/status/changed" && threadId && params.status?.type !== "active") {
       this.activeTurns.delete(threadId);
       this.interruptingThreads.delete(threadId);
+      this._finishLiveMessages(threadId);
       controlChanged = true;
     } else if (method === "serverRequest/resolved") {
       const token = this.serverRequestTokensById.get(this._serverRequestIdKey(params.requestId));
@@ -435,10 +499,18 @@ export class CodexAppServer extends EventEmitter {
       }
     }
 
-    if (controlChanged) this.emit("control", { threadId });
+    if (controlChanged) {
+      this.threadStateRevisions.set(threadId, (this.threadStateRevisions.get(threadId) || 0) + 1);
+      this.emit("control", { threadId });
+    }
   }
 
   _write(message) {
+    if (this.websocketUrl) {
+      if (this.socket?.readyState !== WebSocket.OPEN) throw new Error("共享 Codex 尚未连接");
+      this.socket.send(JSON.stringify(message));
+      return;
+    }
     if (!this.proc?.stdin?.writable) throw new Error("Codex App Server is not running");
     this.proc.stdin.write(`${JSON.stringify(message)}\n`);
   }
@@ -480,11 +552,25 @@ export class CodexAppServer extends EventEmitter {
     if (!archived && !cursor && this.newThreads.size) {
       result.data = [...this.newThreads.values(), ...(result.data || [])];
     }
+    // A rotated rollout can appear twice in scan-and-repair results. The
+    // catalog is already newest-first; identity belongs to the thread ID.
+    const seen = new Set();
+    result.data = (result.data || []).filter((thread) => {
+      if (seen.has(thread.id)) return false;
+      seen.add(thread.id);
+      return true;
+    });
     return result;
   }
 
   async readThread(threadId, { includeTurns = true } = {}) {
     await this.start();
+    // A shared server must subscribe this connection to the same live session.
+    if (this.websocketUrl && includeTurns) {
+      try { await this.resumeThread(threadId); }
+      catch (error) { if (!/already has an active writer/i.test(error.message)) throw error; }
+    }
+    const revision = this.threadStateRevisions.get(threadId);
     let result;
     try {
       result = await this.request("thread/read", { threadId, includeTurns });
@@ -494,7 +580,7 @@ export class CodexAppServer extends EventEmitter {
       if (!draft || !/no rollout found|not materialized|not found/i.test(error.message)) throw error;
       result = { thread: draft };
     }
-    if (includeTurns) this._captureThreadState(result.thread);
+    if (includeTurns && revision === this.threadStateRevisions.get(threadId)) this._captureThreadState(result.thread);
     return result;
   }
 
@@ -644,8 +730,33 @@ export class CodexAppServer extends EventEmitter {
   async resumeThread(threadId) {
     await this.start();
     if (this.loadedThreads.has(threadId)) return this.threadSettings.get(threadId) || null;
-    const result = await this.request("thread/resume", { threadId });
-    this._rememberThreadSession(result, threadId);
+    if (!this.resumePromises.has(threadId)) {
+      const revision = this.threadStateRevisions.get(threadId);
+      const settings = this.threadSettings.get(threadId);
+      const pending = this.request("thread/resume", { threadId }).then((result) => {
+        this._rememberThreadSession(result, threadId, {
+          captureState: revision === this.threadStateRevisions.get(threadId),
+          captureSettings: settings === this.threadSettings.get(threadId),
+        });
+        return result;
+      });
+      this.resumePromises.set(threadId, pending);
+      const cleanup = () => { if (this.resumePromises.get(threadId) === pending) this.resumePromises.delete(threadId); };
+      pending.then(cleanup, cleanup);
+    }
+    return this.resumePromises.get(threadId);
+  }
+
+  async forkThread(threadId) {
+    await this.start();
+    const result = await this.request("thread/fork", {
+      threadId,
+      ephemeral: false,
+      deferGoalContinuation: true,
+    });
+    if (result.thread?.id === threadId) throw new Error("Codex 未创建续接会话");
+    this._rememberThreadSession(result);
+    this.newThreads.set(result.thread.id, result.thread);
     return result;
   }
 
@@ -684,8 +795,12 @@ export class CodexAppServer extends EventEmitter {
         };
       }
 
+      const revision = this.threadStateRevisions.get(threadId);
       const result = await this.request("turn/start", params);
-      if (result.turn?.id) this.activeTurns.set(threadId, result.turn.id);
+      if (result.turn?.id && revision === this.threadStateRevisions.get(threadId)
+        && !["completed", "failed", "interrupted"].includes(result.turn.status)) {
+        this.activeTurns.set(threadId, result.turn.id);
+      }
       if (options.model || options.effort || options.mode) {
         const previous = this.threadSettings.get(threadId) || {};
         this.threadSettings.set(threadId, {
@@ -779,7 +894,7 @@ export class CodexAppServer extends EventEmitter {
     let removed = 0;
     for (const [key, record] of this.liveAgentMessages) {
       if (record.threadId !== threadId || !record.done) continue;
-      if (snapshotById.get(record.itemId) !== record.text) continue;
+      if (!snapshotById.get(record.itemId)?.startsWith(record.text)) continue;
       this.liveAgentMessages.delete(key);
       removed += 1;
     }
@@ -811,6 +926,14 @@ export class CodexAppServer extends EventEmitter {
   }
 
   stop() {
+    if (this.socket) {
+      const socket = this.socket;
+      this.socket = null;
+      clearInterval(this.socketHeartbeat);
+      this._clearRuntimeState(new Error("共享 Codex 连接已关闭"));
+      socket.terminate();
+      return;
+    }
     if (!this.proc) return;
     const proc = this.proc;
     this.proc = null;

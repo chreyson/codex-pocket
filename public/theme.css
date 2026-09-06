@@ -1,0 +1,103 @@
+.settings-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 36px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: var(--weight-normal) var(--text-ui) / 1.5 var(--font-sans);
+  cursor: pointer;
+}
+
+.settings-button:hover,
+.settings-button[aria-expanded="true"] { background: var(--surface-hover); }
+.settings-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.settings-icon-button { width: 36px; padding: 0; }
+.settings-gear {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  background: currentColor;
+  -webkit-mask: url("./vendor/lucide/settings.svg") center / contain no-repeat;
+  mask: url("./vendor/lucide/settings.svg") center / contain no-repeat;
+}
+
+.appearance-settings {
+  width: min(360px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  box-sizing: border-box;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--canvas);
+  color: var(--ink);
+  box-shadow: 0 12px 48px rgb(0 0 0 / 14%);
+}
+
+.appearance-settings::backdrop { background: rgb(0 0 0 / 22%); }
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 12px 4px 20px;
+}
+.settings-header h2 { margin: 0; font-size: 16px; line-height: 24px; font-weight: var(--weight-medium); }
+.settings-header h2:focus { outline: none; }
+.settings-header .settings-button { color: var(--muted); }
+.settings-header svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; }
+.settings-content { padding: 8px 12px 16px; }
+
+.theme-options {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  font: var(--weight-normal) var(--text-ui) / 1.5 var(--font-sans);
+}
+
+.theme-options legend { padding: 0 8px 8px; color: var(--muted); font-size: var(--text-caption); }
+
+.theme-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.theme-option + .theme-option { margin-top: 4px; }
+.theme-option:hover { background: var(--surface-hover); }
+.theme-option:has(input:checked) { background: var(--surface-soft); }
+.theme-option:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+.theme-option:has(input:disabled) { opacity: .5; cursor: default; }
+.theme-option svg { width: 18px; height: 18px; flex: 0 0 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; color: var(--muted); }
+.theme-option span { flex: 1; }
+.theme-option input {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: transparent;
+  cursor: inherit;
+}
+.theme-option input:checked { border: 5px solid var(--ink); background: var(--canvas); }
+.theme-option input:focus-visible { outline: none; }
+
+.theme-error { margin: 8px 8px 0; color: var(--danger); font-size: var(--text-caption); }
+
+@media (pointer: coarse) {
+  .settings-button { min-height: 44px; }
+  .settings-icon-button { width: 44px; }
+}

@@ -4,6 +4,15 @@ export function isDesktopWriterConflict(error) {
   return /already has an active writer/i.test(String(error?.message || ""));
 }
 
+export function continuationRequired(cause) {
+  const error = deliveryError(
+    "桌面端仍持有此会话的写入连接。可保留历史，在 Web 新建续接会话。",
+    "THREAD_CONTINUATION_REQUIRED",
+  );
+  error.cause = cause;
+  return error;
+}
+
 function deliveryError(message, code, status = 409) {
   const error = new Error(message);
   error.code = code;
@@ -69,13 +78,21 @@ export async function startTurnWithDesktopFallback({
     };
   } catch (error) {
     if (!isDesktopWriterConflict(error)) throw error;
-    const desktop = await sendDesktopTurn({
-      desktopBridge,
-      threadId,
-      text,
-      options,
-      transformOptions,
-    });
-    return { delivery: "codex-app", result: desktop.result };
+    try {
+      const desktop = await sendDesktopTurn({
+        desktopBridge,
+        threadId,
+        text,
+        options,
+        transformOptions,
+      });
+      return { delivery: "codex-app", result: desktop.result };
+    } catch (desktopError) {
+      // An uncertain send must never offer a second delivery path.
+      if (["DESKTOP_BRIDGE_UNAVAILABLE", "DESKTOP_BRIDGE_CONNECTION",
+        "DESKTOP_BRIDGE_TOOL_UNAVAILABLE", "DESKTOP_DELIVERY_UNSUPPORTED",
+      ].includes(desktopError.code)) throw continuationRequired(desktopError);
+      throw desktopError;
+    }
   }
 }

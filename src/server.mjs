@@ -1,11 +1,15 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServer } from "./codex-client.mjs";
 import { CodexDesktopBridge } from "./codex-desktop-bridge.mjs";
+import { readSharedConfig } from "./shared-runtime.mjs";
+import { desktopConnectionMonitor } from "./desktop-connection.mjs";
 import {
   isDesktopWriterConflict,
+  continuationRequired,
   startTurnWithDesktopFallback,
 } from "./desktop-delivery.mjs";
 import { ImageStore, MAX_IMAGE_BYTES } from "./image-store.mjs";
@@ -13,13 +17,13 @@ import { boundedInteger, loopbackHost } from "./runtime-config.mjs";
 import { createProject, listProjects, updateProject, managementName, managementError } from "./management.mjs";
 import {
   collectTrackedThreadIds,
-  parseApprovalPayload,
   parseGoalPayload,
   parseMessagePayload,
   parseThreadCreatePayload,
   resolveMessageDispatch,
   sanitizeServerRequest,
 } from "./control.mjs";
+import { parseServerRequestResponse } from "./user-requests.mjs";
 import {
   normalizeComposerCatalog,
   publicComposerCatalog,
@@ -57,7 +61,7 @@ const DESKTOP_SYNC_INTERVAL_MS = boundedInteger(
   { min: 150, max: 10_000 },
 );
 const MAX_SSE_BUFFER_BYTES = 512 * 1024;
-const DESKTOP_SEND_UNAVAILABLE = "Codex Desktop 正在使用这个会话，Web 端暂时无法完成该操作。请稍后重试或回到 Codex Desktop 操作";
+const DESKTOP_SEND_UNAVAILABLE = continuationRequired().message;
 const DESKTOP_STEER_UNAVAILABLE = "这个任务正在 Codex Desktop 中执行，Web 端目前无法可靠 Steer。请回到 Codex Desktop 操作";
 const DESKTOP_INTERRUPT_UNAVAILABLE = "这个任务正在 Codex Desktop 中执行，Web 端目前无法可靠中断。请回到 Codex Desktop 操作";
 
@@ -89,8 +93,19 @@ if (!accessToken) {
   }
 }
 
-const codex = new CodexAppServer();
+const sharedConfig = process.env.POCKET_SHARED_SERVER === "off" || process.env.CODEX_APP_SERVER_WS_URL
+  ? null : await readSharedConfig();
+const websocketUrl = process.env.CODEX_APP_SERVER_WS_URL || sharedConfig?.url || "";
+const connectionMode = websocketUrl ? "shared" : "standalone";
+const desktopConnection = desktopConnectionMonitor(websocketUrl);
+function connectionStatus() {
+  // Desktop process inspection is stale-while-revalidate so health/sync never
+  // waits for ps/lsof or PowerShell to finish.
+  return { state: codexState, error: codexError, connectionMode, desktopConnection: desktopConnection() };
+}
+const codex = new CodexAppServer({ websocketUrl });
 const desktopBridge = new CodexDesktopBridge();
+const webContinuations = new Map();
 let codexState = "starting";
 let codexError = "";
 const queuedTurns = new Map();
@@ -113,7 +128,6 @@ codex.on("notification", (message) => {
 codex.on("serverRequest", () => schedulePoll(10));
 codex.on("control", ({ threadId } = {}) => {
   schedulePoll(10);
-  if (threadId) queueMicrotask(() => observeQueuedTurn(threadId, codex.isThreadBusy(threadId)));
 });
 
 const clients = new Set();
@@ -278,6 +292,7 @@ function desktopMutationError(message, code) {
 function publicQueuedTurn(value) {
   if (!value) return null;
   return {
+    id: value.clientMessageId,
     clientMessageId: value.clientMessageId || "",
     text: value.text,
     skillNames: value.skillNames,
@@ -286,30 +301,39 @@ function publicQueuedTurn(value) {
       alt: "上传的图片",
     })),
     queuedAt: value.queuedAt,
+    error: value.error || "",
+    editing: Boolean(value.editing),
   };
 }
 
 function pocketThreadControlState(threadId) {
-  const queued = queuedTurns.get(threadId);
+  const queue = (queuedTurns.get(threadId) || []).map(publicQueuedTurn);
   return {
     ...codex.threadControlState(threadId),
-    queued: Boolean(queued),
-    queue: publicQueuedTurn(queued),
+    queued: queue.length > 0,
+    queue,
   };
 }
 
-function observeQueuedTurn(threadId, busy) {
-  const queued = queuedTurns.get(threadId);
+function observeQueuedTurn(threadId, thread) {
+  const queued = queuedTurns.get(threadId)?.[0];
   if (!queued) return false;
-  if (!busy) queued.ready = true;
+  queued.ready = !thread.control?.busy && thread.turns?.at(-1)?.status === "completed" && !queued.error;
   void drainQueuedTurn(threadId);
   return true;
 }
 
+function removeQueuedTurn(threadId, queued) {
+  const remaining = (queuedTurns.get(threadId) || []).filter((item) => item !== queued);
+  if (remaining.length) queuedTurns.set(threadId, remaining);
+  else queuedTurns.delete(threadId);
+}
+
 async function drainQueuedTurn(threadId) {
-  const queued = queuedTurns.get(threadId);
+  const queued = queuedTurns.get(threadId)?.[0];
   if (
     !queued
+    || queued.editing
     || !queued.ready
     || drainingQueuedThreads.has(threadId)
     || codex.isThreadBusy(threadId)
@@ -327,22 +351,25 @@ async function drainQueuedTurn(threadId) {
       options: queued.options,
       transformOptions: threadImageOptions,
     });
-    if (queuedTurns.get(threadId) !== queued) return false;
-    queuedTurns.delete(threadId);
+    removeQueuedTurn(threadId, queued);
     broadcastMessageEvent("queueStarted", {
       threadId,
       clientMessageId: queued.clientMessageId || "",
       turnId: result.turn?.id || null,
+      control: pocketThreadControlState(threadId),
     });
     schedulePoll(10);
     scheduleDesktopPoll(0);
     return true;
   } catch (error) {
     if (error.code === "TURN_ACTIVE") return false;
-    if (queuedTurns.get(threadId) === queued) queuedTurns.delete(threadId);
+    queued.ready = false;
+    queued.error = error.message || "等待消息发送失败";
     broadcastMessageEvent("queueFailed", {
       threadId,
+      code: isDesktopWriterConflict(error) ? "THREAD_CONTINUATION_REQUIRED" : error.code,
       clientMessageId: queued.clientMessageId || "",
+      control: pocketThreadControlState(threadId),
       message: isDesktopWriterConflict(error)
         ? DESKTOP_SEND_UNAVAILABLE
         : error.message || "等待消息发送失败",
@@ -388,8 +415,8 @@ async function readThreadState(threadId) {
         ...snapshot,
         control: {
           ...snapshot.control,
-          queued: Boolean(queuedTurns.get(threadId)),
-          queue: publicQueuedTurn(queuedTurns.get(threadId)),
+          queued: queuedTurns.has(threadId),
+          queue: (queuedTurns.get(threadId) || []).map(publicQueuedTurn),
           requests: codex.pendingServerRequests(threadId).map(sanitizeServerRequest),
         },
       };
@@ -482,14 +509,14 @@ async function runPoll() {
       if (!pollingThreads.has(threadId)) void pollThread(threadId);
     }
 
-    for (const client of clients) {
-      sseSend(client, "status", { state: codexState, error: codexError });
-    }
+    const status = await connectionStatus();
+    for (const client of clients) sseSend(client, "status", status);
   } catch (error) {
     pollFailures += 1;
     codexState = "error";
     codexError = error.message;
-    for (const client of clients) sseSend(client, "status", { state: codexState, error: codexError });
+    const status = await connectionStatus();
+    for (const client of clients) sseSend(client, "status", status);
   } finally {
     polling = false;
     schedulePoll(pollFailures
@@ -512,7 +539,7 @@ async function pollThread(threadId) {
       }
     }
     if (broadcasted) codex.confirmLiveAgentMessageSnapshot(threadId, agentMessages);
-    observeQueuedTurn(threadId, thread.control?.busy);
+    observeQueuedTurn(threadId, thread);
   } catch (error) {
     for (const client of clients) {
       if (client.threadId === threadId) sseSend(client, "threadError", { message: error.message });
@@ -523,7 +550,7 @@ async function pollThread(threadId) {
 }
 
 function scheduleDesktopPoll(delay = DESKTOP_SYNC_INTERVAL_MS) {
-  if (shuttingDown) return;
+  if (shuttingDown || codex.websocketUrl) return;
   const dueAt = Date.now() + delay;
   if (desktopPollTimer && desktopPollDueAt <= dueAt) return;
   if (desktopPollTimer) clearTimeout(desktopPollTimer);
@@ -621,7 +648,7 @@ function enforceActionRateLimit(request) {
 }
 
 function parseThreadRoute(pathname) {
-  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|interrupt|approvals|goal|permissions|rename|archive|restore)(?:\/([^/]+))?)?$/);
+  const match = pathname.match(/^\/api\/threads\/([^/]+)(?:\/(messages|queue|interrupt|approvals|goal|permissions|rename|archive|restore|continue)(?:\/([^/]+))?)?$/);
   if (!match) return null;
   try {
     return {
@@ -639,7 +666,7 @@ function parseThreadRoute(pathname) {
 function isThreadMutation(method, route) {
   if (!route?.action) return false;
   if (route.action === "goal") return ["POST", "DELETE"].includes(method);
-  return method === "POST" && ["messages", "interrupt", "approvals", "permissions", "rename", "archive", "restore"].includes(route.action);
+  return method === "POST" && ["messages", "queue", "interrupt", "approvals", "permissions", "rename", "archive", "restore", "continue"].includes(route.action);
 }
 
 async function prepareGoalForTurn(threadId, message, selection, goal, dispatch) {
@@ -701,7 +728,7 @@ const server = createServer(async (request, response) => {
     const pathname = url.pathname;
 
     if (request.method === "GET" && pathname === "/api/health") {
-      return sendJson(response, 200, { ok: true, codex: codexState });
+      return sendJson(response, 200, { ok: true, codex: codexState, ...await connectionStatus() });
     }
 
     if (request.method === "POST" && pathname === "/api/session") {
@@ -759,7 +786,7 @@ const server = createServer(async (request, response) => {
       latestThreads = threads;
       latestThreadsHash = JSON.stringify(threads);
       return sendJson(response, 200, {
-        status: { state: codexState, error: codexError },
+        status: await connectionStatus(),
         transports: ["sse", "poll"],
         projects: latestProjects,
         projectsSupported,
@@ -782,7 +809,7 @@ const server = createServer(async (request, response) => {
         codex.confirmLiveAgentMessageSnapshot(threadId, state.agentMessages);
         events.push(...codex.liveAgentMessagesForThread(threadId));
       }
-      events.push({ event: "status", value: { state: codexState, error: codexError } });
+      events.push({ event: "status", value: await connectionStatus() });
       return sendJson(response, 200, { events });
     }
 
@@ -849,6 +876,26 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, await loadThreadPage(threadRoute.threadId));
     }
 
+    if (request.method === "POST" && threadRoute?.action === "continue" && !threadRoute.requestToken) {
+      await readJson(request, 2_048);
+      const { threadId } = threadRoute;
+      if (!webContinuations.has(threadId)) {
+        const pending = (async () => {
+          const { thread } = await loadThreadState(threadId);
+          if (thread.control?.busy || queuedTurns.has(threadId)) {
+            throw managementError(409, "请在当前任务结束后创建续接会话");
+          }
+          return codex.forkThread(threadId);
+        })();
+        webContinuations.set(threadId, pending);
+        pending.catch(() => webContinuations.delete(threadId));
+      }
+      const result = await webContinuations.get(threadId);
+      if (webContinuations.size > 128) webContinuations.delete(webContinuations.keys().next().value);
+      schedulePoll(0);
+      return sendJson(response, 201, { ok: true, thread: sidebarThread(result.thread) });
+    }
+
     if (request.method === "POST" && ["rename", "archive", "restore"].includes(threadRoute?.action) && !threadRoute.requestToken) {
       const { threadId, action } = threadRoute;
       const value = await readJson(request, 2_048);
@@ -889,13 +936,44 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, { permissions });
     }
 
+    if (request.method === "POST" && threadRoute?.action === "queue" && threadRoute.requestToken) {
+      const { threadId, requestToken: messageId } = threadRoute;
+      const payload = await readJson(request, 65_536);
+      const { action } = payload;
+      if (!["remove", "send", "edit", "update", "cancelEdit"].includes(action)) throw managementError(400, "等待消息操作无效");
+      if (drainingQueuedThreads.has(threadId)) throw managementError(409, "等待消息正在发送，请稍后重试");
+      const queued = queuedTurns.get(threadId)?.find((item) => item.clientMessageId === messageId);
+      if (!queued) throw managementError(404, "这条等待消息已发送或取消");
+      if (action === "remove") removeQueuedTurn(threadId, queued);
+      else if (action === "edit") queued.editing = true;
+      else if (action === "update") {
+        if (!queued.editing) throw managementError(409, "这条消息的编辑已结束，请重新打开编辑");
+        const { text } = parseMessagePayload({ text: payload.text });
+        if (!text && !queued.imageIds.length) throw managementError(400, "消息不能为空");
+        queued.text = text;
+        queued.editing = false;
+        queued.error = "";
+      } else if (action === "cancelEdit") queued.editing = false;
+      else {
+        if (queued.editing) throw managementError(409, "请先保存或取消消息编辑");
+        drainingQueuedThreads.add(threadId);
+        try {
+          await loadThreadState(threadId);
+          const result = codex.isThreadBusy(threadId)
+            ? await codex.steerTurn(threadId, queued.text, queued.options)
+            : (await startTurnWithDesktopFallback({ codex, desktopBridge, threadId, text: queued.text,
+              options: queued.options, transformOptions: threadImageOptions })).result;
+          removeQueuedTurn(threadId, queued);
+          broadcastMessageEvent("queueStarted", { threadId, clientMessageId: messageId,
+            turnId: result.turn?.id || result.turnId || null, control: pocketThreadControlState(threadId) });
+        } finally { drainingQueuedThreads.delete(threadId); }
+      }
+      schedulePoll(0);
+      return sendJson(response, 200, { control: pocketThreadControlState(threadId) });
+    }
+
     if (request.method === "POST" && threadRoute?.action === "messages" && !threadRoute.requestToken) {
       const message = parseMessagePayload(await readJson(request));
-      if ((message.action || "start") === "queue" && queuedTurns.has(threadRoute.threadId)) {
-        const error = new Error("这个会话已经有一条等待消息");
-        error.status = 409;
-        throw error;
-      }
       const prepared = await prepareTurn(threadRoute.threadId, message);
       const { current, dispatch, goal, selection } = prepared;
 
@@ -903,13 +981,14 @@ const server = createServer(async (request, response) => {
         const queued = {
           text: message.text,
           imageIds: message.imageIds || [],
-          clientMessageId: message.clientMessageId || "",
+          clientMessageId: message.clientMessageId || randomUUID(),
           skillNames: selection.skills.map((skill) => skill.name),
           queuedAt: Math.floor(Date.now() / 1_000),
           ready: false,
           options: prepared.options,
         };
-        queuedTurns.set(threadRoute.threadId, queued);
+        queued.options.clientMessageId = queued.clientMessageId;
+        queuedTurns.set(threadRoute.threadId, [...(queuedTurns.get(threadRoute.threadId) || []), queued]);
         queueEvents.delete(threadRoute.threadId);
         imageStore.commitUploads(message.imageIds || []);
         schedulePoll(10);
@@ -976,8 +1055,6 @@ const server = createServer(async (request, response) => {
         goal,
         control: {
           ...pocketThreadControlState(threadRoute.threadId),
-          busy: true,
-          phase: dispatch === "steer" ? "running" : "starting",
         },
       });
     }
@@ -1044,12 +1121,9 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && threadRoute?.action === "approvals" && threadRoute.requestToken) {
       const record = codex.pendingServerRequests(threadRoute.threadId)
         .find((item) => item.token === threadRoute.requestToken);
-      if (!record) return sendJson(response, 404, { error: "这个审批请求已经失效" });
-      if (!["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(record.message.method)) {
-        return sendJson(response, 409, { error: "手机端暂不支持处理这个请求" });
-      }
-      const { decision } = parseApprovalPayload(await readJson(request, 2_048));
-      codex.respondToServerRequest(threadRoute.requestToken, { decision });
+      if (!record) return sendJson(response, 404, { error: "这个请求已经处理或已失效" });
+      const result = parseServerRequestResponse(record, await readJson(request, 65_536));
+      codex.respondToServerRequest(threadRoute.requestToken, result);
       schedulePoll(10);
       return sendJson(response, 200, { ok: true });
     }
@@ -1080,7 +1154,7 @@ const server = createServer(async (request, response) => {
       });
       sseSend(client, "threads", latestThreads);
       sseSend(client, "projects", latestProjects);
-      sseSend(client, "status", { state: codexState, error: codexError });
+      sseSend(client, "status", await connectionStatus());
       for (const liveMessage of codex.liveAgentMessagesForThread(client.threadId)) {
         sseSend(client, liveMessage.event, liveMessage.value);
       }
@@ -1125,6 +1199,7 @@ const server = createServer(async (request, response) => {
     } else if (/already has an active writer/i.test(message)) {
       status = 409;
       message = DESKTOP_SEND_UNAVAILABLE;
+      error.code = "THREAD_CONTINUATION_REQUIRED";
     } else if (error.code === "REQUEST_NOT_FOUND") {
       status = 404;
       message = "这个审批请求已经失效";
@@ -1132,7 +1207,7 @@ const server = createServer(async (request, response) => {
       status = 409;
       message = "这个审批正在处理中";
     }
-    sendJson(response, status, { error: message });
+    sendJson(response, status, { error: message, code: error.code });
   }
 });
 

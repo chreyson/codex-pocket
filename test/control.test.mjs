@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   MAX_MESSAGE_LENGTH,
   collectTrackedThreadIds,
-  parseApprovalPayload,
   parseGoalPayload,
   parseMessagePayload,
   parseThreadCreatePayload,
@@ -157,14 +156,6 @@ test("goal payloads require an objective or supported state transition", () => {
   assert.deepEqual(parseGoalPayload({ status: "complete" }), { status: "complete" });
   assert.throws(() => parseGoalPayload({ status: "blocked" }), (error) => error.status === 400);
   assert.throws(() => parseGoalPayload({}), (error) => error.status === 400);
-});
-
-test("approval payloads only accept documented decisions", () => {
-  assert.deepEqual(parseApprovalPayload({ decision: "accept" }), { decision: "accept" });
-  assert.throws(
-    () => parseApprovalPayload({ decision: "alwaysAllowEverything" }),
-    (error) => error.status === 400,
-  );
 });
 
 test("approval requests expose only the information needed by mobile UI", () => {

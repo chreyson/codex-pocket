@@ -9,8 +9,8 @@ const base = process.env.POCKET_TEST_URL || "http://127.0.0.1:4173";
 const output = new URL("../.data/qa/image-viewer/", import.meta.url);
 await fs.mkdir(output, { recursive: true });
 try {
-  for (const [name, width, height] of [["desktop", 1200, 800], ["phone", 390, 844], ["narrow", 320, 640]]) {
-    const context = await browser.newContext({ viewport: { width, height }, hasTouch: width < 720, isMobile: width < 720 });
+  for (const [name, width, height, colorScheme = "light"] of [["desktop", 1200, 800], ["phone", 390, 844], ["narrow", 320, 640], ["desktop-dark", 1200, 800, "dark"], ["phone-dark", 390, 844, "dark"]]) {
+    const context = await browser.newContext({ viewport: { width, height }, hasTouch: width < 720, isMobile: width < 720, colorScheme });
     const page = await context.newPage();
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
@@ -50,14 +50,29 @@ try {
     for (const [mode, items] of [["single-portrait", [images[0]]], ["single-landscape", [images[1]]], ["multiple", images]]) {
       selectedImages = items;
       await page.evaluate((thread) => window.imageTestSource.dispatchEvent(new MessageEvent("thread", { data: JSON.stringify(thread) })), detail());
+      await page.locator(".message-image-button img").evaluateAll((images) => Promise.all(images.map((image) => image.decode())));
+      const thumbnails = await page.locator(".message-image-button").evaluateAll((buttons) => buttons.map((button) => {
+        const rect = button.getBoundingClientRect();
+        const image = button.querySelector("img");
+        const body = button.closest(".message").querySelector(".message-body").getBoundingClientRect();
+        return { width: rect.width, height: rect.height, bottom: rect.bottom, bodyTop: body.top, fit: getComputedStyle(image).objectFit };
+      }));
+      for (const thumbnail of thumbnails) {
+        assert.equal(thumbnail.width, 80);
+        assert.equal(thumbnail.height, 80);
+        assert.equal(thumbnail.fit, "cover");
+        assert.ok(thumbnail.bottom < thumbnail.bodyTop, "thumbnail stays outside and above the text bubble");
+      }
+      await page.screenshot({ path: fileURLToPath(new URL(`${name}-${mode}-thumbnails.png`, output)), animations: "disabled" });
       await page.locator(".message-image-button").first().click();
       await page.waitForFunction(() => document.querySelector("#image-viewer-image").naturalWidth > 0);
       const measure = await page.locator("#image-viewer-image").evaluate((img) => {
         const rect = img.getBoundingClientRect();
         const scale = Math.min(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
         return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
-          width: rect.width, height: rect.height, drawnWidth: img.naturalWidth * scale, drawnHeight: img.naturalHeight * scale };
+          width: rect.width, height: rect.height, drawnWidth: img.naturalWidth * scale, drawnHeight: img.naturalHeight * scale, fit: getComputedStyle(img).objectFit };
       });
+      assert.equal(measure.fit, "contain", "viewer preserves the complete image");
       assert.ok(measure.width >= width - (mode === "multiple" ? 150 : 35), `${name}/${mode}: image must use the available width`);
       assert.ok(measure.height >= height - 160, `${name}/${mode}: image must use the available height`);
       assert.ok(measure.left >= 0 && measure.right <= width && measure.top >= 0 && measure.bottom <= height);
@@ -75,6 +90,25 @@ try {
       }
       assert.equal(await page.locator("#image-viewer").isVisible(), false);
     }
+    selectedImages = Array.from({ length: 8 }, (_, index) => ({ ...images[index % 2], alt: `Image ${index}` }));
+    await page.evaluate((thread) => window.imageTestSource.dispatchEvent(new MessageEvent("thread", { data: JSON.stringify(thread) })), detail());
+    const wrapping = await page.locator(".message-media").evaluate((media) => {
+      const bounds = media.getBoundingClientRect();
+      return [...media.children].every((button) => {
+        const rect = button.getBoundingClientRect();
+        return rect.width === 80 && rect.height === 80 && rect.left >= bounds.left && rect.right <= bounds.right && rect.bottom <= bounds.bottom;
+      });
+    });
+    assert.ok(wrapping, "multiple thumbnails wrap without resizing or overflowing");
+    await page.evaluate((thread) => window.imageTestSource.dispatchEvent(new MessageEvent("thread", { data: JSON.stringify(thread) })), {
+      ...detail(), messages: images.map((image, index) => ({ id: `view-${index}`, role: "system", kind: "image", images: [image], text: "" })),
+    });
+    assert.equal((await page.locator(".activity-summary").textContent()).trim(), "已查看图片");
+    assert.equal(await page.locator(".message-image-button").count(), 2);
+    await page.locator(".activity-summary").click();
+    await page.locator(".message-image-button").last().click();
+    assert.equal(await page.locator("#image-viewer-image").getAttribute("alt"), "Landscape");
+    await page.locator("#image-viewer-close").click();
     assert.deepEqual(errors, []);
     console.log(`${name}: single portrait, landscape, multiple images and close controls passed`);
     await context.close();

@@ -8,6 +8,21 @@ import {
 } from "../src/codex-client.mjs";
 
 
+test("turn completion and idle history finalize unfinished live records for reconnect", () => {
+  for (const finish of [
+    (client) => client._trackNotification({ method: "turn/completed", params: { threadId: "A", turn: { id: "t", status: "completed" } } }),
+    (client) => client._captureThreadState({ id: "A", turns: [{ id: "t", status: "completed" }] }),
+  ]) {
+    const client = new CodexAppServer();
+    client._trackNotification({ method: "turn/started", params: { threadId: "A", turn: { id: "t" } } });
+    client._trackNotification({ method: "item/agentMessage/delta", params: { threadId: "A", turnId: "t", itemId: "i", delta: "Answer" } });
+    finish(client);
+    assert.equal(client.isThreadBusy("A"), false);
+    assert.equal(client.liveAgentMessagesForThread("A")[0].event, "messageDone");
+    assert.equal(client.liveAgentMessagesForThread("A")[0].value.text, "Answer");
+  }
+});
+
 test("thread listing uses the App Server interactive-source default", async () => {
   const client = new CodexAppServer();
   let captured;
@@ -23,6 +38,23 @@ test("thread listing uses the App Server interactive-source default", async () =
   assert.equal(captured.params.limit, 12);
   assert.equal(captured.params.sourceKinds, undefined);
   assert.equal(captured.params.sortKey, "updated_at");
+});
+
+test("thread catalog collapses rotated rollouts by ID while retaining distinct same-name tasks and cursors", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  const newest = { id: "same-id", name: "Same title", updatedAt: 20, path: "rotated.jsonl" };
+  client.request = async () => ({ data: [
+    newest,
+    { id: "different-id", name: "Same title", updatedAt: 15 },
+    { ...newest, updatedAt: 10, path: "original.jsonl" },
+  ], nextCursor: "next-page" });
+  for (const options of [{}, { archived: true, cursor: "previous-page" }]) {
+    const result = await client.listThreads(options);
+    assert.deepEqual(result.data.map((thread) => thread.id), ["same-id", "different-id"]);
+    assert.equal(result.data[0], newest);
+    assert.equal(result.nextCursor, "next-page");
+  }
 });
 
 test("App Server launch avoids shell argument concatenation on Windows", () => {
@@ -52,6 +84,76 @@ test("App Server launch avoids shell argument concatenation on Windows", () => {
     () => appServerLaunchSpec("codex.cmd\" & whoami", { platform: "win32" }),
     /unsupported characters/,
   );
+});
+
+test("Web continuation forks native history without starting a goal or a turn", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  client.request = async (method, params) => {
+    assert.equal(method, "thread/fork");
+    assert.deepEqual(params, { threadId: "source", ephemeral: false, deferGoalContinuation: true });
+    return { thread: { id: "continuation", turns: [] }, model: "test" };
+  };
+  const result = await client.forkThread("source");
+  assert.equal(result.thread.id, "continuation");
+  assert.equal(client.loadedThreads.has("continuation"), true);
+  assert.equal(client.loadedThreads.has("source"), false);
+  assert.equal(client.isThreadBusy("continuation"), false);
+});
+
+test("late history cannot resurrect a completed turn or clear a newer one", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  client.activeTurns.set("t", "old");
+  client.request = async () => {
+    client._trackNotification({ method: "turn/completed", params: { threadId: "t", turn: { id: "old" } } });
+    return { thread: { id: "t", turns: [{ id: "old", status: "inProgress" }] } };
+  };
+  await client.readThread("t");
+  assert.equal(client.isThreadBusy("t"), false);
+  client._trackNotification({ method: "turn/started", params: { threadId: "t", turn: { id: "new" } } });
+  client._trackNotification({ method: "turn/completed", params: { threadId: "t", turn: { id: "old" } } });
+  assert.equal(client.activeTurns.get("t"), "new");
+});
+
+test("a completion before the start response does not leave the composer busy", async () => {
+  const client = new CodexAppServer();
+  client.resumeThread = async () => {};
+  client.request = async () => {
+    client._trackNotification({ method: "turn/completed", params: { threadId: "t", turn: { id: "fast" } } });
+    return { turn: { id: "fast", status: "inProgress" } };
+  };
+  await client.startTurn("t", "test");
+  assert.equal(client.isThreadBusy("t"), false);
+});
+
+test("resume cannot overwrite a newer completion or active turn notification", async () => {
+  for (const completed of [true, false]) {
+    const client = new CodexAppServer();
+    client.start = async () => {};
+    client.request = async () => {
+      client._trackNotification({
+        method: completed ? "turn/completed" : "turn/started",
+        params: { threadId: "t", turn: { id: "new" } },
+      });
+      return { thread: { id: "t", turns: [{ id: "old", status: "inProgress" }] } };
+    };
+    await client.resumeThread("t");
+    assert.equal(client.activeTurns.get("t"), completed ? undefined : "new");
+    assert.equal(client.loadedThreads.has("t"), true);
+  }
+});
+
+test("resume preserves settings changed by the other client while loading", async () => {
+  const client = new CodexAppServer();
+  client.start = async () => {};
+  const latest = { model: "latest", effort: "high" };
+  client.request = async () => {
+    client._trackNotification({ method: "thread/settings/updated", params: { threadId: "t", threadSettings: latest } });
+    return { thread: { id: "t", turns: [] }, model: "old" };
+  };
+  await client.resumeThread("t");
+  assert.deepEqual(client.threadSettings.get("t"), latest);
 });
 
 test("composer catalog reads paginated thread metadata without turns", async () => {

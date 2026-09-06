@@ -3,9 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export async function fakeRuntime() {
+export async function fakeRuntime(fixtureUrl = new URL("./fake-codex.mjs", import.meta.url)) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pocket test \u6d4b\u8bd5 "));
-  const fixture = fileURLToPath(new URL("./fake-codex.mjs", import.meta.url));
+  const fixture = fileURLToPath(fixtureUrl);
   const command = path.join(directory, process.platform === "win32" ? "codex.cmd" : "codex");
   const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
   await fs.writeFile(command, process.platform === "win32"

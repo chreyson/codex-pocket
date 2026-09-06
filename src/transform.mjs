@@ -189,7 +189,11 @@ function activityMessage(item) {
   if (!item || typeof item !== "object") return null;
   switch (item.type) {
     case "commandExecution":
-      return { type: "command", label: "终端", status: item.status, text: commandText(item) };
+      return {
+        type: "command", label: "终端", status: item.status, text: commandText(item),
+        actions: [...new Set((Array.isArray(item.commandActions) && item.commandActions.length ? item.commandActions : [{ type: "unknown" }])
+          .map((action) => ({ read: "read", listFiles: "read", search: "search" })[action?.type] || "command"))],
+      };
     case "fileChange":
       return { type: "file", label: "文件", status: item.status, text: fileChangeText(item) };
     case "mcpToolCall":
@@ -361,6 +365,7 @@ export function sanitizeThreadDetail(thread, { resolveImage } = {}) {
           kind: "activity",
           label: activity.label,
           activityType: activity.type,
+          ...(activity.actions ? { activityActions: activity.actions } : {}),
           activityStatus: activity.status,
           text: clip(activity.text, 4_000),
           timestamp: startedAt,
@@ -385,6 +390,7 @@ export function sanitizeThreadDetail(thread, { resolveImage } = {}) {
     ...sanitizeThreadSummary(source),
     turns: turns.filter((turn) => turn && typeof turn === "object").map((turn) => ({
       id: turn.id,
+      status: turn.status || null,
       durationMs: Number.isFinite(turn.durationMs) && turn.durationMs >= 0 ? turn.durationMs : null,
     })),
     messages,
@@ -401,9 +407,8 @@ export function sanitizeDesktopThreadSnapshot(value, options = {}) {
     ? value.turns.filter((turn) => turn && typeof turn === "object")
     : [];
   if (value.page?.order === "newest_first") turns.reverse();
-  const activeTurn = [...turns].reverse().find(
-    (turn) => ["inProgress", "running"].includes(turn?.status),
-  );
+  const latestTurn = turns.at(-1);
+  const activeTurn = ["inProgress", "running"].includes(latestTurn?.status) ? latestTurn : null;
   const busy = Boolean(activeTurn);
 
   return {

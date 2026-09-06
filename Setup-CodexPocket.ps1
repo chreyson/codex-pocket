@@ -31,6 +31,7 @@ $setupResult = [ordered]@{
     Codex = $null
     Cloudflared = $null
     WebView2 = $null
+    SharedDesktop = $null
     Firewall = [ordered]@{
         Skipped = [bool]$SkipFirewall
         InboundRulesCreated = $false
@@ -202,6 +203,9 @@ try {
         Path = $webView2Path
     }
 
+    Write-Host 'Installing Node runtime dependencies...'
+    Invoke-PocketPython -Arguments @('-c', 'import sys; from setup_codex_pocket import ensure_node_dependencies; ensure_node_dependencies(sys.argv[1])', $node.Path)
+
     Write-Host 'Installing desktop Python dependencies...'
     Invoke-PocketPython -Arguments @(
         '-m',
@@ -250,6 +254,10 @@ try {
         -Python $script:pocketPython `
         -Node $node `
         -Codex $codexPath
+
+    Write-Host 'Installing automatic shared Codex desktop launch...'
+    Invoke-PocketPython -Arguments @((Join-Path $projectRoot 'install_desktop_launch.py'), '--node', $node.Path, '--codex', $codexPath)
+    $setupResult.SharedDesktop = [ordered]@{ Installed = $true; Mode = 'shared' }
 
     if ($Start) {
         Write-Host 'Starting Codex Pocket...'

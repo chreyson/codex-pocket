@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import net from "node:net";
+import path from "node:path";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 4_000;
@@ -21,10 +22,26 @@ export async function discoverCodexAppPipePaths({
   env = process.env,
   platform = process.platform,
   readdir = fs.readdir,
+  lstat = fs.lstat,
+  uid = process.getuid?.(),
 } = {}) {
   const configured = String(env.CODEX_APP_TOOLS_PIPE_PATH || "").trim();
   const paths = configured ? [configured] : [];
-  if (platform !== "win32") return paths;
+  if (platform !== "win32") {
+    for (const directory of ["/tmp/codex-browser-use", "/tmp/codex-app-tools"]) {
+      let names;
+      try { names = await readdir(directory); } catch { continue; }
+      for (const name of names) {
+        if (!name.endsWith(".sock")) continue;
+        const candidate = path.join(directory, name);
+        try {
+          const info = await lstat(candidate);
+          if (info.isSocket() && (uid === undefined || info.uid === uid)) paths.push(candidate);
+        } catch { /* A desktop restart can remove a discovered socket. */ }
+      }
+    }
+    return unique(paths);
+  }
 
   try {
     const names = await readdir(WINDOWS_PIPE_PREFIX);
@@ -57,6 +74,7 @@ export function requestNativePipe(pipePath, method, params, {
     let socket;
     let settled = false;
     let pending = Buffer.alloc(0);
+    let requestSent = false;
 
     const finish = (callback, value) => {
       if (settled) return;
@@ -67,10 +85,9 @@ export function requestNativePipe(pipePath, method, params, {
     };
 
     const failConnection = (error) => {
-      finish(
-        reject,
-        bridgeError("无法连接正在运行的 Codex App", "DESKTOP_BRIDGE_CONNECTION", error),
-      );
+      const failure = bridgeError("无法连接 Codex App 的会话接口", "DESKTOP_BRIDGE_CONNECTION", error);
+      failure.requestSent = requestSent;
+      finish(reject, failure);
     };
 
     const timer = setTimeout(() => {
@@ -87,6 +104,7 @@ export function requestNativePipe(pipePath, method, params, {
     socket.once("connect", () => {
       try {
         socket.write(encodeNativeFrame({ id, jsonrpc: "2.0", method, params }));
+        requestSent = true;
       } catch (error) {
         finish(reject, error);
       }
@@ -183,17 +201,19 @@ export class CodexDesktopBridge {
     this.timeoutMs = timeoutMs;
     this.endpoint = null;
     this.discoveryPromise = null;
+    this.discoveryFailure = null;
   }
 
   async _discoverEndpoint(requiredTool) {
     if (this.endpoint?.tools.has(requiredTool)) return this.endpoint;
+    if (this.discoveryFailure?.until > Date.now()) throw this.discoveryFailure.error;
     this.endpoint = null;
 
     if (!this.discoveryPromise) {
       this.discoveryPromise = (async () => {
         const paths = await this.discover();
         if (paths.length === 0) {
-          throw bridgeError("未检测到正在运行的 Codex App", "DESKTOP_BRIDGE_UNAVAILABLE");
+          throw bridgeError("未找到可连接的 Codex App 会话接口", "DESKTOP_BRIDGE_UNAVAILABLE");
         }
 
         const attempts = await Promise.all(paths.map(async (pipePath) => {
@@ -228,6 +248,9 @@ export class CodexDesktopBridge {
     let available;
     try {
       available = await discovery;
+    } catch (error) {
+      this.discoveryFailure = { error, until: Date.now() + 5_000 };
+      throw error;
     } finally {
       if (this.discoveryPromise === discovery) this.discoveryPromise = null;
     }
@@ -308,7 +331,8 @@ export class CodexDesktopBridge {
       );
       return assertToolSuccess(result);
     } catch (error) {
-      if (error.code !== "DESKTOP_BRIDGE_TIMEOUT") throw error;
+      if (error.code !== "DESKTOP_BRIDGE_TIMEOUT"
+        && !(error.code === "DESKTOP_BRIDGE_CONNECTION" && error.requestSent)) throw error;
       throw bridgeError(
         "Codex Desktop 的发送结果未确认，请先在 Desktop 中检查，避免重复发送",
         "DESKTOP_BRIDGE_DELIVERY_UNKNOWN",

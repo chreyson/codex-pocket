@@ -20,6 +20,17 @@ const ELEMENT_IDS = [
   "copy-toast",
   "copy-toast-text",
   "connection-description",
+  "connection-mode",
+  "connection-mode-current",
+  "connection-mode-advice",
+  "connect-desktop",
+  "connection-qr",
+  "qr-placeholder",
+  "copy-qr",
+  "show-qr",
+  "close-qr",
+  "qr-dialog",
+  "qr-copy-status",
 ];
 
 class FakeClassList {
@@ -59,6 +70,17 @@ class FakeElement {
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
   }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+    if (name === "src") this.src = "";
+  }
+
+  async decode() {}
+
+  showModal() { this.open = true; }
+  close() { this.open = false; }
+  focus() {}
 }
 
 async function eventually(predicate) {
@@ -76,6 +98,7 @@ async function createHarness(copyResult = true) {
   elements["service-button"].label = new FakeElement();
   elements["copy-toast"].hidden = true;
   const copied = [];
+  const imageCopies = [];
   const bridge = {
     async get_state() {
       return {
@@ -83,12 +106,18 @@ async function createHarness(copyResult = true) {
         status: "服务运行中",
         publicUrl: "https://example.trycloudflare.com",
         accessKey: "secret-key",
+        connectionUrl: "https://example.trycloudflare.com#token=secret-key",
         busy: false,
         error: "",
+        connectionMode: "shared",
       };
     },
     async copy_text(value) {
       copied.push(value);
+      return copyResult;
+    },
+    async copy_qr_image(url, png) {
+      imageCopies.push({ url, png });
       return copyResult;
     },
     async open_url() {},
@@ -105,6 +134,9 @@ async function createHarness(copyResult = true) {
   };
   const clearTimer = (id) => timers.delete(id);
   const document = {
+    createElement() {
+      return { getContext: () => ({ drawImage() {} }), toDataURL: () => "data:image/png;base64,test-png" };
+    },
     querySelector(selector) {
       return elements[selector.replace(/^#/, "")];
     },
@@ -126,10 +158,28 @@ async function createHarness(copyResult = true) {
     window,
   });
   const source = await fs.readFile(APP_SOURCE_URL, "utf8");
+  vm.runInContext(await fs.readFile(new URL("../public/vendor/qrcode.js", import.meta.url), "utf8"), context);
+  window.qrcode = context.qrcode;
   vm.runInContext(source, context, { filename: "public/desktop/app.js" });
   await eventually(() => !elements["copy-url"].disabled);
-  return { copied, elements, timers };
+  return { copied, imageCopies, elements, timers, renderState(state) {
+    context.stateUpdate = state;
+    vm.runInContext("render(stateUpdate)", context);
+  } };
 }
+
+test("shared backend alone cannot claim desktop attachment and stopped state clears it", async () => {
+  const harness = await createHarness();
+  assert.equal(harness.elements["connection-mode"].textContent, "待确认");
+  harness.renderState({ desktopConnection: { state: "independent", label: "桌面未接入", advice: "请正常退出桌面 App" } });
+  assert.equal(harness.elements["connection-mode"].textContent, "桌面未接入");
+  assert.equal(harness.elements["connect-desktop"].hidden, false);
+  harness.renderState({ desktopConnection: { state: "shared", label: "已共享", advice: "已确认" } });
+  assert.equal(harness.elements["connection-mode"].textContent, "已共享");
+  assert.equal(harness.elements["connect-desktop"].hidden, true);
+  harness.renderState({ phase: "stopped" });
+  assert.equal(harness.elements["connection-mode"].textContent, "未连接");
+});
 
 test("copy buttons show specific success feedback", async () => {
   const harness = await createHarness();
@@ -172,4 +222,56 @@ test("copy failures show an error without marking the button successful", async 
     harness.elements["copy-key"].attributes.get("aria-label"),
     undefined,
   );
+});
+
+test("QR copying sends an image and clears the QR during recovery and stop", async () => {
+  const harness = await createHarness();
+  const qr = harness.elements["connection-qr"];
+  const button = harness.elements["copy-qr"];
+  assert.equal(qr.hidden, false);
+  assert.match(qr.src, /^data:image\/gif;base64,/);
+  const original = qr.src;
+  button.listeners.get("click")[0]();
+  await eventually(() => harness.imageCopies.length === 1);
+  assert.equal(harness.imageCopies[0].url, "https://example.trycloudflare.com#token=secret-key");
+  assert.match(harness.imageCopies[0].png, /^data:image\/png;base64,/);
+  assert.equal(harness.copied.length, 0);
+  harness.renderState({ phase: "starting", connectionUrl: "" });
+  assert.equal(qr.hidden, true);
+  assert.equal(qr.src, "");
+  assert.equal(button.disabled, true);
+  harness.renderState({ phase: "running", connectionUrl: "https://recovered.trycloudflare.com#token=new-key" });
+  assert.equal(qr.hidden, false);
+  assert.notEqual(qr.src, original);
+  harness.renderState({ phase: "stopping" });
+  assert.equal(qr.hidden, true);
+  assert.equal(button.disabled, true);
+  button.listeners.get("click")[0]();
+  assert.equal(harness.imageCopies.length, 1);
+});
+
+test("image clipboard failures show an error and allow retry", async () => {
+  const harness = await createHarness(false);
+  const button = harness.elements["copy-qr"];
+  await button.listeners.get("click")[0]();
+  assert.equal(harness.elements["qr-copy-status"].textContent, "二维码复制失败");
+  assert.equal(button.disabled, false);
+  assert.equal(button.dataset.copied, undefined);
+});
+
+test("QR dialog opens on demand and closes when the connection becomes unavailable", async () => {
+  const harness = await createHarness();
+  const show = harness.elements["show-qr"];
+  const dialog = harness.elements["qr-dialog"];
+  assert.ok(!dialog.open);
+  show.listeners.get("click")[0]();
+  assert.equal(dialog.open, true);
+  harness.elements["close-qr"].listeners.get("click")[0]();
+  assert.equal(dialog.open, false);
+  show.listeners.get("click")[0]();
+  harness.renderState({ phase: "starting", connectionUrl: "" });
+  assert.equal(dialog.open, false);
+  assert.equal(show.disabled, true);
+  show.listeners.get("click")[0]();
+  assert.equal(dialog.open, false);
 });

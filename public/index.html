@@ -3,10 +3,12 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-    <meta name="theme-color" content="#212121" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#ffffff">
+    <meta name="color-scheme" content="light dark">
     <title>Codex Pocket</title>
+    <script src="/theme.js"></script>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/user-requests.css">
   </head>
   <body>
     <section id="boot-screen" class="boot-screen" aria-label="正在连接" aria-busy="true">
@@ -22,6 +24,7 @@
           <strong>Codex</strong>
           <span>Pocket</span>
         </div>
+        <button class="settings-button settings-icon-button" data-settings-button type="button" aria-label="设置" title="设置" aria-haspopup="dialog" aria-controls="appearance-settings" aria-expanded="false"><span class="settings-gear" aria-hidden="true"></span></button>
       </header>
       <div class="auth-panel">
         <h1>连接 Codex</h1>
@@ -59,10 +62,17 @@
           <span id="thread-empty-detail">在电脑上打开 Codex 并开始对话。</span>
         </div>
         <footer class="pane-footer">
+          <button class="settings-button settings-icon-button" data-settings-button type="button" aria-label="设置" title="设置" aria-haspopup="dialog" aria-controls="appearance-settings" aria-expanded="false"><span class="settings-gear" aria-hidden="true"></span></button>
+          <button id="archived-button" class="settings-button settings-icon-button" type="button" aria-label="查看已归档" title="查看已归档" aria-pressed="false"><svg class="archive-icon" aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="4" rx="1"/><path d="M5 7v13h14V7M10 12h4"/></svg></button>
           <span id="connection-state" class="connection-state" data-state="connecting">
             <span class="status-dot"></span>
             <span id="connection-label">连接中</span>
           </span>
+          <span id="connection-mode-warning" class="connection-mode-warning" hidden title="连接状态">不可用</span>
+          <details id="connection-mode-help" class="connection-mode-help">
+            <summary aria-label="连接模式说明" title="连接模式说明">?</summary>
+            <div class="connection-mode-popover" role="tooltip"><strong id="connection-mode-current">当前模式：检测中</strong><span id="connection-mode-advice">正在读取连接状态。</span></div>
+          </details>
         </footer>
       </aside>
       <div id="sidebar-menu" class="sidebar-menu" role="menu" hidden></div>
@@ -120,11 +130,10 @@
         </div>
 
         <div id="message-list" class="message-list" aria-live="polite" hidden></div>
-        <div id="approval-tray" class="approval-tray" aria-live="assertive" hidden></div>
+        <div id="approval-tray" class="approval-tray" aria-label="待处理请求" aria-live="polite" hidden></div>
 
         <form id="composer" class="composer-shell" hidden>
           <button id="latest-button" class="latest-button" type="button" aria-label="回到最新消息" title="回到最新消息" hidden>↓</button>
-          <span id="draft-status" class="draft-status" role="status" hidden></span>
           <div id="composer-menu" class="composer-menu" role="dialog" hidden></div>
           <div id="composer-extras" class="composer-extras" role="dialog" aria-label="附件与工作选项" hidden>
             <div class="extras-section-heading">添加</div>
@@ -152,6 +161,7 @@
               <svg class="extras-row-chevron" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></svg>
             </button>
           </div>
+          <div id="queued-message-list" class="queued-message-list" aria-label="等待消息" hidden></div>
           <div class="composer-box">
             <div id="goal-banner" class="goal-banner" hidden>
               <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="3"></circle></svg>
@@ -186,19 +196,16 @@
                   </button>
                 </div>
               <div class="composer-actions">
-                <div id="delivery-control" class="delivery-control" role="radiogroup" aria-label="运行中消息处理方式" hidden>
-                  <button class="delivery-option" type="button" role="radio" data-action="queue" aria-checked="true">等待</button>
-                  <button class="delivery-option" type="button" role="radio" data-action="steer" aria-checked="false">Steer</button>
-                </div>
                 <button id="interrupt-button" class="interrupt-button" type="button" aria-label="中断任务" title="中断任务" hidden>
                   <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
                 </button>
                 <button id="send-button" class="send-button" type="submit" data-action="start" aria-label="发送消息" title="发送消息" disabled>
-                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 19V5"></path><path d="m5 12 7-7 7 7"></path></svg>
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path class="send-icon" d="M12 19V5"></path><path class="send-icon" d="m5 12 7-7 7 7"></path><rect class="stop-icon" x="7" y="7" width="10" height="10" rx="1" hidden></rect></svg>
                 </button>
               </div>
             </div>
             <span id="composer-status" class="composer-status" role="status"></span>
+            <button id="continue-web" class="continue-web" type="button" hidden title="保留历史创建续接会话，原会话不变">在 Web 中继续</button>
           </div>
         </form>
       </section>

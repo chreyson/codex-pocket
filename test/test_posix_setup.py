@@ -10,6 +10,29 @@ import setup_codex_pocket as setup
 
 
 class PosixSetupTests(unittest.TestCase):
+    def test_macos_setup_installs_sharing_before_launch_and_reports_failure(self):
+        for failure in (None, RuntimeError("launch registration failed")):
+            with (
+                self.subTest(failure=failure),
+                patch.object(setup.platform, "system", return_value="Darwin"),
+                patch.object(setup, "ensure_project_virtualenv"),
+                patch.object(setup, "resolve_node", return_value=("/opt/node", "24.0.0")),
+                patch.object(setup, "resolve_codex", return_value="/App/codex"),
+                patch.object(setup, "ensure_node_dependencies"),
+                patch.object(setup, "ensure_desktop_dependencies"),
+                patch.object(setup, "prepare_cloudflared"),
+                patch.object(setup, "write_runtime_config"),
+                patch.object(setup, "write_json_atomic") as write,
+                patch.object(setup, "launch_desktop") as start,
+                patch("install_desktop_launch.install", side_effect=failure) as install,
+                patch.dict(os.environ, {}),
+                patch("builtins.print"),
+            ):
+                self.assertEqual(setup.main(["--install", "--start"]), 1 if failure else 0)
+                install.assert_called_once_with(node="/opt/node", codex="/App/codex")
+                self.assertEqual(start.call_count, 0 if failure else 1)
+                self.assertEqual(write.call_args.args[1]["Ok"], not bool(failure))
+
     def test_inaccessible_runtime_candidates_are_skipped(self):
         with patch("setup_codex_pocket.Path.is_file", side_effect=PermissionError("denied")):
             self.assertIsNone(setup.resolve_candidate("/locked/bin/node", []))
@@ -141,6 +164,7 @@ class PosixSetupTests(unittest.TestCase):
             patch.object(setup, "ensure_project_virtualenv"),
             patch.object(setup, "resolve_node", return_value=("/usr/bin/node", "22.0.0")),
             patch.object(setup, "resolve_codex", return_value="/usr/bin/codex"),
+            patch.object(setup, "ensure_node_dependencies") as node_dependencies,
             patch.object(setup, "ensure_desktop_dependencies") as desktop,
             patch.object(setup, "launch_desktop") as launch,
             patch.object(setup, "write_runtime_config"),
@@ -150,6 +174,7 @@ class PosixSetupTests(unittest.TestCase):
         ):
             self.assertEqual(setup.main(["--headless", "--check"]), 0)
         desktop.assert_not_called()
+        node_dependencies.assert_called_once_with("/usr/bin/node", install=False)
         launch.assert_not_called()
 
     def test_environment_override_precedes_saved_runtime(self):
@@ -160,6 +185,19 @@ class PosixSetupTests(unittest.TestCase):
         ):
             candidates = setup.command_candidates("node", "/saved/node", "NODE_BIN")
         self.assertEqual(candidates[:2], [Path("/override/node"), Path("/saved/node")])
+
+    def test_macos_codex_candidates_put_desktop_bundle_before_saved_cli(self):
+        with (
+            patch.object(setup.platform, "system", return_value="Darwin"),
+            patch.object(setup, "macos_codex_app_candidates", return_value=[Path("/Applications/ChatGPT.app/Contents/Resources/codex")]),
+            patch.object(setup, "command_candidates", side_effect=lambda *args: [Path("/opt/homebrew/bin/codex")]),
+            patch.object(setup, "is_accessible_file", return_value=True),
+            patch.object(setup, "command_output", return_value="codex-cli 0.153.1"),
+        ):
+            self.assertEqual(
+                setup.resolve_codex({"Codex": {"Path": "/opt/homebrew/bin/codex"}}),
+                "/Applications/ChatGPT.app/Contents/Resources/codex",
+            )
 
     def test_unix_launchers_are_root_relative(self):
         project_root = Path(__file__).resolve().parents[1]

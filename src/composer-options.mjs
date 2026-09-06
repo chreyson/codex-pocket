@@ -124,6 +124,11 @@ export function normalizeComposerCatalog(value = {}) {
     modes,
     defaultModel: defaultModel?.id || "",
     defaultEffort: defaultModel?.defaultEffort || "",
+    currentSelection: value.current?.model ? {
+      model: value.current.model,
+      effort: value.current.effort || defaultModel?.defaultEffort || "",
+      mode: value.current.collaborationMode?.mode || value.current.collaborationMode || "default",
+    } : null,
     goal: normalizedGoal(value.goal),
     permissions: value.permissions || null,
     features: {
