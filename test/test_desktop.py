@@ -228,6 +228,7 @@ class DesktopControllerTests(unittest.TestCase):
                 self.assertEqual(find_node(), "node-from-path")
                 self.assertEqual(find_codex(), "codex-from-path")
 
+    @unittest.skipUnless(os.name != "nt", "macOS path semantics")
     def test_macos_prefers_bundled_codex_but_explicit_override_wins(self):
         bundled = "/Applications/ChatGPT.app/Contents/Resources/codex"
         with (
@@ -488,7 +489,7 @@ class DesktopControllerTests(unittest.TestCase):
 
         command = run_command.call_args.args[0]
         self.assertEqual(command[0], "/runtime/node")
-        self.assertTrue(command[1].endswith("scripts/shared-codex.mjs"))
+        self.assertTrue(str(command[1]).replace("\\", "/").endswith("scripts/shared-codex.mjs"))
         self.assertEqual(command[2:], ["--open-app"])
         self.assertEqual(run_command.call_args.kwargs["env"], runtime_env)
         self.assertEqual(run_command.call_args.kwargs["cwd"], Path(__file__).resolve().parents[1])

@@ -55,6 +55,10 @@ try {
     assert.equal(await page.locator("#delivery-control").count(), 0);
     assert.equal(await page.locator("#composer-status").innerText(), "");
     assert.equal(await page.locator(".queued-message").count(), 2);
+    await page.waitForFunction(() => {
+      const image = document.querySelector(".queued-remove img");
+      return Boolean(image?.complete && image.naturalWidth > 0);
+    });
     assert.equal(await page.locator(".queued-remove img").first().evaluate((img) => img.complete && img.naturalWidth > 0), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     const rows = await page.locator("#queued-message-list").boundingBox();

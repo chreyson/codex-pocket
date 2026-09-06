@@ -186,6 +186,7 @@ class PosixSetupTests(unittest.TestCase):
             candidates = setup.command_candidates("node", "/saved/node", "NODE_BIN")
         self.assertEqual(candidates[:2], [Path("/override/node"), Path("/saved/node")])
 
+    @unittest.skipUnless(os.name != "nt", "POSIX path semantics")
     def test_macos_codex_candidates_put_desktop_bundle_before_saved_cli(self):
         with (
             patch.object(setup.platform, "system", return_value="Darwin"),

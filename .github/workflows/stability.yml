@@ -37,6 +37,8 @@ jobs:
             macOS) python -c 'import webview.platforms.cocoa' ;;
             Windows) python -c 'import webview.platforms.edgechromium' ;;
             Linux)
+              sudo apt-get update
+              sudo apt-get install -y libegl1 libxkbcommon0
               python -m pip install 'pywebview[pyside6]>=5.4,<6'
               QT_QPA_PLATFORM=offscreen python -c 'import webview.platforms.qt'
               ;;
