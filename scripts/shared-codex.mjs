@@ -1,5 +1,20 @@
-import { ensureSharedServer } from "../src/shared-runtime.mjs";
+import { promises as fs } from "node:fs";
+import { ensureSharedServer, readSharedConfig, sharedConfigPath, stopManagedBackend } from "../src/shared-runtime.mjs";
 import { openSharedDesktop } from "../src/desktop-launch.mjs";
+
+if (process.argv.includes("--stop")) {
+  const config = await readSharedConfig();
+  if (!config) process.exit(0);
+  try {
+    await stopManagedBackend(config);
+    await fs.unlink(sharedConfigPath).catch(() => {});
+    console.log("Pocket 管理的共享 Codex 已停止");
+  } catch (error) {
+    // An active desktop client deliberately keeps the App Server alive.
+    console.log(`保留共享 Codex：${error.message}`);
+  }
+  process.exit(0);
+}
 
 const config = process.env.CODEX_APP_SERVER_WS_URL
   ? { url: process.env.CODEX_APP_SERVER_WS_URL } : await ensureSharedServer();

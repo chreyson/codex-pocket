@@ -801,6 +801,8 @@ class ServiceManager:
             tunnel = self.tunnel_process
             viewer = self.viewer_process
             helper = run.helper_process
+            cleanup_node = self._runtime_node
+            cleanup_env = dict(self._runtime_env) if self._runtime_env is not None else None
             self.tunnel_process = None
             self.viewer_process = None
             run.helper_process = None
@@ -823,6 +825,25 @@ class ServiceManager:
                         self._log("desktop", f"进程清理失败：{error}")
                     except Exception:
                         pass
+            # The shared App Server is intentionally outside the viewer
+            # process tree. Reap it only when no Codex Desktop client uses it;
+            # the cleanup helper preserves an App-owned active connection.
+            if cleanup_node:
+                try:
+                    cleanup = subprocess.run(
+                        [cleanup_node, str(APP_DIR / "scripts" / "shared-codex.mjs"), "--stop"],
+                        cwd=APP_DIR,
+                        env=cleanup_env or os.environ.copy(),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        **hidden_process_options(),
+                    )
+                    if cleanup.returncode != 0:
+                        self._log("desktop", "共享 Codex 清理未完成，已保留现有后端")
+                except (OSError, subprocess.SubprocessError) as error:
+                    self._log("desktop", f"共享 Codex 清理失败，已保留现有后端：{error}")
         finally:
             run.stop_done.set()
             with self._lock:
