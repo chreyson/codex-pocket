@@ -198,7 +198,16 @@ try {
     assert.equal(await mode.innerText(), "正在切换");
     assert.equal(await page.evaluate(() => window.designConnects), 0);
     const bounds = await mode.boundingBox();
-    assert.ok(bounds.width >= 48 && bounds.height <= 28, "mode label must remain on one line");
+    const textBounds = await mode.evaluate((node) => {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      return Array.from(range.getClientRects(), ({ x, y, width, height }) => ({ x, y, width, height }));
+    });
+    assert.ok(bounds.width > 0 && bounds.height <= 28, "mode label must remain compact");
+    assert.ok(textBounds.length > 0 && textBounds.every((rect) =>
+      Math.abs(rect.y - textBounds[0].y) <= 1
+      && rect.x >= bounds.x - 1 && rect.x + rect.width <= bounds.x + bounds.width + 1),
+    `mode label must remain on one line without clipping: ${JSON.stringify({ bounds, textBounds })}`);
     const headerBefore = await page.locator(".section-intro").boundingBox();
     await shot(page, `${name}-mode`);
     await page.locator(".connection-mode-details > summary").click();

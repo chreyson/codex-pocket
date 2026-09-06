@@ -95,7 +95,8 @@ try {
     await page.mouse.click(4, 4);
     assert.equal(await dialog.isVisible(), false);
     await show.click();
-    await page.keyboard.press("Tab");
+    // macOS WebKit uses Option+Tab to include buttons in keyboard navigation.
+    await page.keyboard.press(process.platform === "darwin" && process.env.PLAYWRIGHT_BROWSER === "webkit" ? "Alt+Tab" : "Tab");
     assert.equal(await dialog.evaluate((el) => el.contains(document.activeElement)), true);
     assert.equal(await page.locator("#copy-qr").evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), true);
     const oldImage = await qr.getAttribute("src");
