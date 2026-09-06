@@ -731,6 +731,7 @@ class DesktopControllerTests(unittest.TestCase):
             patch("codex_pocket.find_codex", return_value="codex"),
             patch("codex_pocket.ensure_cloudflared", return_value="cloudflared"),
             patch("codex_pocket.subprocess.Popen", return_value=viewer) as popen,
+            patch("codex_pocket.subprocess.run", return_value=SimpleNamespace(returncode=0)) as cleanup,
             patch.object(manager, "_wait_for_local_service", side_effect=delayed_health_check),
             patch("codex_pocket.terminate_process_tree", side_effect=delayed_terminate) as terminate,
         ):
@@ -751,6 +752,8 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertFalse(stopper.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(popen.call_count, 1)
+        cleanup.assert_called_once()
+        self.assertEqual(cleanup.call_args.args[0][-1], "--stop")
         terminate.assert_any_call(viewer)
         self.assertFalse(manager.running)
 

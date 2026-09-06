@@ -498,24 +498,27 @@ async function unusedUrl() {
   return url;
 }
 
-export function defaultCodexCommand() {
-  if (process.env.CODEX_BIN?.trim()) return process.env.CODEX_BIN.trim();
-  if (process.platform === "darwin") {
+export function defaultCodexCommand({
+  env = process.env, platform = process.platform, exists = existsSync,
+  readFile = readFileSync, home = homedir(),
+} = {}) {
+  if (env.CODEX_BIN?.trim()) return env.CODEX_BIN.trim();
+  if (platform === "darwin") {
     for (const bundled of [
       "/Applications/ChatGPT.app/Contents/Resources/codex",
       "/Applications/Codex.app/Contents/Resources/codex",
-      path.join(homedir(), "Applications/ChatGPT.app/Contents/Resources/codex"),
-      path.join(homedir(), "Applications/Codex.app/Contents/Resources/codex"),
+      path.posix.join(home, "Applications/ChatGPT.app/Contents/Resources/codex"),
+      path.posix.join(home, "Applications/Codex.app/Contents/Resources/codex"),
     ]) {
-      if (existsSync(bundled)) return bundled;
+      if (exists(bundled)) return bundled;
     }
     const system = "/opt/homebrew/bin/codex";
-    if (existsSync(system)) return system;
+    if (exists(system)) return system;
   }
   // GUI launches do not necessarily inherit the installer's shell PATH.
   try {
-    const configured = JSON.parse(readFileSync(path.join(POCKET_ROOT, ".data/runtime.json"), "utf8"))?.Codex?.Path;
-    if (configured && existsSync(configured)) return configured;
+    const configured = JSON.parse(readFile(path.join(POCKET_ROOT, ".data/runtime.json"), "utf8"))?.Codex?.Path;
+    if (configured && exists(configured)) return configured;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }

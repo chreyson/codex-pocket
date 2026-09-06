@@ -96,16 +96,21 @@ test("shared connection failures never silently spawn an independent writer", as
   assert.equal(client.socket, null);
 });
 
-test("the generated desktop CLI proxy joins the existing shared backend", async (t) => {
+test("the generated desktop CLI proxy joins the existing shared backend", { timeout: 60_000 }, async (t) => {
   const { url } = await fixture(t);
   const directory = await fs.mkdtemp(path.join(tmpdir(), "codex-pocket-proxy-"));
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const proxy = await prepareDesktopProxy(url, {
     dataDirectory: directory,
     codexPath: process.execPath,
   });
-  const desktop = new CodexAppServer({ command: proxy });
-  t.after(() => desktop.stop());
+  const desktop = new CodexAppServer({ command: proxy, requestTimeoutMs: 5_000 });
+  desktop.on("diagnostic", (message) => t.diagnostic(message));
+  t.after(async () => {
+    const closed = desktop.proc ? once(desktop.proc, "close") : Promise.resolve();
+    desktop.stop();
+    await closed;
+    await fs.rm(directory, { recursive: true, force: true, maxRetries: 5 });
+  });
 
   await desktop.start();
   const result = await desktop.request("thread/read", {

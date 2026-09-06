@@ -52,24 +52,37 @@ async function startServer(t) {
   proc.stdout.on("data", (chunk) => { output += chunk; });
   proc.stderr.on("data", (chunk) => { output += chunk; });
   const closed = once(proc, "close");
+  const streams = new Set();
   t.after(async () => {
+    // Close readers before terminating the server, including on Windows where
+    // process termination resets sockets instead of ending the SSE response.
+    const results = await Promise.allSettled([...streams].map((stream) => stream.close()));
     proc.kill();
     await closed;
     await cleanup();
+    const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+    if (errors.length) throw new AggregateError(errors, "SSE subscriptions failed");
   });
   const url = `http://127.0.0.1:${port}`;
   for (let attempt = 0; attempt < 100; attempt++) {
     if (proc.exitCode !== null) throw new Error(output);
     try {
       const response = await fetch(`${url}/api/health`);
-      if ((await response.json()).codex === "ready") return { url, proc, closed };
+      if ((await response.json()).codex === "ready") return {
+        url, proc, closed,
+        subscribe: async (cookie, threadId) => {
+          const stream = await subscribe(url, cookie, threadId);
+          streams.add(stream);
+          return stream;
+        },
+      };
     } catch { /* Wait for the listener to bind. */ }
     await delay(50);
   }
   throw new Error(`Server did not become ready: ${output}`);
 }
 
-async function subscribe(t, url, cookie, threadId = "test-thread") {
+async function subscribe(url, cookie, threadId = "test-thread") {
   const controller = new AbortController();
   const response = await fetch(`${url}/api/events?threadId=${threadId}`, {
     headers: { Cookie: cookie }, signal: controller.signal,
@@ -80,6 +93,7 @@ async function subscribe(t, url, cookie, threadId = "test-thread") {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let failure;
   const reading = (async () => {
     try {
       while (true) {
@@ -96,16 +110,20 @@ async function subscribe(t, url, cookie, threadId = "test-thread") {
         }
       }
     } catch (error) {
-      if (!controller.signal.aborted) throw error;
+      if (!controller.signal.aborted) failure = error;
     }
   })();
-  const close = async () => { controller.abort(); await reading; };
-  t.after(close);
+  const close = async () => {
+    controller.abort();
+    await reading;
+    if (failure) throw failure;
+  };
   return {
     close,
     async waitFor(predicate, timeout = 5_000) {
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
+        if (failure) throw failure;
         const event = events.find(predicate);
         if (event) return event;
         await delay(25);
@@ -145,19 +163,19 @@ test("an idle writer conflict has a recovery code and explicit continuation is i
 });
 
 test("questions and approvals travel through stdio, HTTP, SSE, reconnect and resolution", { timeout: 15000 }, async (t) => {
-  const { url } = await startServer(t);
+  const { url, subscribe } = await startServer(t);
   const headers = { Authorization: "Bearer integration-test-token", "Content-Type": "application/json" };
   const post = (route, body) => fetch(url + route, { method: "POST", headers, body: JSON.stringify(body) });
   const session = await fetch(url + "/api/session", { method: "POST", headers });
   const cookie = session.headers.get("set-cookie").split(";")[0];
-  const stream = await subscribe(t, url, cookie);
+  const stream = await subscribe(cookie);
   const started = await post("/api/threads/test-thread/messages", { text: "Synthetic requests", clientMessageId: "request-test" });
   assert.equal(started.status, 202, await started.text());
   const event = await stream.waitFor((event) => event.name === "thread" && event.value.control.requests.length === 4);
   const requests = event.value.control.requests;
   assert.deepEqual(requests.map((r) => r.type), ["userInput", "command", "permissions", "elicitation"]);
   await stream.close();
-  const recovered = await subscribe(t, url, cookie);
+  const recovered = await subscribe(cookie);
   const replay = await recovered.waitFor((event) => event.name === "thread" && event.value.control.requests.length === 4);
   assert.deepEqual(replay.value.control.requests.map((r) => r.token), requests.map((r) => r.token));
   const sync = await (await fetch(url + "/api/sync?threadId=test-thread", { headers })).json();
@@ -283,7 +301,7 @@ test("management HTTP routes authenticate, validate, persist names and restore a
 });
 
 test("HTTP authentication and SSE survive a slow thread, idle heartbeat and reconnect", { timeout: 35_000 }, async (t) => {
-  const { url } = await startServer(t);
+  const { url, subscribe } = await startServer(t);
   assert.equal((await fetch(`${url}/api/events`)).status, 401);
   assert.equal((await fetch(`${url}/api/session`, { method: "POST" })).status, 401);
   const session = await fetch(`${url}/api/session`, {
@@ -310,9 +328,9 @@ test("HTTP authentication and SSE survive a slow thread, idle heartbeat and reco
   }
   const page = await fetch(`${url}/api/threads/test-thread`, { headers: { Cookie: cookie } });
   assert.equal((await page.json()).composerOptions.permissions.current, "ask");
-  const slow = await subscribe(t, url, cookie, "slow-thread");
+  const slow = await subscribe(cookie, "slow-thread");
   await delay(100);
-  const first = await subscribe(t, url, cookie);
+  const first = await subscribe(cookie);
   const snapshot = await first.waitFor((event) => event.name === "thread");
   assert.equal(snapshot.value.id, "test-thread");
   await first.waitFor((event) => event.name === "thread"
@@ -320,7 +338,7 @@ test("HTTP authentication and SSE survive a slow thread, idle heartbeat and reco
   await first.waitFor((event) => event.name === "heartbeat", 17_000);
   await slow.close();
   await first.close();
-  const second = await subscribe(t, url, cookie);
+  const second = await subscribe(cookie);
   const recovered = await second.waitFor((event) => event.name === "thread", 8_000);
   assert.equal(recovered.value.id, "test-thread");
   assert.notDeepEqual(recovered.value.messages, snapshot.value.messages);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import test from "node:test";
 import {
   classifyDesktop,
@@ -330,7 +331,7 @@ test("desktop proxy wrapper redirects app-server but preserves other CLI command
     rename: async () => {},
     chmod: async () => {},
   });
-  assert.equal(proxyPath, "/tmp/pocket data/codex-pocket-shared-cli");
+  assert.equal(proxyPath, path.join("/tmp/pocket data", "codex-pocket-shared-cli"));
   assert.equal(writes.length, 1);
   assert.match(writes[0].content, /if \[ "\$arg" = "app-server" \]/);
   assert.match(writes[0].content, /exec '\/opt\/node bin\/node'.*app-server-ws-proxy\.mjs.*ws:\/\/127\.0\.0\.1:4500/);
@@ -345,8 +346,8 @@ test("automatic desktop proxy resolves an isolated runtime config instead of pin
     mkdir: async () => {}, writeFile: async (_file, value) => { content = value; },
     rename: async () => {}, chmod: async () => {},
   });
-  assert.equal(proxyPath, "/tmp/pocket auto/codex-pocket-auto-cli");
-  assert.ok(content.includes("'auto' '/tmp/pocket auto/shared-server.json' \"$@\""));
+  assert.equal(proxyPath, path.join("/tmp/pocket auto", "codex-pocket-auto-cli"));
+  assert.ok(content.includes(`'auto' '${path.join("/tmp/pocket auto", "shared-server.json")}' "$@"`));
   assert.match(content, /exec '\/opt\/codex' "\$@"/);
 });
 

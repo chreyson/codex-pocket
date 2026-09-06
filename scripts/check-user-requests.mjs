@@ -52,8 +52,15 @@ try {
     let reject = true;
     await page.addInitScript(() => {
       window.EventSource = class extends EventTarget {
-        constructor() { super(); window.requestSource = this; setTimeout(() => this.dispatchEvent(new MessageEvent("status", { data: '{"state":"ready"}' })), 10); }
-        close() {}
+        constructor() {
+          super();
+          window.requestSource = this;
+          // Deliver initial readiness before the next simulated connection change.
+          queueMicrotask(() => {
+            if (!this.closed) this.dispatchEvent(new MessageEvent("status", { data: '{"state":"ready"}' }));
+          });
+        }
+        close() { this.closed = true; }
       };
     });
     await page.route("**/api/**", async (route) => {
@@ -91,8 +98,10 @@ try {
     await answer.focus();
     await page.evaluate(() => window.requestSource.onerror());
     assert.equal(await panel.getByRole("button", { name: "下一题" }).isDisabled(), true);
+    assert.equal(await page.locator("#connection-state").getAttribute("data-state"), "disconnected");
     assert.equal(await answer.inputValue(), "先做好断线恢复");
     await page.evaluate(() => window.requestSource.dispatchEvent(new MessageEvent("status", { data: '{"state":"ready"}' })));
+    assert.equal(await panel.getByRole("button", { name: "下一题" }).isDisabled(), false);
     thread.control.requests.push(request("concurrent", "item/commandExecution/requestApproval", { command: "npm test", availableDecisions: ["accept", "decline"] }));
     await emit();
     assert.equal(await answer.inputValue(), "先做好断线恢复");

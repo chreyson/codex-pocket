@@ -45,9 +45,29 @@ test("shared startup is serialized, survives client shutdown and reuses its addr
   await assert.rejects(fs.access(`${configPath}.lock`), { code: "ENOENT" });
 });
 
-test("macOS prefers the desktop bundled CLI so MCP config matches the App", () => {
-  if (process.platform !== "darwin") return;
-  assert.match(defaultCodexCommand(), /ChatGPT\.app\/Contents\/Resources\/codex$/);
+test("CLI discovery honors configuration and installed macOS apps on a clean machine", () => {
+  const chatgpt = "/Applications/ChatGPT.app/Contents/Resources/codex";
+  const codex = "/Applications/Codex.app/Contents/Resources/codex";
+  const userApp = "/Users/test/Applications/Codex.app/Contents/Resources/codex";
+  for (const [installed, configured, expected] of [
+    [[chatgpt, codex, "/opt/homebrew/bin/codex"], "", chatgpt],
+    [[codex, userApp], "", codex],
+    [[userApp], "", userApp],
+    [["/opt/homebrew/bin/codex"], "", "/opt/homebrew/bin/codex"],
+    [["/custom/codex"], "/custom/codex", "/custom/codex"],
+    [[], "/missing/codex", "codex"],
+    [[], "", "codex"],
+  ]) {
+    assert.equal(defaultCodexCommand({
+      platform: "darwin", env: {}, home: "/Users/test",
+      exists: (file) => installed.includes(file),
+      readFile: () => JSON.stringify({ Codex: { Path: configured } }),
+    }), expected);
+  }
+  assert.equal(defaultCodexCommand({
+    env: { CODEX_BIN: " custom-codex " },
+    exists: () => assert.fail("An explicit CLI must take precedence over discovery"),
+  }), "custom-codex");
 });
 
 test("failed shared startup releases its lock for a subsequent attempt", async (t) => {
@@ -326,7 +346,13 @@ test("a dead backend is rebuilt on its saved URL without touching an unrelated l
   assert.equal(launched, true);
   assert.equal(result.url, url);
   assert.equal(result.pid, child.pid);
-  assert.deepEqual(launchArgs.args.slice(0, 2), ["app-server", "--listen"]);
+  if (process.platform === "win32") {
+    assert.equal(launchArgs.command, `"${runtime.command}" app-server --listen "${url}"`);
+    assert.deepEqual(launchArgs.args, []);
+  } else {
+    assert.equal(launchArgs.command, runtime.command);
+    assert.deepEqual(launchArgs.args, ["app-server", "--listen", url]);
+  }
   assert.doesNotThrow(() => process.kill(process.pid, 0));
   const saved = JSON.parse(await fs.readFile(configPath, "utf8"));
   assert.equal(saved.url, url);

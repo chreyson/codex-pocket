@@ -33,7 +33,7 @@ export async function discoverCodexAppPipePaths({
       try { names = await readdir(directory); } catch { continue; }
       for (const name of names) {
         if (!name.endsWith(".sock")) continue;
-        const candidate = path.join(directory, name);
+        const candidate = path.posix.join(directory, name);
         try {
           const info = await lstat(candidate);
           if (info.isSocket() && (uid === undefined || info.uid === uid)) paths.push(candidate);
