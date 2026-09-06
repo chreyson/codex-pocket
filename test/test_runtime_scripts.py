@@ -72,7 +72,7 @@ class RuntimeScriptTests(unittest.TestCase):
             result = subprocess.run([
                 "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
                 ". $env:POCKET_TEST_HELPER; $resolved = Resolve-PocketCodex; "
-                "if ($resolved -ine $env:POCKET_TEST_NATIVE) { throw ('Unexpected CLI: ' + $resolved) }",
+                "if ((Resolve-Path -LiteralPath $resolved).Path -ine (Resolve-Path -LiteralPath $env:POCKET_TEST_NATIVE).Path) { throw ('Unexpected CLI: ' + $resolved) }",
             ], env=environment, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
 
