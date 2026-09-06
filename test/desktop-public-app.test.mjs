@@ -171,8 +171,8 @@ async function createHarness(copyResult = true) {
 test("shared backend alone cannot claim desktop attachment and stopped state clears it", async () => {
   const harness = await createHarness();
   assert.equal(harness.elements["connection-mode"].textContent, "待确认");
-  harness.renderState({ desktopConnection: { state: "independent", label: "桌面未接入", advice: "请正常退出桌面 App" } });
-  assert.equal(harness.elements["connection-mode"].textContent, "桌面未接入");
+  harness.renderState({ desktopConnection: { state: "independent", label: "正在切换", advice: "Pocket 会自动切换" } });
+  assert.equal(harness.elements["connection-mode"].textContent, "正在切换");
   assert.equal(harness.elements["connect-desktop"].hidden, false);
   harness.renderState({ desktopConnection: { state: "shared", label: "已共享", advice: "已确认" } });
   assert.equal(harness.elements["connection-mode"].textContent, "已共享");

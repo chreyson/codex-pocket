@@ -61,9 +61,35 @@ export async function openSharedDesktop(url, {
   prepareProxy = prepareDesktopProxy,
 } = {}) {
   url = localAppServerUrl(url);
-  const current = await inspect(url);
+  let current = await inspect(url);
   if (current.state === "shared") return current;
-  if (current.state !== "not-running") {
+  if (current.state === "independent" && ["darwin", "win32"].includes(platform)) {
+    const quitSpec = platform === "darwin"
+      ? ["/usr/bin/osascript", ["-e", 'tell application id "com.openai.codex" to quit'], { timeout: 10_000 }]
+      : ["powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop'; $deadline=(Get-Date).AddSeconds(8); do { $processes=@(Get-Process -Name 'Codex','ChatGPT' -ErrorAction SilentlyContinue); if ($processes.Count -eq 0) { exit 0 }; $apps=@($processes | Where-Object {$_.MainWindowHandle -ne 0}); foreach ($app in $apps) { if ($app.CloseMainWindow()) { exit 0 } }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline); throw 'Codex window did not accept a normal close request'",
+      ], { timeout: 10_000, windowsHide: true, encoding: "utf8" }];
+    try {
+      await run(...quitSpec);
+    } catch (error) {
+      current = await inspect(url);
+      if (current.state !== "not-running") {
+        throw new Error("无法请求桌面 App 正常退出，Pocket 没有强制结束它。请处理 App 中的退出确认后重试。", { cause: error });
+      }
+    }
+    if (current.state !== "not-running") {
+      for (let attempt = 0; attempt < 60; attempt++) {
+        await wait(250);
+        current = await inspect(url);
+        if (current.state === "shared") return current;
+        if (current.state === "not-running") break;
+      }
+    }
+    if (current.state !== "not-running") {
+      throw new Error("桌面 App 未能正常退出，Pocket 已取消切换且没有强制结束它。请处理 App 中的未完成任务或退出确认后重试。");
+    }
+  } else if (current.state !== "not-running") {
     throw new Error("桌面 App 尚未退出或连接无法确认。请先在桌面保存工作并正常退出 App，再点击“连接桌面 App”。Pocket 不会自动结束桌面任务。");
   }
   let executable = env.CODEX_DESKTOP_PATH || env.CODEX_DESKTOP_APP;

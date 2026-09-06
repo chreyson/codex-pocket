@@ -112,7 +112,7 @@ function render(state) {
     if (connectDesktopButton) {
       connectDesktopButton.hidden = !running || currentState.connectionMode !== "shared" || connection.state === "shared";
       connectDesktopButton.disabled = !bridge || Boolean(currentState.desktopConnecting);
-      connectDesktopButton.textContent = currentState.desktopConnecting ? "正在确认连接…" : "连接桌面 App";
+      connectDesktopButton.textContent = currentState.desktopConnecting ? "正在自动连接…" : "连接桌面 App";
     }
   }
   statusDot.dataset.phase = phase;

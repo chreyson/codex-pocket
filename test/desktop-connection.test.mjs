@@ -12,6 +12,12 @@ import { openSharedDesktop, prepareDesktopProxy } from "../src/desktop-launch.mj
 const url = "ws://127.0.0.1:4500";
 const macApp = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
 
+test("independent desktop guidance matches each platform's switching support", () => {
+  assert.equal(connectionDescription("independent", "darwin").label, "正在切换");
+  assert.equal(connectionDescription("independent", "win32").label, "正在切换");
+  assert.equal(connectionDescription("independent", "linux").label, "桌面未接入");
+});
+
 for (const [platform, file, cli] of [
   ["darwin", macApp, "/Applications/ChatGPT.app/Contents/Resources/codex"],
   ["linux", "/opt/codex/Codex", "/opt/codex/codex"],
@@ -107,13 +113,111 @@ test("Windows accepts the Codex child as the shared socket owner", async () => {
   assert.equal((await inspectDesktop(url, { platform: "win32", run })).state, "shared");
 });
 
-test("opening an independent or unknown desktop never launches or terminates it", async () => {
-  for (const state of ["independent", "unknown"]) {
+test("unknown desktops and Linux independent desktops are never relaunched", async () => {
+  for (const [state, platform] of [["independent", "linux"], ["unknown", "darwin"], ["unknown", "win32"]]) {
     await assert.rejects(openSharedDesktop(url, {
+      platform,
       inspect: async () => ({ state }),
       run: () => assert.fail("must not run"), launch: () => assert.fail("must not launch"),
     }), /正常退出/);
   }
+});
+
+test("macOS gracefully relaunches an already-running independent desktop into shared mode", async () => {
+  const commands = [];
+  const states = ["independent", "independent", "not-running", "shared"];
+  const result = await openSharedDesktop(url, {
+    platform: "darwin", env: {}, exists: () => true, wait: async () => {},
+    prepareProxy: async () => "/tmp/codex-pocket-shared-cli",
+    inspect: async () => ({ state: states.shift() || "shared" }),
+    run: async (command, args, options) => { commands.push({ command, args, options }); },
+  });
+
+  assert.equal(result.state, "shared");
+  assert.deepEqual(commands[0], {
+    command: "/usr/bin/osascript",
+    args: ["-e", 'tell application id "com.openai.codex" to quit'],
+    options: { timeout: 10_000 },
+  });
+  assert.equal(commands[1].command, "/usr/bin/open");
+  assert.ok(commands[1].args.includes("CODEX_APP_SERVER_FORCE_CLI=1"));
+});
+
+test("macOS never force-closes a desktop that does not finish quitting", async () => {
+  const commands = [];
+  await assert.rejects(openSharedDesktop(url, {
+    platform: "darwin", wait: async () => {},
+    inspect: async () => ({ state: "independent" }),
+    run: async (command, args) => { commands.push({ command, args }); },
+  }), /没有强制结束/);
+  assert.deepEqual(commands, [{
+    command: "/usr/bin/osascript",
+    args: ["-e", 'tell application id "com.openai.codex" to quit'],
+  }]);
+});
+
+test("macOS tolerates an app that exits while the graceful quit request is in flight", async () => {
+  const states = ["independent", "not-running", "shared"];
+  const commands = [];
+  const result = await openSharedDesktop(url, {
+    platform: "darwin", env: {}, exists: () => true, wait: async () => {},
+    prepareProxy: async () => "/tmp/codex-pocket-shared-cli",
+    inspect: async () => ({ state: states.shift() || "shared" }),
+    run: async (command) => {
+      commands.push(command);
+      if (command === "/usr/bin/osascript") throw new Error("application already exited");
+    },
+  });
+  assert.equal(result.state, "shared");
+  assert.deepEqual(commands, ["/usr/bin/osascript", "/usr/bin/open"]);
+});
+
+test("Windows gracefully closes and relaunches an independent desktop into shared mode", async () => {
+  const executable = "C:\\Program Files\\WindowsApps\\OpenAI.Codex\\app\\Codex.exe";
+  const proxy = "C:\\Pocket\\proxy.exe";
+  const commands = [];
+  const states = ["independent", "independent", "not-running", "shared"];
+  const child = new EventEmitter();
+  child.unref = () => {};
+  let launched;
+  const result = await openSharedDesktop(url, {
+    platform: "win32",
+    env: { CODEX_DESKTOP_PATH: executable },
+    exists: (value) => value === executable,
+    prepareProxy: async () => proxy,
+    wait: async () => {},
+    inspect: async () => ({ state: states.shift() || "shared" }),
+    run: async (command, args, options) => { commands.push({ command, args, options }); },
+    launch: (file, _args, options) => {
+      launched = { file, options };
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+  });
+
+  assert.equal(result.state, "shared");
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].command, "powershell.exe");
+  assert.ok(commands[0].args.at(-1).includes("CloseMainWindow()"));
+  assert.ok(commands[0].args.at(-1).includes("MainWindowHandle"));
+  assert.ok(commands[0].args.at(-1).includes("Start-Sleep -Milliseconds 250"));
+  assert.doesNotMatch(commands[0].args.at(-1), /Stop-Process|taskkill|\.Kill\(/i);
+  assert.deepEqual(commands[0].options, { timeout: 10_000, windowsHide: true, encoding: "utf8" });
+  assert.equal(launched.file, executable);
+  assert.equal(launched.options.env.CODEX_CLI_PATH, proxy);
+  assert.equal(launched.options.env.CODEX_APP_SERVER_FORCE_CLI, "1");
+});
+
+test("Windows never force-closes a desktop that ignores the normal close request", async () => {
+  const commands = [];
+  await assert.rejects(openSharedDesktop(url, {
+    platform: "win32", wait: async () => {},
+    inspect: async () => ({ state: "independent" }),
+    run: async (command, args) => { commands.push({ command, args }); },
+  }), /没有强制结束/);
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].command, "powershell.exe");
+  assert.ok(commands[0].args.at(-1).includes("CloseMainWindow()"));
 });
 
 test("explicit macOS connection launches in background with shared env and verifies attachment", async () => {

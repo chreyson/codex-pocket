@@ -36,6 +36,15 @@ class FakeManager:
         self.shutdown_requested = True
 
 
+class AutoConnectManager(FakeManager):
+    def __init__(self, on_status, on_ready, on_failure):
+        super().__init__(on_status, on_ready, on_failure)
+        self.connect_count = 0
+
+    def connect_desktop(self):
+        self.connect_count += 1
+
+
 def wait_for_state(controller, phase, timeout=1):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -52,6 +61,25 @@ class DesktopHostTests(unittest.TestCase):
         controller._on_ready("https://pocket.example.test", "sample-key")
         self.assertEqual(controller.get_state()["connectionMode"], "unknown")
         self.assertIsNone(controller.get_state()["desktopConnection"])
+
+    def test_macos_and_windows_ready_state_start_desktop_migration_in_background(self):
+        for system_name in ("Darwin", "Windows"):
+            with self.subTest(system=system_name), patch(
+                "desktop_host.platform.system", return_value=system_name
+            ):
+                controller = DesktopController(AutoConnectManager)
+                controller._on_ready("https://pocket.example.test", "sample-key")
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline and controller.manager.connect_count == 0:
+                    time.sleep(0.01)
+                self.assertEqual(controller.manager.connect_count, 1)
+                self.assertFalse(controller.get_state()["desktopConnecting"])
+
+    def test_linux_ready_state_does_not_restart_the_desktop(self):
+        with patch("desktop_host.platform.system", return_value="Linux"):
+            controller = DesktopController(AutoConnectManager)
+            controller._on_ready("https://pocket.example.test", "sample-key")
+        self.assertEqual(controller.manager.connect_count, 0)
 
     def test_connection_status_refreshes_without_restarting_service(self):
         controller = DesktopController(FakeManager)

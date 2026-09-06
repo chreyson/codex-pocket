@@ -190,12 +190,12 @@ try {
         start_service: async () => window.designState,
         connect_desktop: async () => { window.designConnects++; return window.designState; },
       } };
-    }, connectionDescription("independent"));
+    }, connectionDescription("independent", "win32"));
     await page.goto(`${base}/desktop/index.html`);
     await page.locator('#desktop-app[data-phase="running"]').waitFor();
     assert.equal(await page.locator("#connection-description").innerText(), "连接已就绪");
     const mode = page.locator("#connection-mode");
-    assert.equal(await mode.innerText(), "桌面未接入");
+    assert.equal(await mode.innerText(), "正在切换");
     assert.equal(await page.evaluate(() => window.designConnects), 0);
     const bounds = await mode.boundingBox();
     assert.ok(bounds.width >= 48 && bounds.height <= 28, "mode label must remain on one line");

@@ -261,6 +261,12 @@ class DesktopController:
             connectionMode="unknown",
             desktopConnection=None,
         )
+        # An App launched before Pocket cannot inherit the shared CLI
+        # environment. Migrate it in the background as soon as the local
+        # service is ready, so the normal startup path stays seamless.
+        if (platform.system().lower() in {"darwin", "windows"}
+                and hasattr(self.manager, "connect_desktop")):
+            self.connect_desktop()
 
     def _on_failure(self, message: str) -> None:
         self._update(

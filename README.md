@@ -155,12 +155,12 @@ Quick Tunnel 重建可能产生新域名，需要从桌面窗口获取新链接�
 
 要在桌面和 Web 中继续**同一个任务**，两个客户端必须连接到同一个后端：
 
-1. 首次运行安装器；Windows/macOS 会自动完成共享接入登记。安装前已打开的 Codex App 需要在当前工作结束后正常退出并重开一次。
+1. 首次运行安装器；Windows/macOS 会自动完成共享接入登记。安装前已打开的 Codex App 会在 Pocket 服务就绪后自动切换到共享连接。
 2. 之后可以先开 Codex App，也可以先开 Pocket。开启 Pocket 服务后，用手机扫码继续任务。
-3. 连接状态旁的问号显示实际检测结果；若仍显示“桌面未接入”，可正常退出 App 后使用说明中的“连接桌面 App”。
+3. 连接状态旁的问号显示实际检测结果；如果 Codex App 先于 Pocket 启动，Windows/macOS 都会在服务就绪后自动请求 App 正常退出并重开，使它接入共享后端。
 
 Pocket 会保存 `.data/shared-server.json`，但这个文件只代表后端配置，不能证明桌面已接入。
-Windows/macOS 的安装器登记对新启动的 App 生效，不会重启已经运行的 App。
+Windows/macOS 的安装器登记对新启动的 App 生效；Pocket 服务会自动切换此前已经运行的 App。
 Windows 会通知 Explorer 刷新当前用户环境；企业策略阻止登记时，安装器报告失败，不会显示安装成功。
 Linux 尚未登记系统图标的自动接入，需要使用 Pocket 的“连接桌面 App”。
 Pocket 会为桌面 App 生成本地 CLI 代理，通过 `CODEX_CLI_PATH` 把桌面 stdio 协议转发到现有共享后端；

@@ -4,14 +4,17 @@ import { promisify } from "node:util";
 const execute = promisify(execFile);
 const descriptions = {
   shared: ["已共享", "已确认桌面 App 和 Pocket 连接到同一后端，可继续同一任务。"],
-  independent: ["桌面未接入", "桌面 App 正在使用独立后端，它占用的任务暂时无法在 Web 继续。请先在桌面保存工作并正常退出 App，再点击 Pocket 中的“连接桌面 App”。"],
+  independent: ["正在切换", "Pocket 会自动请求桌面 App 正常退出并重开，以接入共享后端；不会强制结束进程。"],
   "not-running": ["桌面未打开", "Pocket 的共享后端已就绪。请打开 Codex App，打开后会检测是否连接到同一后端。"],
   unknown: ["待确认", "Pocket 无法确认桌面 App 的实际连接，尚未验证能否继续桌面任务。"],
   standalone: ["独立模式", "Pocket 未连接共享后端，无法保证与桌面 App 继续同一任务。请启用共享后端后重新启动 Pocket 服务。"],
 };
 
-export function connectionDescription(state) {
-  const [label, advice] = descriptions[state] || descriptions.unknown;
+export function connectionDescription(state, platform = process.platform) {
+  const description = state === "independent" && !["darwin", "win32"].includes(platform)
+    ? ["桌面未接入", "桌面 App 正在使用独立后端。请正常退出 App 后点击“连接桌面 App”。"]
+    : descriptions[state] || descriptions.unknown;
+  const [label, advice] = description;
   return { state, label, advice };
 }
 
@@ -133,7 +136,7 @@ export async function inspectDesktop(url, { platform = process.platform, run = e
         if (match) sockets.push({ pid, host: match[1] || match[2], port: Number(match[3]) });
       }
     } else return connectionDescription("unknown");
-    return connectionDescription(classifyDesktop(processes, sockets, url, platform));
+    return connectionDescription(classifyDesktop(processes, sockets, url, platform), platform);
   } catch {
     return { ...connectionDescription("unknown"), label: "检测失败",
       advice: "无法读取本机桌面进程或 TCP 连接，尚未确认接入状态。请重试连接检测。" };
